@@ -136,6 +136,17 @@ Other knobs: `TRIBUNE_ABSTENTION_THRESHOLD` (default `0.70`), `TRIBUNE_DEFAULT_J
 
 ---
 
+## Cost accounting: cost per completed verification
+
+TRIBUNE meters every task — tokens in/out, proposer/verifier turns, and a cost
+computed from a configurable pricing file where **pricing is data, not code**
+(API rates or amortized self-hosted $/GPU-hour, with effective dates so
+promotional rates expire on schedule). `tribune eval` prints the breakdown by
+outcome type; a **correct abstention is a completed success at its actual (low)
+cost**, never a failure. See [docs/cost_accounting.md](docs/cost_accounting.md).
+
+---
+
 ## Contributing a new program or jurisdiction
 
 This is the **primary contribution path** and requires **no changes to core code**. See [CONTRIBUTING.md](CONTRIBUTING.md). In short:

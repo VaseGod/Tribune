@@ -50,6 +50,13 @@ class TribuneSettings(BaseSettings):
     tracing: Literal["none", "weave"] = "none"
     weave_project: str = "tribune"
 
+    # -- Cost accounting ------------------------------------------------------ #
+    # Pricing is data, not code. Empty pricing_path uses the packaged
+    # tribune/eval/pricing.json. pricing_date (ISO date) pins the accounting date
+    # so promotional-rate expiry is reproducible; empty means "today".
+    pricing_path: str = ""
+    pricing_date: str = ""
+
     # -- General ------------------------------------------------------------ #
     default_jurisdiction: str = "EX"
     seed: int = 7

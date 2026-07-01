@@ -9,6 +9,8 @@ into an abstention rather than crashing the case.
 
 from __future__ import annotations
 
+from datetime import date
+
 from ..abstention.calibration import Calibrator
 from ..agents.eligibility import EligibilityProposer
 from ..agents.navigator import Navigator
@@ -16,10 +18,12 @@ from ..agents.preparer import Preparer
 from ..agents.verifier import Verifier
 from ..config import TribuneSettings, get_settings
 from ..corpus.rule_store import make_rule_store
+from ..eval.costmodel import CostModel
 from ..governance.action_gate import ActionGate
 from ..governance.audit import AuditLog
 from ..ingestion.base import make_doc_ingest
 from ..instrumentation.tracing import init_tracing, span
+from ..instrumentation.usage import UsageRecorder
 from ..memory.consolidation import MemoryConsolidator
 from ..memory.partitions import PartitionManager
 from ..providers.base import get_provider_for_role
@@ -29,14 +33,21 @@ from .router import Router
 from .state_machine import CaseStateMachine
 
 
+def _make_recorder(settings: TribuneSettings) -> UsageRecorder:
+    pricing_date = date.fromisoformat(settings.pricing_date) if settings.pricing_date else None
+    cost_model = CostModel.load(settings.pricing_path or None)
+    return UsageRecorder(cost_model=cost_model, pricing_date=pricing_date)
+
+
 class CasePipeline:
     def __init__(self, settings: TribuneSettings | None = None) -> None:
         self.settings = settings or get_settings()
         init_tracing()
 
         rule_store = make_rule_store(self.settings)
-        proposer_provider = get_provider_for_role("proposer", self.settings)
-        verifier_provider = get_provider_for_role("verifier", self.settings)
+        self.recorder = _make_recorder(self.settings)
+        proposer_provider = get_provider_for_role("proposer", self.settings, self.recorder)
+        verifier_provider = get_provider_for_role("verifier", self.settings, self.recorder)
 
         self.proposer = EligibilityProposer(proposer_provider, rule_store)
         self.verifier = Verifier(verifier_provider, rule_store)
@@ -55,10 +66,12 @@ class CasePipeline:
             preparer=self.preparer,
             router=self.router,
             audit=self.audit,
+            recorder=self.recorder,
         )
 
     def run_case(self, case: SyntheticCase) -> CaseRunResult:
         with span("run_case", case_id=case.case_id, jurisdiction=case.jurisdiction):
+            self.recorder.start_case(case.case_id, case.language)
             partition = self.partitions.open(case.case_id)
             consolidator = MemoryConsolidator(partition)
 
@@ -83,6 +96,7 @@ class CasePipeline:
 
                 program = task.program
                 assert program is not None
+                self.recorder.start_task(program)
                 try:
                     outcome = self.sm.run_program(
                         case.case_id, case.jurisdiction, program, shared["evidence"], consolidator
@@ -98,6 +112,9 @@ class CasePipeline:
                     outcome = ProgramOutcome(
                         program=program, abstained=True, final_state=SMState.ABSTAIN
                     )
+                # Usage attaches to every completed task — abstentions included:
+                # a correct abstention is a completed outcome at its actual cost.
+                outcome.usage = self.recorder.finish_task()
                 result.outcomes.append(outcome)
                 return outcome
 

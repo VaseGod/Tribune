@@ -52,7 +52,7 @@ where = ["."]
 include = ["tribune*"]
 
 [tool.setuptools.package-data]
-tribune = ["static/*"]
+tribune = ["static/*", "eval/*.json", "eval/quant_sensitivity/data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

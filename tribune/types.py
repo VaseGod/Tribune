@@ -343,6 +343,56 @@ class AbstentionScore(StrictModel):
 
 
 # --------------------------------------------------------------------------- #
+# Usage metering (tokens, turns, cost)
+# --------------------------------------------------------------------------- #
+
+
+class ModelCallUsage(StrictModel):
+    """Token accounting for a single model round-trip.
+
+    ``estimated`` marks token counts produced by a deterministic local estimator
+    (the offline provider has no real tokenizer) rather than reported by a serving
+    backend. Costing treats both identically; reports surface the flag.
+    """
+
+    role: str  # "proposer" | "verifier"
+    model: str
+    tokenizer_id: str
+    tokens_input: int
+    tokens_output: int
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    estimated: bool = False
+
+
+class TaskUsage(BaseModel):
+    """Accumulated usage for one (case, program) task: tokens, turns, and cost.
+
+    A *task* here is one program outcome — the unit the cost-per-completed-
+    verification metric is defined over. Abstaining tasks are completed tasks and
+    accumulate (and report) their actual cost like any other outcome.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str = ""
+    program: str = ""
+    language: str = "en"
+    turns: int = 0
+    proposer_turns: int = 0
+    verifier_turns: int = 0
+    tokens_input: int = 0
+    tokens_output: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    calls: list[ModelCallUsage] = Field(default_factory=list)
+    tokenizer_ids: list[str] = Field(default_factory=list)
+    estimated: bool = False
+    cost_usd: float | None = None
+    cost_backend_id: str | None = None
+
+
+# --------------------------------------------------------------------------- #
 # Governance: prepared materials and audit
 # --------------------------------------------------------------------------- #
 
@@ -468,6 +518,7 @@ class SyntheticCase(StrictModel):
     documents: list[RawDocument]
     ground_truth: dict[ProgramId, ProgramGroundTruth]
     target_programs: list[ProgramId]
+    language: str = "en"  # BCP-47-ish tag of the case documents ("en", "es")
 
 
 # --------------------------------------------------------------------------- #
@@ -488,6 +539,7 @@ class ProgramOutcome(BaseModel):
     final_state: SMState = SMState.DONE
     abstained: bool = False
     replans: int = 0
+    usage: TaskUsage | None = None
     human_path: str = (
         "A navigator or caseworker can review this with you. "
         "You may also contact the administering agency directly."

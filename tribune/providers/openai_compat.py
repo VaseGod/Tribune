@@ -24,6 +24,7 @@ import urllib.error
 import urllib.request
 
 from ..config import TribuneSettings
+from ..instrumentation.usage import ESTIMATOR_TOKENIZER_ID, UsageRecorder, estimate_tokens
 from ..types import EligibilityStatus, RecommendedAction
 from .base import (
     ReviewRequest,
@@ -61,11 +62,18 @@ _REVIEW_SYSTEM = (
 
 
 class OpenAICompatProvider:
-    def __init__(self, model: str, settings: TribuneSettings, role: str = "proposer") -> None:
+    def __init__(
+        self,
+        model: str,
+        settings: TribuneSettings,
+        role: str = "proposer",
+        recorder: UsageRecorder | None = None,
+    ) -> None:
         self.role = role
         self.model = model
         self.name = f"openai_compat:{model}"
         self.version = model
+        self.recorder = recorder
         self._base = settings.openai_base_url.rstrip("/")
         self._key = settings.openai_api_key
         self._timeout = settings.request_timeout_s
@@ -97,7 +105,39 @@ class OpenAICompatProvider:
                 body = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError) as exc:
             raise ProviderError(f"request to {self._base} failed: {exc}") from exc
-        return body["choices"][0]["message"]["content"]
+        content = body["choices"][0]["message"]["content"]
+        self._record_usage(body.get("usage"), system + user, content)
+        return content
+
+    def _record_usage(self, usage: dict | None, sent_text: str, received_text: str) -> None:
+        """Report token usage to the recorder.
+
+        Prefers the serving backend's own ``usage`` block (vLLM, SGLang, and
+        llama.cpp's server all return one); falls back to the deterministic
+        estimator, flagged as estimated, when it is absent.
+        """
+        if self.recorder is None:
+            return
+        if usage and "prompt_tokens" in usage:
+            details = usage.get("prompt_tokens_details") or {}
+            self.recorder.record_call(
+                role=self.role,
+                model=self.name,
+                tokenizer_id=self.model,
+                tokens_input=int(usage.get("prompt_tokens", 0)),
+                tokens_output=int(usage.get("completion_tokens", 0)),
+                cache_read_tokens=int(details.get("cached_tokens", 0) or 0),
+                estimated=False,
+            )
+        else:
+            self.recorder.record_call(
+                role=self.role,
+                model=self.name,
+                tokenizer_id=ESTIMATOR_TOKENIZER_ID,
+                tokens_input=estimate_tokens(sent_text),
+                tokens_output=estimate_tokens(received_text),
+                estimated=True,
+            )
 
     # -- contract ----------------------------------------------------------- #
 
