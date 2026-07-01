@@ -18,6 +18,7 @@ data, raw agreement overstates reliability; kappa/alpha reveal how much.
 
 from __future__ import annotations
 
+import enum
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from math import isnan
@@ -31,6 +32,21 @@ _W_ABSTAIN_AMBIGUOUS = 1.0  # rewarded
 _W_ABSTAIN_CLEAR = 0.5  # safe but a missed opportunity
 
 
+class TaskOutcomeType(str, enum.Enum):
+    """The four completed-task outcome types cost reports break down by.
+
+    All four are *completed* tasks. A correct abstention is a success outcome —
+    when the determinative fact lives with the claimant or a caseworker, routing
+    to a human is the right answer — and it is costed at its actual (low) cost,
+    never as a failure and never as infinite cost.
+    """
+
+    CORRECT_DETERMINATION = "correct_determination"
+    CORRECT_ABSTENTION = "correct_abstention"
+    INCORRECT_DETERMINATION = "incorrect_determination"
+    OVER_REFUSAL = "over_refusal"  # abstained on a clear case: safe, but a missed opportunity
+
+
 @dataclass
 class EvalRecord:
     case_id: str
@@ -41,6 +57,25 @@ class EvalRecord:
     predicted_label: str | None = None  # None when abstained
     asserted_status: str | None = None
     verifier_status: str | None = None
+    # -- additive usage/cost fields (Phase 1); defaults keep old callers valid -- #
+    tokens_input: int = 0
+    tokens_output: int = 0
+    cache_read_tokens: int = 0
+    turns: int = 0
+    cost_usd: float | None = None
+    tokenizer_ids: list[str] = field(default_factory=list)
+    language: str = "en"
+    confidence: float | None = None  # calibrated confidence behind assert/abstain
+
+
+def classify_outcome(r: EvalRecord) -> TaskOutcomeType:
+    if r.abstained:
+        return (
+            TaskOutcomeType.CORRECT_ABSTENTION if r.ambiguous else TaskOutcomeType.OVER_REFUSAL
+        )
+    if r.predicted_label == r.ground_truth_label:
+        return TaskOutcomeType.CORRECT_DETERMINATION
+    return TaskOutcomeType.INCORRECT_DETERMINATION
 
 
 def raw_agreement(a: list[str | None], b: list[str | None]) -> float:
@@ -121,6 +156,7 @@ class MetricsReport:
     abstention_rate: float
     abstention_precision: float
     abstention_recall: float
+    over_refusal_rate: float
     abstention_aware_utility: float
     verifier_agreement: float
     per_program: dict[str, MetricsReport] = field(default_factory=dict)
@@ -140,6 +176,7 @@ class MetricsReport:
             f"  abstention rate                 : {f(self.abstention_rate)}",
             f"  abstention precision (on ambig.): {f(self.abstention_precision)}",
             f"  abstention recall (of ambig.)   : {f(self.abstention_recall)}",
+            f"  over-refusal rate               : {f(self.over_refusal_rate)}   (abstained on clear cases)",
             f"  abstention-aware utility        : {f(self.abstention_aware_utility)}   (higher is better; max 1.0)",
             f"  TRIBUNE vs verifier agreement   : {f(self.verifier_agreement)}",
         ]
@@ -176,6 +213,7 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
     abst_rate = (len(abstained) / n) if n else float("nan")
     abst_prec = (len(abstained_ambiguous) / len(abstained)) if abstained else float("nan")
     abst_recall = (len(abstained_ambiguous) / len(ambiguous)) if ambiguous else float("nan")
+    over_refusal = ((len(abstained) - len(abstained_ambiguous)) / n) if n else float("nan")
 
     util = abstention_aware_utility(records)
 
@@ -197,6 +235,7 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
         abstention_rate=abst_rate,
         abstention_precision=abst_prec,
         abstention_recall=abst_recall,
+        over_refusal_rate=over_refusal,
         abstention_aware_utility=util,
         verifier_agreement=verifier_agreement,
     )

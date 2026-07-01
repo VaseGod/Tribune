@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "currency": "USD",
+  "note": "Pricing is data, not code. First backend whose model_pattern matches wins, so keep specific patterns above catch-alls. Rates carry effective dates so promotional pricing expires on schedule. Self-hosted entries amortize $/GPU-hour over *your measured* throughput — replace the defaults with numbers measured on your hardware.",
+  "backends": [
+    {
+      "backend_id": "anthropic:claude-sonnet-5",
+      "kind": "api",
+      "model_patterns": ["*claude-sonnet-5*"],
+      "rates": [
+        {
+          "effective_from": "2025-11-24",
+          "effective_until": "2026-08-31",
+          "input_per_m": 2.0,
+          "output_per_m": 10.0,
+          "cache_read_per_m": 0.2,
+          "cache_write_per_m": 2.5,
+          "note": "launch promotional pricing; expires 2026-08-31"
+        },
+        {
+          "effective_from": "2026-09-01",
+          "effective_until": null,
+          "input_per_m": 3.0,
+          "output_per_m": 15.0,
+          "cache_read_per_m": 0.3,
+          "cache_write_per_m": 3.75,
+          "note": "standard list pricing after promo expiry"
+        }
+      ]
+    },
+    {
+      "backend_id": "selfhost:openai-compat-default",
+      "kind": "self_hosted",
+      "model_patterns": ["openai_compat:*"],
+      "rates": [
+        {
+          "effective_from": "2026-01-01",
+          "effective_until": null,
+          "gpu_hour_usd": 1.8,
+          "throughput_tokens_per_s": 850.0,
+          "note": "placeholder commodity-GPU amortization; replace with your measured throughput"
+        }
+      ]
+    },
+    {
+      "backend_id": "local:rules",
+      "kind": "free",
+      "model_patterns": ["local_rules*", "mock_quant*"],
+      "rates": [
+        {
+          "effective_from": "2020-01-01",
+          "effective_until": null,
+          "note": "deterministic offline providers cost nothing"
+        }
+      ]
+    }
+  ]
+}

@@ -98,8 +98,12 @@ def recommend_action(status: EligibilityStatus) -> RecommendedAction:
     return RecommendedAction.ABSTAIN_AND_ESCALATE
 
 
-def get_provider_for_role(role: str, settings=None):
-    """Factory: ``role`` is 'proposer' or 'verifier'. Selected by config."""
+def get_provider_for_role(role: str, settings=None, recorder=None):
+    """Factory: ``role`` is 'proposer' or 'verifier'. Selected by config.
+
+    ``recorder`` is an optional :class:`~tribune.instrumentation.usage.UsageRecorder`;
+    providers report per-call token usage to it when present.
+    """
     from ..config import get_settings
 
     settings = settings or get_settings()
@@ -111,7 +115,7 @@ def get_provider_for_role(role: str, settings=None):
     if kind == "openai_compat":
         from .openai_compat import OpenAICompatProvider
 
-        return OpenAICompatProvider(model=model, settings=settings, role=role)
+        return OpenAICompatProvider(model=model, settings=settings, role=role, recorder=recorder)
     from .local_rules import LocalRulesProvider
 
-    return LocalRulesProvider(role=role)
+    return LocalRulesProvider(role=role, recorder=recorder)

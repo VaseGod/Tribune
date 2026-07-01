@@ -9,6 +9,7 @@ one-environment-variable change.
 
 from __future__ import annotations
 
+from ..instrumentation.usage import ESTIMATOR_TOKENIZER_ID, UsageRecorder, estimate_tokens
 from ..types import CriterionOutcome
 from .base import (
     ReviewRequest,
@@ -22,11 +23,39 @@ from .base import (
 _VERSION = "0.1.0"
 
 
+def _synth_request_text(req: SynthesisRequest) -> str:
+    """Canonical text of what a served model would be sent, for token estimation."""
+    parts = [req.program.value, req.jurisdiction, req.evidence_summary, str(req.required_total)]
+    parts += [f"{c.criterion_id} {c.description} {c.outcome.value}" for c in req.criteria]
+    parts += [f"{c.citation_id} {c.source} {c.text}" for c in req.citations]
+    return " ".join(parts)
+
+
+def _review_request_text(req: ReviewRequest) -> str:
+    parts = [req.assessment.status.value, req.assessment.rationale]
+    parts += [f"{c.criterion_id} {c.outcome.value}" for c in req.recomputed]
+    parts += [f"{c.citation_id} {c.text}" for c in req.citations]
+    return " ".join(parts)
+
+
 class LocalRulesProvider:
-    def __init__(self, role: str = "proposer") -> None:
+    def __init__(self, role: str = "proposer", recorder: UsageRecorder | None = None) -> None:
         self.role = role
         self.name = "local_rules"
         self.version = _VERSION
+        self.recorder = recorder
+
+    def _record(self, tokens_input: int, tokens_output: int) -> None:
+        if self.recorder is None:
+            return
+        self.recorder.record_call(
+            role=self.role,
+            model=self.name,
+            tokenizer_id=ESTIMATOR_TOKENIZER_ID,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            estimated=True,
+        )
 
     def synthesize_assessment(self, req: SynthesisRequest) -> SynthesisResult:
         status = derive_status(req.criteria, req.coverage_complete)
@@ -51,6 +80,7 @@ class LocalRulesProvider:
             f"Assessed {len(req.criteria)} of {req.required_total} governing criteria "
             f"for this program. Result: {status.value}.\n" + "\n".join(lines)
         )
+        self._record(estimate_tokens(_synth_request_text(req)), estimate_tokens(rationale))
         return SynthesisResult(
             status=status,
             recommended_action=action,
@@ -67,4 +97,9 @@ class LocalRulesProvider:
             concerns.append("proposer self-confidence is low for an asserted result")
         if req.assessment.is_assertion and not req.assessment.citations:
             concerns.append("asserted result without citations")
-        return ReviewResult(supported=len(concerns) == 0, concerns=concerns)
+        result = ReviewResult(supported=len(concerns) == 0, concerns=concerns)
+        self._record(
+            estimate_tokens(_review_request_text(req)),
+            estimate_tokens(" ".join(concerns) or "supported"),
+        )
+        return result

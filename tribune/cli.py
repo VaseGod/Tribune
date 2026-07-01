@@ -82,12 +82,18 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     from .eval.harness import EvalHarness
+    from .types import ProgramId
 
     settings = get_settings()
     print(_BANNER + "\n")
     harness = EvalHarness(settings)
-    result = harness.run(n_per_program=args.n, ambiguous_ratio=args.ambiguous_ratio)
+    programs = [ProgramId(p) for p in args.programs] if args.programs else None
+    result = harness.run(
+        n_per_program=args.n, ambiguous_ratio=args.ambiguous_ratio, programs=programs
+    )
     print(result.report.render_full())
+    print()
+    print(result.cost_report.render())
     return 0
 
 
@@ -141,6 +147,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval = sub.add_parser("eval", help="run the evaluation harness and print metrics")
     p_eval.add_argument("--n", type=int, default=24, help="cases per program")
     p_eval.add_argument("--ambiguous-ratio", dest="ambiguous_ratio", type=float, default=0.25)
+    p_eval.add_argument(
+        "--program",
+        dest="programs",
+        action="append",
+        default=None,
+        help="restrict to a program (repeatable), e.g. --program appeals",
+    )
     p_eval.set_defaults(func=cmd_eval)
 
     p_canary = sub.add_parser("canary", help="adversarial canary + rule-drift sentinel")

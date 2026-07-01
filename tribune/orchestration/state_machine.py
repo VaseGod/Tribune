@@ -12,6 +12,7 @@ uncertain terminal state. Every transition is written to the audit log.
 from __future__ import annotations
 
 from ..governance.audit import AuditLog
+from ..instrumentation.usage import UsageRecorder
 from ..memory.consolidation import MemoryConsolidator
 from ..types import ProgramId, ProgramOutcome, RecommendedAction, SMState
 from .router import Router
@@ -27,6 +28,7 @@ class CaseStateMachine:
         router: Router,
         audit: AuditLog,
         max_attempts: int = 3,
+        recorder: UsageRecorder | None = None,
     ) -> None:
         self.proposer = proposer
         self.verifier = verifier
@@ -35,6 +37,11 @@ class CaseStateMachine:
         self.router = router
         self.audit = audit
         self.max_attempts = max_attempts
+        self.recorder = recorder
+
+    def _turn(self, role: str) -> None:
+        if self.recorder is not None:
+            self.recorder.record_turn(role)
 
     def run_program(
         self,
@@ -57,6 +64,7 @@ class CaseStateMachine:
                 model_name=self.proposer.provider.name,
                 model_version=self.proposer.provider.version,
             )
+            self._turn("proposer")
             assessment, diag = self.proposer.assess(
                 case_id, jurisdiction, program, evidence, k=route.k, attempt=attempt
             )
@@ -72,6 +80,7 @@ class CaseStateMachine:
                 model_version=self.verifier.provider.version,
                 citation_ids=cit_ids,
             )
+            self._turn("verifier")
             verdict = self.verifier.verify(assessment, evidence, jurisdiction)
 
             if not verdict.approved:
