@@ -1,0 +1,132 @@
+"""Independent verifier.
+
+The verifier re-derives the assessment from the *cited* rules rather than trusting
+the proposer's criterion results. It checks three things and can reject -> REPLAN:
+
+1. **Citation integrity** — every resolved criterion cites the rule that governs it.
+2. **Coverage** — every required criterion of the program was actually assessed
+   (catches the proposer concluding eligibility from a partial, retrieval-limited
+   view; this is what drives the REPLAN path).
+3. **Support** — the asserted status matches the status obtained by re-deriving
+   over *all* required rules; no unsupported leaps.
+
+A served deployment can run this on a stronger model; the provider's model-side
+review is folded in alongside the structural checks.
+"""
+
+from __future__ import annotations
+
+from ..corpus import programs as program_registry
+from ..corpus.programs.jurisdictions import get_profile
+from ..corpus.rule_store import RuleStore
+from ..providers.base import ModelProvider, ReviewRequest, derive_status
+from ..types import (
+    Assessment,
+    CriterionOutcome,
+    CriterionResult,
+    Evidence,
+    EvidenceView,
+    VerifierVerdict,
+)
+
+
+class Verifier:
+    def __init__(self, provider: ModelProvider, rule_store: RuleStore) -> None:
+        self.provider = provider
+        self.rule_store = rule_store
+
+    def verify(
+        self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
+    ) -> VerifierVerdict:
+        program = assessment.program
+        profile = get_profile(jurisdiction)
+        view = EvidenceView(evidence)
+        ruleset = program_registry.get_ruleset(program)
+
+        missing_citations: list[str] = []
+        unsupported_claims: list[str] = []
+        reasons: list[str] = []
+
+        # Re-derive every criterion the assessment took a position on, from its rule.
+        recomputed_for_assessment: list[CriterionResult] = []
+        for crit in assessment.criteria:
+            rule = ruleset.get(crit.criterion_id)
+            if rule is None:
+                unsupported_claims.append(f"unknown criterion '{crit.criterion_id}'")
+                continue
+            expected_cid = rule.citation(program, jurisdiction).citation_id
+            if crit.outcome is not CriterionOutcome.UNKNOWN and expected_cid not in crit.citation_ids:
+                missing_citations.append(crit.criterion_id)
+            recomputed = rule.predicate(view, profile)
+            recomputed_for_assessment.append(
+                CriterionResult(
+                    criterion_id=crit.criterion_id,
+                    description=crit.description,
+                    outcome=recomputed,
+                    required=crit.required,
+                    citation_ids=[expected_cid],
+                    evidence_ids=crit.evidence_ids,
+                )
+            )
+            if recomputed is not crit.outcome:
+                unsupported_claims.append(
+                    f"criterion '{crit.criterion_id}': proposer said {crit.outcome.value}, "
+                    f"re-derivation says {recomputed.value}"
+                )
+
+        # Coverage: were all required criteria assessed?
+        assessed_required = {c.criterion_id for c in assessment.criteria if c.required}
+        incomplete_coverage = [rid for rid in ruleset.required_ids if rid not in assessed_required]
+        if incomplete_coverage:
+            reasons.append(
+                "assessment did not cover all required criteria: " + ", ".join(incomplete_coverage)
+            )
+
+        # Independent status from a full re-derivation over every required rule.
+        full_recompute: list[CriterionResult] = []
+        for rule in ruleset.rules:
+            full_recompute.append(
+                CriterionResult(
+                    criterion_id=rule.criterion_id,
+                    description=rule.description,
+                    outcome=rule.predicate(view, profile),
+                    required=rule.required,
+                    citation_ids=[rule.citation(program, jurisdiction).citation_id],
+                )
+            )
+        recomputed_status = derive_status(full_recompute, coverage_complete=True)
+        if assessment.is_assertion and recomputed_status is not assessment.status:
+            unsupported_claims.append(
+                f"asserted status {assessment.status.value} is not supported by full "
+                f"re-derivation ({recomputed_status.value})"
+            )
+
+        review = self.provider.review_assessment(
+            ReviewRequest(
+                assessment=assessment,
+                recomputed=recomputed_for_assessment,
+                citations=assessment.citations,
+            )
+        )
+
+        approved = (
+            not missing_citations
+            and not unsupported_claims
+            and not incomplete_coverage
+            and review.supported
+        )
+        if missing_citations:
+            reasons.append("missing/incorrect citations for: " + ", ".join(missing_citations))
+        for c in review.concerns:
+            reasons.append(f"model review concern: {c}")
+        if approved:
+            reasons.append("independent re-derivation from the cited rules confirms the assessment")
+
+        return VerifierVerdict(
+            approved=approved,
+            recomputed_status=recomputed_status,
+            missing_citations=missing_citations,
+            unsupported_claims=unsupported_claims,
+            incomplete_coverage=incomplete_coverage,
+            reasons=reasons,
+        )

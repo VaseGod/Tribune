@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TRIBUNE — Benefits Navigator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="safety-strip">
+    <span class="dot"></span>
+    Informational only — <strong>not legal advice</strong> and <strong>never a binding determination</strong>. TRIBUNE abstains and routes to a human when unsure.
+  </div>
+
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">T</div>
+        <div>
+          <div class="brand-name">TRIBUNE</div>
+          <div class="brand-sub">Benefits Navigator</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-view="demo">
+          <span class="nav-ico">▦</span> Demo Cases
+        </button>
+        <button class="nav-item" data-view="wizard">
+          <span class="nav-ico">✎</span> New Case
+        </button>
+        <button class="nav-item" data-view="settings">
+          <span class="nav-ico">⚙</span> Settings
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="legend">
+          <div><span class="swatch emerald"></span> Likely eligible</div>
+          <div><span class="swatch amber"></span> Abstain · route to human</div>
+          <div><span class="swatch crimson"></span> Likely ineligible</div>
+        </div>
+        <p class="muted tiny">Self-hostable · cited · privacy-first</p>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">Demo Cases</h1>
+          <p class="muted" id="view-sub">Run a realistic, fully-simulated case through the verification pipeline.</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="audit-toggle" id="audit-toggle-wrap" hidden>
+            <input type="checkbox" id="audit-toggle" /> Caseworker audit view
+          </label>
+        </div>
+      </header>
+
+      <section class="view" id="view"></section>
+    </main>
+  </div>
+
+  <!-- Chat launcher + drawer -->
+  <button class="chat-launcher" id="chat-launcher" title="Ask the navigator">
+    <span>💬</span>
+  </button>
+  <div class="chat-drawer" id="chat-drawer" hidden>
+    <div class="chat-head">
+      <div>
+        <div class="chat-title">Navigator Assistant</div>
+        <div class="muted tiny">Grounded in your case — never guesses</div>
+      </div>
+      <button class="icon-btn" id="chat-close">✕</button>
+    </div>
+    <div class="chat-body" id="chat-body"></div>
+    <form class="chat-input" id="chat-form">
+      <input id="chat-text" type="text" placeholder="Ask why, or what's missing…" autocomplete="off" />
+      <button type="submit" class="btn primary sm">Send</button>
+    </form>
+  </div>
+
+  <!-- Loader overlay -->
+  <div class="loader-overlay" id="loader" hidden>
+    <div class="loader-card">
+      <div class="pulse-ring"></div>
+      <div class="loader-text" id="loader-text">Running the verification pipeline…</div>
+      <div class="loader-steps">PLAN → GATHER → ASSESS → VERIFY → decide</div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
