@@ -1,0 +1,7 @@
+# Pinned runtime dependencies for the reproducible appeals-eval container.
+# These mirror TRIBUNE's core deps (pyproject.toml) at exact versions so a
+# rebuild is byte-reproducible. The eval needs nothing beyond the core deps —
+# no served-model, web, or tracing extras — because it runs fully offline.
+pydantic==2.8.2
+pydantic-settings==2.4.0
+numpy==1.26.4

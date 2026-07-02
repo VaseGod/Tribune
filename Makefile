@@ -34,3 +34,19 @@ quant-real:
 # Deliberately redefine the frozen quant seed set (invalidates comparability!).
 freeze-seed:
 	$(PY) -m tribune.cli quant-eval --freeze-seed
+
+# --- Phase 6: sandboxed appeals eval ------------------------------------------
+.PHONY: appeals-eval sandbox-build sandbox-appeals-eval
+
+# Run the appeals eval locally under the in-process egress guard.
+appeals-eval:
+	$(PY) -m tribune.eval.appeals_eval
+
+# Build the reproducible eval container.
+sandbox-build:
+	docker build -f sandbox/Dockerfile -t tribune-appeals-eval .
+
+# The one documented command: run the appeals eval end-to-end in a
+# network-isolated container from a clean checkout.
+sandbox-appeals-eval: sandbox-build
+	docker run --rm --network=none tribune-appeals-eval

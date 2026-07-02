@@ -45,3 +45,6 @@ jobs:
 
       - name: Validate backend registry (schema only; link check is opt-in)
         run: python scripts/validate_registry.py
+
+      - name: Sandboxed appeals eval — must run with zero network egress
+        run: python -m tribune.eval.appeals_eval --n 8
