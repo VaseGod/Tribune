@@ -170,6 +170,20 @@ def cmd_canary(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def cmd_redteam(args: argparse.Namespace) -> int:
+    from .casegen.synthetic import SyntheticCaseGenerator
+    from .redteam import InjectionProbe
+
+    settings = get_settings()
+    print(_BANNER + "\n")
+    generator = SyntheticCaseGenerator(seed=settings.seed)
+    # A benign, well-evidenced case so any misbehavior is attributable to the payload.
+    base_case = generator.generate_demo_set()[0]
+    report = InjectionProbe(settings).run(base_case)
+    print(report.render())
+    return 0 if report.ok else 1
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     try:
         import uvicorn
@@ -249,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_disc = sub.add_parser("disclose", help="plain-language explanation of the last run")
     p_disc.set_defaults(func=cmd_disclose)
+
+    p_redteam = sub.add_parser(
+        "redteam", help="ingestion injection probe (adversarial benefit notices); exits 1 on findings"
+    )
+    p_redteam.set_defaults(func=cmd_redteam)
 
     p_web = sub.add_parser("web", help="serve the web UI (FastAPI + single-page app)")
     p_web.add_argument("--host", default="127.0.0.1", help="bind host (use 0.0.0.0 to expose on the network)")
