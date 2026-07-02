@@ -42,3 +42,6 @@ jobs:
 
       - name: Red-team — ingestion injection probe must pass
         run: tribune redteam
+
+      - name: Validate backend registry (schema only; link check is opt-in)
+        run: python scripts/validate_registry.py

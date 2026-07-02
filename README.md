@@ -154,6 +154,11 @@ Beyond `tribune eval` and `tribune canary`:
   adversarial benefit notices through the real OCR path; asserts the action gate
   never fires from document instructions, provenance never cites injected text,
   and injected content is flagged or inert.
+- **Backend registry** ([backends/registry.yaml](backends/registry.yaml),
+  [criteria](backends/README.md)) — a validated catalog of proposer/verifier
+  candidates (license, real vs. announced-only weights, serving support, quant
+  formats, and empty measured-kappa / cost-per-task slots filled from eval runs);
+  `python scripts/validate_registry.py` checks it in CI.
 
 ---
 
