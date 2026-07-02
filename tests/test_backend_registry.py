@@ -1,0 +1,107 @@
+"""Phase 5 — backend registry schema validation.
+
+Covers: the committed registry validates, the seed candidates the plan requires
+are present with the right statuses, and the schema's honesty invariants reject
+malformed entries. No network (the link check is exercised separately and opt-in).
+"""
+
+import importlib.util
+import os
+
+import pytest
+
+_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts", "validate_registry.py")
+_REGISTRY = os.path.join(os.path.dirname(__file__), "..", "backends", "registry.yaml")
+
+_spec = importlib.util.spec_from_file_location("validate_registry", _SCRIPT)
+vr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(vr)
+
+
+def test_committed_registry_validates():
+    registry = vr.load_registry(_REGISTRY)
+    assert registry.version == 1
+    assert registry.seed_set == "tribune-quant-seed-set"
+    assert len(registry.candidates) >= 7
+
+
+def test_all_required_seed_candidates_present():
+    registry = vr.load_registry(_REGISTRY)
+    ids = {c.candidate_id for c in registry.candidates}
+    for required in [
+        "glm-5.2",
+        "deepseek-v4",
+        "openpangu-2-flash-92b",
+        "openpangu-2-flash-6b",
+        "longcat-2.0",
+        "qwen3.6-27b-nvfp4",
+        "claude-sonnet-5",
+    ]:
+        assert required in ids
+
+
+def test_status_flags_match_plan():
+    registry = vr.load_registry(_REGISTRY)
+    by_id = {c.candidate_id: c for c in registry.candidates}
+    # LongCat is announced-only and must not be deployable/verified.
+    assert by_id["longcat-2.0"].weights_status == "announced_only"
+    assert by_id["longcat-2.0"].weights_verified is False
+    # OpenPangu weights are unverified until confirmed.
+    assert by_id["openpangu-2-flash-92b"].weights_status == "unverified"
+    # Sonnet 5 is API-only with a promo end date, proposer role.
+    sonnet = by_id["claude-sonnet-5"]
+    assert sonnet.weights_status == "api_only"
+    assert sonnet.promo_end_date == "2026-08-31"
+    assert sonnet.roles == ["proposer"]
+    # GLM-5.2 is the incumbent verifier candidate.
+    assert "verifier" in by_id["glm-5.2"].roles
+    # No measured slots are pre-filled — they come from eval runs.
+    assert all(c.measured_kappa is None for c in registry.candidates)
+    assert all(c.measured_cost_per_task is None for c in registry.candidates)
+
+
+def test_downloadable_requires_url():
+    with pytest.raises(ValueError, match="requires a weights_url"):
+        vr.Candidate(
+            candidate_id="x", name="X", vendor="v", params="1B", roles=["proposer"],
+            license="open-weights", weights_status="downloadable", weights_url=None,
+            serving=["vllm"], context_window=8192,
+        )
+
+
+def test_announced_only_cannot_be_verified():
+    with pytest.raises(ValueError, match="weights_verified=true only valid"):
+        vr.Candidate(
+            candidate_id="x", name="X", vendor="v", params="1B", roles=["verifier"],
+            license="unknown", weights_status="announced_only", weights_verified=True,
+            serving=["vllm"], context_window=8192,
+        )
+
+
+def test_duplicate_ids_rejected():
+    good = vr.load_registry(_REGISTRY)
+    payload = {
+        "version": 1,
+        "seed_set": "s",
+        "candidates": [
+            good.candidates[0].model_dump(),
+            good.candidates[0].model_dump(),
+        ],
+    }
+    with pytest.raises(ValueError, match="duplicate candidate_id"):
+        vr.Registry.model_validate(payload)
+
+
+def test_unknown_field_rejected():
+    with pytest.raises(ValueError):
+        vr.Candidate(
+            candidate_id="x", name="X", vendor="v", params="1B", roles=["proposer"],
+            license="open-weights", weights_status="unverified",
+            serving=["vllm"], context_window=8192, bogus_field="nope",
+        )
+
+
+def test_main_exits_zero_on_committed_registry(capsys):
+    rc = vr.main(["--path", _REGISTRY])
+    assert rc == 0
+    assert "schema OK" in capsys.readouterr().out

@@ -1,0 +1,150 @@
+# TRIBUNE backend registry
+#
+# A machine-readable catalog of candidate model backends for the proposer and
+# verifier roles. Inclusion criteria and how the measured slots get populated are
+# documented in backends/README.md. Validate with:
+#
+#     python scripts/validate_registry.py                 # schema only (CI)
+#     python scripts/validate_registry.py --check-links   # + weight-URL HEAD checks
+#
+# Honesty rules encoded here:
+#   * weights_status: downloadable vs. announced_only — announced-only models are
+#     NOT deployable; do not treat them as available.
+#   * weights_verified stays false until a link check confirms the URL resolves.
+#   * measured_kappa / measured_cost_per_task are null until populated from a
+#     TRIBUNE eval run on the frozen seed set (never hand-entered vibes).
+#   * cost is judged as cost-per-verified-determination, never list price.
+
+version: 1
+seed_set: tribune-quant-seed-set          # the frozen 50-case set (Phase 2)
+
+candidates:
+  - candidate_id: glm-5.2
+    name: GLM-5.2
+    vendor: Zhipu AI
+    params: "753B (MoE)"
+    roles: [verifier, proposer]
+    role_note: incumbent verifier candidate
+    license: open-weights
+    weights_status: downloadable
+    weights_url: https://huggingface.co/zai-org/GLM-5.2
+    weights_verified: false
+    serving: [vllm, sglang, llama.cpp]
+    quant_formats: [fp16, fp8, gguf-q8_0, gguf-q4_k_m, gguf-q2_k, gguf-iq1_s]
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Runs usable inference at ~2-bit effective quantization on commodity
+      hardware; whether verifier calibration survives that quant level is exactly
+      what Eval Note #1 measures.
+
+  - candidate_id: deepseek-v4
+    name: DeepSeek V4
+    vendor: DeepSeek
+    params: "unconfirmed"
+    roles: [verifier, proposer]
+    license: open-weights
+    weights_status: downloadable
+    weights_url: https://huggingface.co/deepseek-ai/DeepSeek-V4
+    weights_verified: false
+    serving: [vllm, sglang, llama.cpp]
+    quant_formats: [fp8, gguf-q4_k_m, gguf-q2_k]
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      llama.cpp support recently merged; GGUF quant availability still maturing —
+      verify quant files exist before relying on a given rung.
+
+  - candidate_id: openpangu-2-flash-92b
+    name: OpenPangu-2.0-Flash 92B
+    vendor: Huawei
+    params: "92B"
+    roles: [proposer, verifier]
+    license: open-weights
+    weights_status: unverified
+    weights_url: https://huggingface.co/openPangu/OpenPangu-2.0-Flash-92B
+    weights_verified: false
+    serving: [vllm, sglang]
+    quant_formats: [fp16, fp8]
+    context_window: 32768
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Confirm the weights actually exist and are downloadable before marking
+      weights_status: downloadable.
+
+  - candidate_id: openpangu-2-flash-6b
+    name: OpenPangu-2.0-Flash 6B
+    vendor: Huawei
+    params: "6B"
+    roles: [proposer]
+    license: open-weights
+    weights_status: unverified
+    weights_url: https://huggingface.co/openPangu/OpenPangu-2.0-Flash-6B
+    weights_verified: false
+    serving: [vllm, sglang, llama.cpp]
+    quant_formats: [fp16, gguf-q8_0, gguf-q4_k_m]
+    context_window: 32768
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: Small sibling; verify weights exist before marking available.
+
+  - candidate_id: longcat-2.0
+    name: LongCat-2.0
+    vendor: Meituan
+    params: "1.6T (MoE)"
+    roles: [verifier]
+    license: unknown
+    weights_status: announced_only
+    weights_url: null
+    weights_verified: false
+    serving: [vllm]
+    quant_formats: []
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Announced; weights not yet on Hugging Face. Unverified and NOT deployable —
+      tracked here so its status is watched, not because it is usable.
+
+  - candidate_id: qwen3.6-27b-nvfp4
+    name: Qwen3.6-27B (NVFP4)
+    vendor: Alibaba
+    params: "27B"
+    roles: [proposer, verifier]
+    license: open-weights
+    weights_status: downloadable
+    weights_url: https://huggingface.co/Qwen/Qwen3.6-27B
+    weights_verified: false
+    serving: [vllm, sglang]
+    quant_formats: [nvfp4, fp8, fp16]
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      NVFP4 variants target Blackwell-class GPUs; a mid-size candidate for the
+      verifier role at low cost-per-task.
+
+  - candidate_id: claude-sonnet-5
+    name: Claude Sonnet 5
+    vendor: Anthropic
+    params: "n/a (hosted)"
+    roles: [proposer]
+    role_note: proposer candidate; evaluate strictly at cost-per-task, never list price
+    license: proprietary-api
+    weights_status: api_only
+    weights_url: https://www.anthropic.com/pricing
+    weights_verified: false
+    serving: [api]
+    quant_formats: []
+    context_window: 200000
+    measured_kappa: null
+    measured_cost_per_task: null
+    promo_end_date: "2026-08-31"
+    notes: >-
+      API-only. Launch promo $2/$10 per M through 2026-08-31, reverting to
+      $3/$15; cheaper per token but observed ~2x cost per completed task, so it
+      must be judged at cost-per-verified-determination (see the Phase-1 cost
+      model), never list price.
