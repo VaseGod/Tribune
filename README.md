@@ -159,6 +159,10 @@ Beyond `tribune eval` and `tribune canary`:
   candidates (license, real vs. announced-only weights, serving support, quant
   formats, and empty measured-kappa / cost-per-task slots filled from eval runs);
   `python scripts/validate_registry.py` checks it in CI.
+- **Sandboxed appeals eval** (`make sandbox-appeals-eval`, [docs](docs/sandbox_eval.md)) —
+  the appeals workflow end-to-end in a network-isolated container with pinned
+  deps and deterministic seeds; a **deny-by-default egress guard** (allowlist =
+  the configured model endpoint only) proves no eval run touches a live system.
 
 ---
 
