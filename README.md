@@ -150,6 +150,10 @@ Beyond `tribune eval` and `tribune canary`:
   configurable thresholds are filed as **equity bugs** (distinct tracker label),
   and machine-drafted legal terms are flagged for human review, never silently
   deployed.
+- **Ingestion injection probe** (`tribune redteam`, [docs](docs/injection_probe.md)) —
+  adversarial benefit notices through the real OCR path; asserts the action gate
+  never fires from document instructions, provenance never cites injected text,
+  and injected content is flagged or inert.
 
 ---
 

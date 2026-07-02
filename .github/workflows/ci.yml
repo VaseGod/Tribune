@@ -39,3 +39,6 @@ jobs:
 
       - name: Smoke — quant-sensitivity ladder (2 mock rungs, ~5 cases)
         run: tribune quant-eval --smoke --out /tmp/quant_smoke_note.md
+
+      - name: Red-team — ingestion injection probe must pass
+        run: tribune redteam
