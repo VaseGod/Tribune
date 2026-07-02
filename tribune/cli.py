@@ -140,6 +140,27 @@ def cmd_quant_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_parity(args: argparse.Namespace) -> int:
+    from .eval.parity import run_parity
+    from .eval.quant_sensitivity.seedset import SEED_WEIGHTS, build_seed_set
+
+    settings = get_settings()
+    print(_BANNER + "\n")
+    cases = None
+    if args.n:
+        per = {p: max(1, round(args.n * w / sum(SEED_WEIGHTS.values()))) for p, w in SEED_WEIGHTS.items()}
+        cases = build_seed_set(per)
+    report = run_parity(settings, cases=cases)
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(report.render())
+        print(f"Wrote parity report to {args.out}")
+    else:
+        print(report.render())
+    return 0 if report.ok else 1
+
+
 def cmd_canary(args: argparse.Namespace) -> int:
     from .eval.canary import CanarySentinel
 
@@ -214,6 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="run even if the seed set no longer matches the frozen manifest hash",
     )
     p_quant.set_defaults(func=cmd_quant_eval)
+
+    p_parity = sub.add_parser(
+        "parity", help="EN/ES multilingual parity audit (equity gate); exits 1 on equity bugs"
+    )
+    p_parity.add_argument("--n", type=int, default=None, help="approximate total cases (default: full 50-case seed set)")
+    p_parity.add_argument("--out", default=None, help="write the markdown report here instead of stdout")
+    p_parity.set_defaults(func=cmd_parity)
 
     p_canary = sub.add_parser("canary", help="adversarial canary + rule-drift sentinel")
     p_canary.add_argument("--freeze", action="store_true", help="(re)write the drift baseline")

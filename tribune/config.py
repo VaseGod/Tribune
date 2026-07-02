@@ -57,6 +57,10 @@ class TribuneSettings(BaseSettings):
     pricing_path: str = ""
     pricing_date: str = ""
 
+    # -- Multilingual parity (equity gate) ------------------------------------ #
+    # Empty uses the packaged tribune/eval/parity_thresholds.json.
+    parity_thresholds_path: str = ""
+
     # -- General ------------------------------------------------------------ #
     default_jurisdiction: str = "EX"
     seed: int = 7

@@ -1,0 +1,9 @@
+{
+  "note": "Multilingual parity thresholds (equity gate). Deltas beyond these are filed as equity bugs, not footnotes. Token inflation alone (tokenizers encode Spanish ~1.33x less efficiently) is expected and gets a looser threshold; quality and cost deltas are the equity signal.",
+  "max_abstention_rate_delta": 0.05,
+  "max_over_refusal_rate_delta": 0.05,
+  "max_kappa_delta": 0.10,
+  "max_false_confidence_rate_delta": 0.02,
+  "max_cost_rel_delta": 0.25,
+  "max_tokens_rel_delta": 0.40
+}
