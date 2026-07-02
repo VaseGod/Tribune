@@ -145,6 +145,11 @@ Beyond `tribune eval` and `tribune canary`:
   plus a free deterministic mock for CI) over a frozen, hash-pinned 50-case seed
   set and generates
   [Eval Note #1: *Does abstention calibration survive quantization?*](docs/eval_notes/eval_note_1_quant_sensitivity.md)
+- **Multilingual parity** (`tribune parity`, [docs](docs/multilingual_parity.md)) —
+  EN/ES twins of the seed set through the full pipeline; deltas beyond
+  configurable thresholds are filed as **equity bugs** (distinct tracker label),
+  and machine-drafted legal terms are flagged for human review, never silently
+  deployed.
 
 ---
 
