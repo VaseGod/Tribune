@@ -97,6 +97,49 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quant_eval(args: argparse.Namespace) -> int:
+    from .eval.quant_sensitivity import backends, ladder, report, seedset
+
+    settings = get_settings()
+    print(_BANNER + "\n")
+
+    if args.freeze_seed:
+        cases = seedset.build_seed_set()
+        manifest = seedset.write_manifest(cases)
+        print(
+            f"Froze quant seed set: {manifest['n_cases']} cases, "
+            f"hash {manifest['content_hash'][:16]}…"
+        )
+        return 0
+
+    if args.config:
+        rungs = backends.load_ladder_config(args.config)
+    elif args.smoke:
+        rungs = backends.smoke_ladder()
+    else:
+        rungs = backends.default_mock_ladder()
+
+    if args.smoke:
+        cases = seedset.build_seed_set(
+            {p: max(1, n // 10) for p, n in seedset.SEED_WEIGHTS.items()}
+        )
+        manifest = {"content_hash": seedset.seed_set_hash(cases), "smoke": True}
+    else:
+        cases, manifest = seedset.load_frozen_seed_set(strict=not args.allow_drift)
+
+    result = ladder.run_ladder(rungs, cases=cases, settings=settings, manifest=manifest)
+    out_path = args.out or os.path.join("docs", "eval_notes", "eval_note_1_quant_sensitivity.md")
+    report.write_eval_note(result, out_path)
+    for r in result.rungs:
+        print(
+            f"[{r.rung.label:5s}] kappa={r.report.cohen_kappa:.3f} "
+            f"abstention={r.report.abstention_rate:.3f} ece={r.ece:.3f} "
+            f"kappa_vs_ref={r.kappa_vs_reference:.3f}"
+        )
+    print(f"\nWrote eval note to {out_path}")
+    return 0
+
+
 def cmd_canary(args: argparse.Namespace) -> int:
     from .eval.canary import CanarySentinel
 
@@ -155,6 +198,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="restrict to a program (repeatable), e.g. --program appeals",
     )
     p_eval.set_defaults(func=cmd_eval)
+
+    p_quant = sub.add_parser(
+        "quant-eval", help="verifier quantization-sensitivity ladder (Eval Note #1)"
+    )
+    p_quant.add_argument("--smoke", action="store_true", help="2 rungs x ~5 cases (CI)")
+    p_quant.add_argument("--config", default=None, help="JSON ladder config for real endpoints")
+    p_quant.add_argument("--out", default=None, help="output path for the markdown eval note")
+    p_quant.add_argument(
+        "--freeze-seed", action="store_true", help="(re)write the frozen seed-set manifest"
+    )
+    p_quant.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="run even if the seed set no longer matches the frozen manifest hash",
+    )
+    p_quant.set_defaults(func=cmd_quant_eval)
 
     p_canary = sub.add_parser("canary", help="adversarial canary + rule-drift sentinel")
     p_canary.add_argument("--freeze", action="store_true", help="(re)write the drift baseline")

@@ -136,6 +136,18 @@ Other knobs: `TRIBUNE_ABSTENTION_THRESHOLD` (default `0.70`), `TRIBUNE_DEFAULT_J
 
 ---
 
+## Eval suites
+
+Beyond `tribune eval` and `tribune canary`:
+
+- **Quantization sensitivity** (`tribune quant-eval`, [docs](docs/quant_sensitivity.md)) —
+  runs the verifier across a quantization ladder (llama.cpp GGUF / vLLM formats,
+  plus a free deterministic mock for CI) over a frozen, hash-pinned 50-case seed
+  set and generates
+  [Eval Note #1: *Does abstention calibration survive quantization?*](docs/eval_notes/eval_note_1_quant_sensitivity.md)
+
+---
+
 ## Cost accounting: cost per completed verification
 
 TRIBUNE meters every task — tokens in/out, proposer/verifier turns, and a cost

@@ -128,6 +128,52 @@ def krippendorff_alpha(units: list[tuple[str | None, ...]]) -> float:
     return 1.0 - do / de
 
 
+def brier_score(confidences: list[float], corrects: list[bool]) -> float:
+    """Mean squared error of confidence vs. correctness (lower is better)."""
+    pairs = list(zip(confidences, corrects, strict=True))
+    if not pairs:
+        return float("nan")
+    return sum((c - (1.0 if ok else 0.0)) ** 2 for c, ok in pairs) / len(pairs)
+
+
+def expected_calibration_error(
+    confidences: list[float], corrects: list[bool], n_bins: int = 10
+) -> float:
+    """ECE with equal-width bins: sum_b (n_b/n) * |acc_b - conf_b| (lower is better)."""
+    pairs = list(zip(confidences, corrects, strict=True))
+    n = len(pairs)
+    if n == 0:
+        return float("nan")
+    bins: list[list[tuple[float, bool]]] = [[] for _ in range(n_bins)]
+    for c, ok in pairs:
+        idx = min(n_bins - 1, max(0, int(c * n_bins)))
+        bins[idx].append((c, ok))
+    ece = 0.0
+    for bucket in bins:
+        if not bucket:
+            continue
+        avg_conf = sum(c for c, _ in bucket) / len(bucket)
+        accuracy = sum(1 for _, ok in bucket if ok) / len(bucket)
+        ece += (len(bucket) / n) * abs(accuracy - avg_conf)
+    return ece
+
+
+def calibration_over_assertions(records: list[EvalRecord]) -> tuple[float, float]:
+    """(ECE, Brier) of the calibrated confidence over *asserted* records.
+
+    Abstained records carry no assertion to score, so they are excluded here —
+    their calibration behavior is captured by the abstention-rate and
+    over-refusal metrics instead. This never scores an abstention as a failure.
+    """
+    asserted = [r for r in records if not r.abstained and r.confidence is not None]
+    confidences = [float(r.confidence) for r in asserted]  # type: ignore[arg-type]
+    corrects = [r.predicted_label == r.ground_truth_label for r in asserted]
+    return (
+        expected_calibration_error(confidences, corrects),
+        brier_score(confidences, corrects),
+    )
+
+
 def abstention_aware_utility(records: list[EvalRecord]) -> float:
     if not records:
         return float("nan")

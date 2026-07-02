@@ -36,3 +36,6 @@ jobs:
           tribune demo
           tribune eval --n 8
           tribune canary
+
+      - name: Smoke — quant-sensitivity ladder (2 mock rungs, ~5 cases)
+        run: tribune quant-eval --smoke --out /tmp/quant_smoke_note.md
