@@ -99,7 +99,7 @@ def recommend_action(status: EligibilityStatus) -> RecommendedAction:
 
 
 def get_provider_for_role(role: str, settings=None, recorder=None):
-    """Factory: ``role`` is 'proposer' or 'verifier'. Selected by config.
+    """Factory: ``role`` is 'proposer', 'verifier', or 'router'. Selected by config.
 
     ``recorder`` is an optional :class:`~tribune.instrumentation.usage.UsageRecorder`;
     providers report per-call token usage to it when present.
@@ -107,6 +107,12 @@ def get_provider_for_role(role: str, settings=None, recorder=None):
     from ..config import get_settings
 
     settings = settings or get_settings()
+
+    if role == "router" or (settings and getattr(settings, "provider", None) == "router"):
+        from .router import ModelRouter
+
+        return ModelRouter(settings=settings, recorder=recorder)
+
     if role == "verifier":
         kind, model = settings.verifier_provider, settings.verifier_model
     else:

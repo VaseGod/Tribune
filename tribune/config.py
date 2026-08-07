@@ -32,6 +32,26 @@ class TribuneSettings(BaseSettings):
     verifier_model: str = "Qwen/Qwen2.5-32B-Instruct"
     request_timeout_s: float = 60.0
 
+    # -- Tiered Model Router ------------------------------------------------ #
+    tier1_model: str = Field(
+        default_factory=lambda: os.getenv(
+            "DEFAULT_TIER1_MODEL",
+            os.getenv("TRIBUNE_DEFAULT_TIER1_MODEL", "GPT-5.6 Luna"),
+        )
+    )
+    tier2_model: str = Field(
+        default_factory=lambda: os.getenv(
+            "DEFAULT_TIER2_MODEL",
+            os.getenv("TRIBUNE_DEFAULT_TIER2_MODEL", "GPT-5.6 Sol"),
+        )
+    )
+    tier1_provider: Literal["local_rules", "openai_compat"] = "local_rules"
+    tier2_provider: Literal["local_rules", "openai_compat"] = "local_rules"
+    use_tiered_routing: bool = True
+    mcp_auth_token: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_MCP_AUTH_TOKEN", "")
+    )
+
     # -- Rule store / retrieval --------------------------------------------- #
     rule_store: Literal["local", "hosted"] = "local"
     hosted_vector_url: str = ""

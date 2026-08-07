@@ -166,6 +166,44 @@ Beyond `tribune eval` and `tribune canary`:
 
 ---
 
+## Model Context Protocol (MCP) Server Endpoint
+
+TRIBUNE exposes a standard, stateless **MCP server interface** (`POST /mcp`) allowing external agentic environments (e.g. Cursor, Claude Desktop, ChatGPT Agent Plugins) to natively inspect resources and call tools:
+
+- **JSON-RPC 2.0 Interface:** Endpoint at `/mcp` handling `initialize`, `resources/list`, `resources/read`, `tools/list`, and `tools/call`.
+- **Exposed Resources:**
+  - `tribune://programs` — Supported public benefit programs (SNAP, Medicaid, Unemployment, Housing, Appeals).
+  - `tribune://jurisdictions` — Known jurisdiction codes (e.g. EX, CA, NY, TX).
+  - `tribune://demo-cases` — Synthetic benchmark cases.
+  - `tribune://rules/{program}` — Governing rulesets and criteria.
+  - `tribune://cases/{case_id}` — Outcomes for an active case run.
+- **Exported Tools:**
+  - `tribune_run_case` — Run eligibility assessment for applicant parameters or document uploads.
+  - `tribune_search_rules` — Search program rules, criteria, and legal citations.
+  - `tribune_extract_fields` — Extract structured situation fields from raw text via OCR.
+  - `tribune_explain_assessment` — Grounded explanation of case results.
+- **Authentication & RBAC:** Enforces Bearer token / API key authentication when `TRIBUNE_MCP_AUTH_TOKEN` is set, and validates `X-Tribune-Role` headers for role-based permissions (e.g., `read_only` restrictions).
+- **OpenAI Agent Plugin Compatibility:** Exposes `/.well-known/ai-plugin.json` (plugin manifest) and `/api/openai-tools` (OpenAI Chat Completions compatible tool schemas).
+
+---
+
+## Tiered Model Routing Architecture
+
+TRIBUNE includes a central **`ModelRouter`** service layer that sits between system requests and LLM provider execution to optimize latency, cost, and reasoning quality:
+
+- **Tier 1 (Fast / Cheap / Utility):** Lightweight models (defaults: `GPT-5.6 Luna` / `Qwen/Qwen2.5-7B-Instruct`) for routine tasks such as parsing, classification, formatting, and query generation.
+- **Tier 2 (Deep Reasoning / Complex Synthesis):** Frontier models (defaults: `GPT-5.6 Sol` / `Qwen/Qwen2.5-32B-Instruct` / `Claude Opus` class) for multi-step reasoning, verifier checks, and complex synthesis.
+- **Task Classifier Heuristic:** Automatically determines task tier based on intent, context token length (>4,000 tokens -> Tier 2), role (`verifier` -> Tier 2), and program complexity (Medicaid/Housing -> Tier 2).
+- **Automatic Fallback:** If a Tier 1 model fails with an exception, outputs low confidence (`< 0.50`), or produces unparseable JSON/tool calls, `ModelRouter` automatically retries execution on Tier 2.
+- **Configuration:** Set environment variables to customize model assignments:
+  ```bash
+  export DEFAULT_TIER1_MODEL="GPT-5.6 Luna"
+  export DEFAULT_TIER2_MODEL="GPT-5.6 Sol"
+  export TRIBUNE_PROVIDER="router"
+  ```
+
+---
+
 ## Cost accounting: cost per completed verification
 
 TRIBUNE meters every task — tokens in/out, proposer/verifier turns, and a cost

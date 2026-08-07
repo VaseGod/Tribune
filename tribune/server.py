@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -25,6 +25,7 @@ from .config import TribuneSettings, get_settings
 from .corpus.programs import all_programs, benefit_programs, known_jurisdictions
 from .governance.action_gate import ActionBlocked, ActionGate, HumanSignoff
 from .ingestion.ocr import parse_text_to_fields
+from .mcp import MCPHandler, get_openai_plugin_manifest, get_openai_tools_schema
 from .orchestration.pipeline import CasePipeline
 from .types import ApplicantSituation, CaseRunResult, ProgramId, RawDocument, SyntheticCase
 
@@ -166,13 +167,55 @@ def meta() -> dict:
         "programs": [p.value for p in all_programs()],
         "benefit_programs": _DEFAULT_PROGRAMS,
         "program_names": PROGRAM_NAMES,
-        "providers": ["local_rules", "openai_compat"],
+        "providers": ["local_rules", "openai_compat", "router"],
         "defaults": {
             "jurisdiction": s.default_jurisdiction,
             "provider": s.provider,
             "abstention_threshold": s.abstention_threshold,
         },
     }
+
+
+# --------------------------------------------------------------------------- #
+# MCP & Agent Plugin routes
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request) -> dict:
+    """Model Context Protocol (MCP) JSON-RPC 2.0 endpoint."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error: invalid JSON"},
+        }
+    headers = dict(request.headers)
+    handler = MCPHandler(runs_store=_RUNS, settings=get_settings())
+    return handler.handle_request(payload, headers)
+
+
+@app.get("/mcp")
+def mcp_info() -> dict:
+    return {
+        "status": "ok",
+        "service": "tribune-mcp",
+        "protocolVersion": "2024-11-05",
+        "endpoint": "/mcp",
+    }
+
+
+@app.get("/.well-known/ai-plugin.json")
+def openai_plugin_manifest(request: Request) -> dict:
+    base_url = str(request.base_url)
+    return get_openai_plugin_manifest(base_url)
+
+
+@app.get("/api/openai-tools")
+def openai_tools_schema() -> dict:
+    return {"tools": get_openai_tools_schema()}
 
 
 @app.get("/api/cases/demo")

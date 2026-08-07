@@ -82,6 +82,10 @@ class Registry(BaseModel):
         return self
 
 
+Candidate.model_rebuild()
+Registry.model_rebuild()
+
+
 def load_registry(path: str) -> Registry:
     with open(path, encoding="utf-8") as fh:
         payload = yaml.safe_load(fh)
