@@ -1,11 +1,11 @@
 """Tests for Model Context Protocol (MCP) server interface and plugin endpoints."""
 
 import json
+
 import pytest
 from fastapi.testclient import TestClient
 
-from tribune.config import TribuneSettings, get_settings, reset_settings_cache
-from tribune.mcp import MCPHandler, MCPAuthError, check_mcp_auth
+from tribune.config import reset_settings_cache
 from tribune.server import app
 
 

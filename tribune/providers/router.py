@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
 from ..config import TribuneSettings, get_settings
 from ..instrumentation.usage import UsageRecorder

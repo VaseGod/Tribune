@@ -12,10 +12,9 @@ from typing import Any
 from .casegen.synthetic import SyntheticCaseGenerator
 from .config import TribuneSettings, get_settings
 from .corpus.programs import all_programs, get_ruleset, known_jurisdictions
-from .governance.action_gate import HumanSignoff
 from .ingestion.ocr import parse_text_to_fields
 from .orchestration.pipeline import CasePipeline
-from .types import ApplicantSituation, ProgramId, RawDocument, SyntheticCase
+from .types import ApplicantSituation, ProgramId, RawDocument
 
 # MCP Protocol Version
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -381,7 +380,7 @@ class MCPHandler:
             return json.dumps({"extracted_fields": fields}, indent=2)
 
         if name == "tribune_explain_assessment":
-            from .server import build_chat_reply, ChatMessage
+            from .server import ChatMessage, build_chat_reply
 
             case_id = args.get("case_id", "")
             query = args.get("query", "")

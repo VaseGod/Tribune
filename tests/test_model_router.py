@@ -1,10 +1,7 @@
 """Tests for Tiered Model Router."""
 
-import os
-import pytest
-from tribune.config import TribuneSettings, reset_settings_cache
+from tribune.config import reset_settings_cache
 from tribune.providers.base import (
-    CriterionResult,
     EligibilityStatus,
     ProgramId,
     ReviewRequest,
@@ -13,7 +10,6 @@ from tribune.providers.base import (
     SynthesisResult,
     get_provider_for_role,
 )
-from tribune.providers.local_rules import LocalRulesProvider
 from tribune.providers.router import ModelRouter
 
 
