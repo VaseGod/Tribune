@@ -1,0 +1,32 @@
+# TRIBUNE Pipeline YAML Configuration File
+
+provider: "local_rules"
+
+openai:
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+
+anthropic:
+  base_url: "https://api.anthropic.com/v1"
+  model: "claude-3-5-sonnet-20241022"
+
+deepseek:
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-v4-flash"
+  reasoning_effort: "medium"
+
+vllm:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen2.5-7B-Instruct"
+
+local_fallback:
+  url: "http://localhost:8001/v1"
+  model: "local-quant-moe-3bit"
+  enabled: true
+
+static_analysis:
+  semgrep_binary: "semgrep"
+  timeout_s: 30.0
+
+pricing:
+  path: "tribune/eval/pricing.json"

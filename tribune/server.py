@@ -167,13 +167,20 @@ def meta() -> dict:
         "programs": [p.value for p in all_programs()],
         "benefit_programs": _DEFAULT_PROGRAMS,
         "program_names": PROGRAM_NAMES,
-        "providers": ["local_rules", "openai_compat", "router"],
+        "providers": ["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "router"],
         "defaults": {
             "jurisdiction": s.default_jurisdiction,
             "provider": s.provider,
             "abstention_threshold": s.abstention_threshold,
         },
     }
+
+
+@app.get("/api/telemetry")
+def get_telemetry() -> dict:
+    """Real-time operational token and cost telemetry endpoint."""
+    from .instrumentation.telemetry import GLOBAL_TELEMETRY_STORE
+    return GLOBAL_TELEMETRY_STORE.get_summary()
 
 
 # --------------------------------------------------------------------------- #

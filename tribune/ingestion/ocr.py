@@ -30,18 +30,71 @@ def _normalize_key(label: str) -> str:
     return label.strip().lower().replace(" ", "_")
 
 
-def parse_text_to_fields(text: str) -> dict[str, str]:
-    """Parse ``key: value`` lines from OCR'd text into known evidence fields."""
+_ALIAS_MAP: dict[str, str] = {
+    "gross_income": EvidenceType.MONTHLY_INCOME.value,
+    "gross_pay": EvidenceType.MONTHLY_INCOME.value,
+    "monthly_pay": EvidenceType.MONTHLY_INCOME.value,
+    "total_wages": EvidenceType.MONTHLY_INCOME.value,
+    "base_earnings": EvidenceType.BASE_PERIOD_EARNINGS.value,
+    "earnings": EvidenceType.BASE_PERIOD_EARNINGS.value,
+    "rent": EvidenceType.MONTHLY_RENT.value,
+    "rent_amount": EvidenceType.MONTHLY_RENT.value,
+    "lease_amount": EvidenceType.MONTHLY_RENT.value,
+    "days_denied": EvidenceType.DAYS_SINCE_DENIAL.value,
+    "denial_days": EvidenceType.DAYS_SINCE_DENIAL.value,
+    "household": EvidenceType.HOUSEHOLD_SIZE.value,
+    "family_size": EvidenceType.HOUSEHOLD_SIZE.value,
+    "state": EvidenceType.RESIDENCY_STATE.value,
+    "jurisdiction": EvidenceType.RESIDENCY_STATE.value,
+}
+
+_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?:gross\s+(?:income|pay)|monthly\s+pay|total\s+wages)\s*[:=$-]\s*\$?([0-9,]+(?:\.[0-9]+)?)", re.I), EvidenceType.MONTHLY_INCOME.value),
+    (re.compile(r"(?:annual\s+income|yearly\s+pay)\s*[:=$-]\s*\$?([0-9,]+(?:\.[0-9]+)?)", re.I), EvidenceType.ANNUAL_INCOME.value),
+    (re.compile(r"(?:base\s+period\s+earnings|wages)\s*[:=$-]\s*\$?([0-9,]+(?:\.[0-9]+)?)", re.I), EvidenceType.BASE_PERIOD_EARNINGS.value),
+    (re.compile(r"(?:monthly\s+rent|rent\s+amount|rent)\s*[:=$-]\s*\$?([0-9,]+(?:\.[0-9]+)?)", re.I), EvidenceType.MONTHLY_RENT.value),
+    (re.compile(r"(?:days\s+since\s+denial|denial\s+days|days\s+elapsed)\s*[:=$-]\s*([0-9]+)", re.I), EvidenceType.DAYS_SINCE_DENIAL.value),
+    (re.compile(r"(?:household\s+size|family\s+size|members)\s*[:=$-]\s*([0-9]+)", re.I), EvidenceType.HOUSEHOLD_SIZE.value),
+    (re.compile(r"(?:liquid\s+assets|bank\s+balance|assets)\s*[:=$-]\s*\$?([0-9,]+(?:\.[0-9]+)?)", re.I), EvidenceType.LIQUID_ASSETS.value),
+    (re.compile(r"(?:residency\s+state|state|jurisdiction)\s*[:=$-]\s*([A-Za-z]{2})", re.I), EvidenceType.RESIDENCY_STATE.value),
+]
+
+
+def fast_heuristic_parse(text: str, doc_type: str = "") -> dict[str, str]:
+    """Lightweight, high-speed heuristic parsing pipeline using layout extraction regexes.
+
+    Completes initial text parsing before falling back to heavy VLM or OCR processing.
+    Handles wage stubs, lease agreements, and decision notices.
+    """
     fields: dict[str, str] = {}
+    if not text:
+        return fields
+
     known = {e.value for e in EvidenceType}
     for line in text.splitlines():
-        m = _LINE_RE.match(line)
-        if not m:
+        line = line.strip()
+        if not line:
             continue
-        key = _normalize_key(m.group(1))
-        if key in known:
-            fields[key] = m.group(2)
+        m = _LINE_RE.match(line)
+        if m:
+            key = _normalize_key(m.group(1))
+            val = m.group(2).strip()
+            mapped_key = _ALIAS_MAP.get(key, key)
+            if mapped_key in known:
+                fields[mapped_key] = val
+
+    for pattern, etype_val in _PATTERNS:
+        if etype_val not in fields:
+            match = pattern.search(text)
+            if match:
+                fields[etype_val] = match.group(1)
+
     return fields
+
+
+def parse_text_to_fields(text: str) -> dict[str, str]:
+    """Parse ``key: value`` lines from text into known evidence fields via fast heuristic path."""
+    return fast_heuristic_parse(text)
 
 
 class OcrIngest:
@@ -67,25 +120,31 @@ class OcrIngest:
         return body.get("text", "")
 
     def ingest(self, doc: RawDocument) -> list[Evidence]:
-        # Path 1: a real scan + configured OCR server.
+        fields = dict(doc.fields)
+        if doc.text:
+            fast_fields = fast_heuristic_parse(doc.text, doc.doc_type)
+            for k, v in fast_fields.items():
+                fields.setdefault(k, v)
+
+        # Path 1: If text or fields fast path completed, parse directly
+        if fields:
+            fields = {k: v for k, v in fields.items() if coerce_value(_safe_type(k), str(v)) is not None}
+            parsed = RawDocument(doc_id=doc.doc_id, doc_type=doc.doc_type, text=doc.text, fields=fields)
+            return fields_to_evidence(parsed, IngestMethod.OCR)
+
+        # Path 2: Heavier OCR endpoint processing fallback for images without extracted text
         if self._endpoint and doc.image_path:  # pragma: no cover - needs endpoint
             text = self._ocr_image(doc.image_path)
+            fast_fields = fast_heuristic_parse(text, doc.doc_type)
             parsed = RawDocument(
                 doc_id=doc.doc_id,
                 doc_type=doc.doc_type,
                 text=text,
-                fields=parse_text_to_fields(text),
+                fields=fast_fields,
             )
             return fields_to_evidence(parsed, IngestMethod.OCR)
 
-        # Path 2 (offline fallback): parse already-extracted text, or, if the
-        # document carries structured fields, use those directly.
-        fields = dict(doc.fields)
-        if not fields and doc.text:
-            fields = parse_text_to_fields(doc.text)
-        else:
-            # Validate/normalize any text-derived values that are present.
-            fields = {k: v for k, v in fields.items() if coerce_value(_safe_type(k), v) is not None}
+        fields = {k: v for k, v in fields.items() if coerce_value(_safe_type(k), str(v)) is not None}
         parsed = RawDocument(doc_id=doc.doc_id, doc_type=doc.doc_type, text=doc.text, fields=fields)
         return fields_to_evidence(parsed, IngestMethod.OCR)
 

@@ -86,15 +86,29 @@ def _compare_to_reference(rung: RungResult, reference: RungResult) -> None:
     rung.ece_drift = rung.ece - reference.ece
 
 
+def verify_program_coverage(cases: list[SyntheticCase]) -> bool:
+    """Verify sensitivity checks evaluate accuracy across all standard benefit program datasets."""
+    from ...types import ProgramId
+    covered = {c.target_programs[0] for c in cases if c.target_programs}
+    required = {ProgramId.SNAP, ProgramId.MEDICAID, ProgramId.HOUSING, ProgramId.UNEMPLOYMENT, ProgramId.APPEALS}
+    return required.issubset(covered)
+
+
 def run_ladder(
-    rungs: list[QuantRung],
+    rungs: list[QuantRung] | None = None,
     cases: list[SyntheticCase] | None = None,
     settings: TribuneSettings | None = None,
     manifest: dict | None = None,
 ) -> LadderResult:
     base_settings = settings or get_settings()
+    if rungs is None:
+        rungs = default_mock_ladder()
     if cases is None:
         cases = build_seed_set()
+
+    if not verify_program_coverage(cases):
+        raise ValueError("Seed set must cover all standard benefit programs: SNAP, Medicaid, Housing, Unemployment, Appeals")
+
     if manifest is None:
         manifest = load_manifest() or {}
     manifest = dict(manifest)

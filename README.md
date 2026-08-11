@@ -99,14 +99,31 @@ For each program in a person's situation:
 2. The **eligibility proposer** retrieves the governing rules (late-interaction retrieval), evaluates each rule's predicate against the documented evidence, and synthesizes a typed, fully-cited `Assessment` (status + per-criterion results + recommended action + self-reported confidence).
 3. The **verifier** independently re-derives the assessment from the *cited* rules and checks citation integrity, rule **coverage**, and support. It can reject → **REPLAN** (the router widens retrieval and retries — a real retrieval-recall recovery).
 4. **Calibrated abstention**: if calibrated confidence is below threshold — or the case hits a structural ambiguity signal, or verification failed, or the status is indeterminate — TRIBUNE **abstains and routes to a human**. Abstention is logged as a first-class, correct-when-uncertain outcome.
-5. If the assessment clears verification and confidence, the **preparer** assembles materials and a document checklist — but the **action-gate** ensures nothing binding is submitted.
+5. If the assessment clears verification and confidence, the **preparer** assembles materials and a document checklist — but the **action-gate** enforces mandatory epistemic citation verification, ensuring no uncited claims or invalid statutory references can be submitted.
 6. Every step writes a record to an append-only, **hash-chained audit log**; `disclosure.py` renders it as a plain-language "here's why."
 
 ---
 
 ## Swapping in real backends (run it sovereignly)
 
-Everything external sits behind an interface with a working local fallback. Flip one environment variable to use a real backend.
+Everything external sits behind an interface with a working local fallback. Flip one environment variable or backend profile to run sovereignly.
+
+**Local Sovereign Endpoint (Meta's Muse Glimmer 30B GGUF with Speculative Decoding):**
+Register local model backends in [backends/registry.yaml](backends/registry.yaml):
+```yaml
+muse_glimmer_local:
+  provider: openai_compat
+  base_url: "http://localhost:8080/v1"
+  model_name: "Muse-Glimmer-30B-GGUF"
+  parameters:
+    temperature: 0.1
+    max_tokens: 4096
+    extra_body:
+      speculative_drafter: "DFlash"
+      sliding_window_attention: true
+      kv_cache_type: "q8_0"
+```
+The `openai_compat` provider forwards `extra_body` parameters (such as `speculative_drafter`, `sliding_window_attention`, and `kv_cache_type`) directly in completion requests to local servers (vLLM / llama.cpp).
 
 **Self-hosted model (vLLM / SGLang / any OpenAI-compatible endpoint):**
 ```bash
@@ -117,6 +134,15 @@ export TRIBUNE_OPENAI_MODEL=Qwen/Qwen2.5-7B-Instruct
 export TRIBUNE_VERIFIER_PROVIDER=openai_compat
 export TRIBUNE_VERIFIER_MODEL=Qwen/Qwen2.5-32B-Instruct
 ```
+
+**Low-Latency Document Ingestion Fast Path:**
+Document intake for wage stubs, lease agreements, and decision notices executes a high-speed heuristic regex/layout parser (`fast_heuristic_parse`) before falling back to heavier OCR or VLM processing, minimizing intake latency and token consumption.
+
+**Programmatic Python Agent Stubs:**
+Agent tool interfaces (`tribune/agents/`) use strongly-typed Python executable class stubs (`ProgrammaticEligibilityTools`, `ProgrammaticPreparerTools`, `ProgrammaticNavigatorTools`, `ProgrammaticVerifierTools`) with explicit docstrings and type hints exposed directly to model prompts.
+
+**Epistemic Citation Verification Gates:**
+`ActionGate` and `Verifier` enforce a mandatory citation gate for local model outputs. Every eligibility determination and legal claim must match an active entry in `rule_store.py`. Outputs with uncited claims or invalid statutory references are intercepted, blocked via `ActionBlocked`, and flagged for human review.
 
 **Hosted vector store** for retrieval:
 ```bash
@@ -141,10 +167,7 @@ Other knobs: `TRIBUNE_ABSTENTION_THRESHOLD` (default `0.70`), `TRIBUNE_DEFAULT_J
 Beyond `tribune eval` and `tribune canary`:
 
 - **Quantization sensitivity** (`tribune quant-eval`, [docs](docs/quant_sensitivity.md)) —
-  runs the verifier across a quantization ladder (llama.cpp GGUF / vLLM formats,
-  plus a free deterministic mock for CI) over a frozen, hash-pinned 50-case seed
-  set and generates
-  [Eval Note #1: *Does abstention calibration survive quantization?*](docs/eval_notes/eval_note_1_quant_sensitivity.md)
+  runs the verifier across a quantization ladder featuring 4-bit and 5-bit GGUF targets (`Q4_K_XL`, `Q5_K_M`, `Q8_0`, `Q4_K_M`, `Q2_K`, `IQ1_S`) evaluated across all standard benefit datasets (SNAP, Medicaid, Housing, Unemployment, Appeals) over a frozen 50-case seed set.
 - **Multilingual parity** (`tribune parity`, [docs](docs/multilingual_parity.md)) —
   EN/ES twins of the seed set through the full pipeline; deltas beyond
   configurable thresholds are filed as **equity bugs** (distinct tracker label),

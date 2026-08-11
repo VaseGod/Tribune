@@ -30,10 +30,56 @@ from ..types import (
 )
 
 
+class ProgrammaticVerifierTools:
+    """Typed Python stubs executed directly in-code by verifier agent loops."""
+
+    @staticmethod
+    def verify_citation_mapping(criterion_id: str, citation_id: str, rule_citations: list[str]) -> dict:
+        """Verify that criterion citation matches expected rule citation."""
+        is_valid = citation_id in rule_citations
+        return {
+            "criterion_id": criterion_id,
+            "citation_id": citation_id,
+            "is_valid": is_valid,
+        }
+
+    @staticmethod
+    def rederive_status(criteria_outcomes: list[str]) -> dict:
+        """Re-derive overall eligibility status from criterion outcome strings."""
+        if any(o == "ineligible" for o in criteria_outcomes):
+            status = "likely_ineligible"
+        elif any(o == "unknown" for o in criteria_outcomes):
+            status = "indeterminate"
+        else:
+            status = "likely_eligible"
+        return {"rederived_status": status}
+
+    @classmethod
+    def get_tool_signatures(cls) -> str:
+        """Expose typed Python signatures for model prompt generation."""
+        return (
+            "class ProgrammaticVerifierTools:\n"
+            "    @staticmethod\n"
+            "    def verify_citation_mapping(criterion_id: str, citation_id: str, rule_citations: list[str]) -> dict: ...\n"
+            "    @staticmethod\n"
+            "    def rederive_status(criteria_outcomes: list[str]) -> dict: ...\n"
+        )
+
+
 class Verifier:
     def __init__(self, provider: ModelProvider, rule_store: RuleStore) -> None:
         self.provider = provider
         self.rule_store = rule_store
+        self.tools = ProgrammaticVerifierTools()
+
+    def generate_prompt(self, assessment: Assessment) -> str:
+        """Generate prompt incorporating programmatic Python tool signatures."""
+        return (
+            f"You are the verifier for assessment '{assessment.assessment_id}'.\n"
+            "You have access to the following executable Python stubs:\n\n"
+            f"{ProgrammaticVerifierTools.get_tool_signatures()}\n"
+            "Use these tools directly to check citation mappings and re-derive statuses."
+        )
 
     def verify(
         self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
@@ -47,6 +93,13 @@ class Verifier:
         unsupported_claims: list[str] = []
         reasons: list[str] = []
 
+        # Mandatory citation verification against RuleStore
+        active_citations = self.rule_store.all_citations(program, jurisdiction)
+        active_cids = {c.citation_id for c in active_citations}
+        for cit in assessment.citations:
+            if cit.citation_id not in active_cids:
+                missing_citations.append(f"invalid statutory citation '{cit.citation_id}'")
+
         # Re-derive every criterion the assessment took a position on, from its rule.
         recomputed_for_assessment: list[CriterionResult] = []
         for crit in assessment.criteria:
@@ -55,8 +108,11 @@ class Verifier:
                 unsupported_claims.append(f"unknown criterion '{crit.criterion_id}'")
                 continue
             expected_cid = rule.citation(program, jurisdiction).citation_id
-            if crit.outcome is not CriterionOutcome.UNKNOWN and expected_cid not in crit.citation_ids:
-                missing_citations.append(crit.criterion_id)
+            if crit.outcome is not CriterionOutcome.UNKNOWN:
+                if not crit.citation_ids:
+                    missing_citations.append(f"uncited claim for criterion '{crit.criterion_id}'")
+                elif expected_cid not in crit.citation_ids or any(cid not in active_cids for cid in crit.citation_ids):
+                    missing_citations.append(crit.criterion_id)
             recomputed = rule.predicate(view, profile)
             recomputed_for_assessment.append(
                 CriterionResult(

@@ -21,14 +21,39 @@ class TribuneSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRIBUNE_", extra="ignore")
 
     # -- Model provider ----------------------------------------------------- #
-    # "local_rules" is the deterministic, offline default. "openai_compat" talks
-    # to any OpenAI-compatible endpoint (vLLM / SGLang / etc.) hosting your model.
-    provider: Literal["local_rules", "openai_compat"] = "local_rules"
+    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "anthropic", "deepseek", "vllm"
+    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm"] = "local_rules"
     openai_base_url: str = "http://localhost:8000/v1"
     openai_api_key: str = "not-needed-for-local-serving"
     openai_model: str = "Qwen/Qwen2.5-7B-Instruct"
+
+    # Anthropic API parameters
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-3-5-sonnet-20241022"
+
+    # DeepSeek API parameters (including DeepSeek-V4-Flash reasoning_effort)
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_reasoning_effort: Literal["low", "medium", "high"] = "medium"
+
+    # Open-weight / Local vLLM parameters
+    vllm_base_url: str = "http://localhost:8000/v1"
+    vllm_api_key: str = "token-vllm-local"
+    vllm_model: str = "Qwen/Qwen2.5-7B-Instruct"
+
+    # Local Quantized Fallback Endpoint (3-bit MoE / local server)
+    local_fallback_url: str = "http://localhost:8001/v1"
+    local_fallback_model: str = "local-quant-moe-3bit"
+    enable_local_fallback: bool = True
+
+    # Static Analysis Path & Execution
+    semgrep_binary: str = "semgrep"
+    static_analysis_timeout_s: float = 30.0
+
     # The verifier can run on a *stronger* model than the proposer.
-    verifier_provider: Literal["local_rules", "openai_compat"] = "local_rules"
+    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm"] = "local_rules"
     verifier_model: str = "Qwen/Qwen2.5-32B-Instruct"
     request_timeout_s: float = 60.0
 

@@ -72,6 +72,8 @@ class Registry(BaseModel):
     version: int
     seed_set: str
     candidates: list[Candidate]
+    muse_glimmer_local: dict | None = None
+
 
     @model_validator(mode="after")
     def _unique_ids(self) -> Registry:

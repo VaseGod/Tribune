@@ -32,3 +32,87 @@ def test_signoff_intent_must_match_program_and_case():
     wrong = HumanSignoff.issue("navigator-jane", "medicaid", "c1")  # wrong program
     with pytest.raises(ActionBlocked):
         ActionGate().authorize_submission(_materials(), wrong)
+
+
+def test_citation_verification_gate_passes_for_valid_citations():
+    from tribune.corpus.rule_store import LocalRuleStore
+    from tribune.types import Assessment, Citation, CriterionResult, CriterionOutcome, EligibilityStatus, RecommendedAction
+
+    store = LocalRuleStore()
+    citations = store.all_citations(ProgramId.SNAP, "EX")
+    valid_citation = citations[0]
+
+    crit = CriterionResult(
+        criterion_id="snap_gross_income",
+        description="Gross income test",
+        outcome=CriterionOutcome.SATISFIED,
+        required=True,
+        citation_ids=[valid_citation.citation_id],
+    )
+    assessment = Assessment(
+        assessment_id="c1:snap:a1",
+        case_id="c1",
+        program=ProgramId.SNAP,
+        jurisdiction="EX",
+        status=EligibilityStatus.LIKELY_ELIGIBLE,
+        criteria=[crit],
+        citations=[valid_citation],
+        recommended_action=RecommendedAction.PREPARE_APPLICATION,
+        self_confidence=0.9,
+        rationale="Valid test rationale",
+    )
+
+    gate = ActionGate()
+    is_valid, violations = gate.verify_citations(assessment, store)
+    assert is_valid is True
+    assert len(violations) == 0
+
+    signoff = HumanSignoff.issue("navigator-jane", "snap", "c1")
+    receipt = gate.authorize_submission(_materials(), signoff, assessment=assessment, rule_store=store)
+    assert receipt.authorized_by == "navigator-jane"
+
+
+def test_citation_verification_gate_blocks_uncited_and_invalid_statutory_claims():
+    from tribune.corpus.rule_store import LocalRuleStore
+    from tribune.types import Assessment, Citation, CriterionResult, CriterionOutcome, EligibilityStatus, RecommendedAction
+
+    store = LocalRuleStore()
+    invalid_citation = Citation(
+        citation_id="invalid_fake_citation_999",
+        program=ProgramId.SNAP,
+        jurisdiction="EX",
+        title="Fake Title",
+        source="Fake Code § 999",
+        text="Fake statutory rule text",
+    )
+
+    crit = CriterionResult(
+        criterion_id="snap_gross_income",
+        description="Gross income test",
+        outcome=CriterionOutcome.SATISFIED,
+        required=True,
+        citation_ids=["invalid_fake_citation_999"],
+    )
+    assessment = Assessment(
+        assessment_id="c1:snap:a1",
+        case_id="c1",
+        program=ProgramId.SNAP,
+        jurisdiction="EX",
+        status=EligibilityStatus.LIKELY_ELIGIBLE,
+        criteria=[crit],
+        citations=[invalid_citation],
+        recommended_action=RecommendedAction.PREPARE_APPLICATION,
+        self_confidence=0.9,
+        rationale="Test rationale with invalid citation",
+    )
+
+    gate = ActionGate()
+    is_valid, violations = gate.verify_citations(assessment, store)
+    assert is_valid is False
+    assert any("Invalid statutory reference" in v for v in violations)
+
+    signoff = HumanSignoff.issue("navigator-jane", "snap", "c1")
+    with pytest.raises(ActionBlocked, match="Submission blocked: uncited claims or invalid statutory references detected"):
+        gate.authorize_submission(_materials(), signoff, assessment=assessment, rule_store=store)
+
+

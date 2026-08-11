@@ -105,3 +105,42 @@ def test_main_exits_zero_on_committed_registry(capsys):
     rc = vr.main(["--path", _REGISTRY])
     assert rc == 0
     assert "schema OK" in capsys.readouterr().out
+
+
+def test_muse_glimmer_local_profile_configured():
+    registry = vr.load_registry(_REGISTRY)
+    assert registry.muse_glimmer_local is not None
+    mgl = registry.muse_glimmer_local
+    assert mgl["provider"] == "openai_compat"
+    assert mgl["base_url"] == "http://localhost:8080/v1"
+    assert mgl["model_name"] == "Muse-Glimmer-30B-GGUF"
+    assert mgl["parameters"]["temperature"] == 0.1
+    assert mgl["parameters"]["max_tokens"] == 4096
+    extra = mgl["parameters"]["extra_body"]
+    assert extra["speculative_drafter"] == "DFlash"
+    assert extra["sliding_window_attention"] is True
+    assert extra["kv_cache_type"] == "q8_0"
+
+
+def test_openai_compat_extra_body_forwarding():
+    from tribune.config import get_settings
+    from tribune.providers.openai_compat import OpenAICompatProvider
+
+    settings = get_settings()
+    extra_body = {
+        "speculative_drafter": "DFlash",
+        "sliding_window_attention": True,
+        "kv_cache_type": "q8_0",
+    }
+    provider = OpenAICompatProvider(
+        model="Muse-Glimmer-30B-GGUF",
+        settings=settings,
+        role="proposer",
+        extra_body=extra_body,
+        temperature=0.1,
+        max_tokens=4096,
+    )
+    assert provider.extra_body == extra_body
+    assert provider.temperature == 0.1
+    assert provider.max_tokens == 4096
+

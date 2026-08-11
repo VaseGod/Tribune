@@ -4,9 +4,41 @@
   "note": "Pricing is data, not code. First backend whose model_pattern matches wins, so keep specific patterns above catch-alls. Rates carry effective dates so promotional pricing expires on schedule. Self-hosted entries amortize $/GPU-hour over *your measured* throughput — replace the defaults with numbers measured on your hardware.",
   "backends": [
     {
-      "backend_id": "anthropic:claude-sonnet-5",
+      "backend_id": "deepseek:v4-flash",
       "kind": "api",
-      "model_patterns": ["*claude-sonnet-5*"],
+      "model_patterns": ["*deepseek-v4-flash*", "deepseek:deepseek-v4-flash*"],
+      "rates": [
+        {
+          "effective_from": "2026-01-01",
+          "effective_until": null,
+          "input_per_m": 0.14,
+          "output_per_m": 0.28,
+          "cache_read_per_m": 0.014,
+          "cache_write_per_m": 0.14,
+          "note": "DeepSeek-V4-Flash high throughput pricing"
+        }
+      ]
+    },
+    {
+      "backend_id": "deepseek:chat",
+      "kind": "api",
+      "model_patterns": ["*deepseek-chat*", "*deepseek-reasoner*", "deepseek:*"],
+      "rates": [
+        {
+          "effective_from": "2025-01-01",
+          "effective_until": null,
+          "input_per_m": 0.27,
+          "output_per_m": 1.10,
+          "cache_read_per_m": 0.07,
+          "cache_write_per_m": 0.27,
+          "note": "DeepSeek V3 / R1 pricing"
+        }
+      ]
+    },
+    {
+      "backend_id": "anthropic:claude-3-5-sonnet",
+      "kind": "api",
+      "model_patterns": ["*claude-3-5-sonnet*", "*claude-sonnet-5*", "anthropic:*"],
       "rates": [
         {
           "effective_from": "2025-11-24",
@@ -29,9 +61,25 @@
       ]
     },
     {
+      "backend_id": "openai:gpt-4o",
+      "kind": "api",
+      "model_patterns": ["*gpt-4o*", "openai:*"],
+      "rates": [
+        {
+          "effective_from": "2025-01-01",
+          "effective_until": null,
+          "input_per_m": 2.50,
+          "output_per_m": 10.00,
+          "cache_read_per_m": 1.25,
+          "cache_write_per_m": 2.50,
+          "note": "OpenAI GPT-4o list price"
+        }
+      ]
+    },
+    {
       "backend_id": "selfhost:openai-compat-default",
       "kind": "self_hosted",
-      "model_patterns": ["openai_compat:*"],
+      "model_patterns": ["openai_compat:*", "vllm:*", "*qwen*"],
       "rates": [
         {
           "effective_from": "2026-01-01",
@@ -45,7 +93,7 @@
     {
       "backend_id": "local:rules",
       "kind": "free",
-      "model_patterns": ["local_rules*", "mock_quant*"],
+      "model_patterns": ["local_rules*", "mock_quant*", "local-quant*", "local_fallback*"],
       "rates": [
         {
           "effective_from": "2020-01-01",

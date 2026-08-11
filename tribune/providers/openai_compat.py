@@ -68,6 +68,9 @@ class OpenAICompatProvider:
         settings: TribuneSettings,
         role: str = "proposer",
         recorder: UsageRecorder | None = None,
+        extra_body: dict | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
     ) -> None:
         self.role = role
         self.model = model
@@ -77,6 +80,9 @@ class OpenAICompatProvider:
         self._base = settings.openai_base_url.rstrip("/")
         self._key = settings.openai_api_key
         self._timeout = settings.request_timeout_s
+        self.extra_body = extra_body or {}
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
     # -- transport ---------------------------------------------------------- #
 
@@ -87,9 +93,15 @@ class OpenAICompatProvider:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.0,
+            "temperature": self.temperature,
             "response_format": {"type": "json_object"},
         }
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+        if self.extra_body:
+            payload["extra_body"] = self.extra_body
+            for k, v in self.extra_body.items():
+                payload[k] = v
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self._base}/chat/completions",

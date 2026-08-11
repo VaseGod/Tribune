@@ -52,6 +52,8 @@ def default_mock_ladder() -> list[QuantRung]:
         QuantRung("fp16", "fp16", flip_prob=0.0, reference=True,
                   notes="full-precision reference"),
         QuantRung("q8", "gguf-q8_0", flip_prob=0.02),
+        QuantRung("q5_k_m", "gguf-q5_k_m", flip_prob=0.04, notes="5-bit GGUF quantization target"),
+        QuantRung("q4_k_xl", "gguf-q4_k_xl", flip_prob=0.05, notes="4-bit GGUF quantization target"),
         QuantRung("q4", "gguf-q4_k_m", flip_prob=0.06),
         QuantRung("q2", "gguf-q2_k", flip_prob=0.22),
         QuantRung("iq1", "gguf-iq1_s", flip_prob=0.40,

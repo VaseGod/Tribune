@@ -11,7 +11,8 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 
-from ..types import PreparedMaterials, SubmissionReceipt
+from ..types import Assessment, CriterionOutcome, PreparedMaterials, SubmissionReceipt
+from ..corpus.rule_store import RuleStore
 
 
 class ActionBlocked(PermissionError):
@@ -40,9 +41,54 @@ class ActionGate:
         """Preparation is always allowed and never marks anything submitted."""
         return materials  # submitted is structurally pinned False on the model
 
+    def verify_citations(
+        self, assessment: Assessment, rule_store: RuleStore | None = None
+    ) -> tuple[bool, list[str]]:
+        """Mandatory citation verification gate for local model outputs.
+
+        Requires every eligibility determination or legal claim to contain an exact,
+        verifiable citation matching an active entry in rule_store.
+        Returns (is_valid, list_of_violations).
+        """
+        if rule_store is None:
+            from ..corpus.rule_store import LocalRuleStore
+            rule_store = LocalRuleStore()
+
+        active_citations = rule_store.all_citations(assessment.program, assessment.jurisdiction)
+        active_ids = {c.citation_id for c in active_citations}
+
+        violations: list[str] = []
+        if not assessment.citations:
+            violations.append("Assessment contains no statutory citations.")
+
+        for citation in assessment.citations:
+            if citation.citation_id not in active_ids:
+                violations.append(f"Invalid statutory reference citation ID '{citation.citation_id}'")
+
+        for crit in assessment.criteria:
+            if crit.outcome is not CriterionOutcome.UNKNOWN:
+                if not crit.citation_ids:
+                    violations.append(f"Uncited claim for criterion '{crit.criterion_id}'")
+                else:
+                    for cid in crit.citation_ids:
+                        if cid not in active_ids:
+                            violations.append(f"Criterion '{crit.criterion_id}' references invalid citation ID '{cid}'")
+
+        return len(violations) == 0, violations
+
     def authorize_submission(
-        self, materials: PreparedMaterials, signoff: HumanSignoff | None
+        self,
+        materials: PreparedMaterials,
+        signoff: HumanSignoff | None,
+        assessment: Assessment | None = None,
+        rule_store: RuleStore | None = None,
     ) -> SubmissionReceipt:
+        if assessment is not None:
+            is_valid, violations = self.verify_citations(assessment, rule_store)
+            if not is_valid:
+                raise ActionBlocked(
+                    f"Submission blocked: uncited claims or invalid statutory references detected. Flagged for human review. Violations: {'; '.join(violations)}"
+                )
         if signoff is None:
             raise ActionBlocked(
                 "binding submission requires explicit human sign-off; none provided"

@@ -59,9 +59,54 @@ _CHECKLISTS: dict[ProgramId, list[str]] = {
 }
 
 
+class ProgrammaticPreparerTools:
+    """Typed Python stubs executed directly in-code by preparer loops."""
+
+    @staticmethod
+    def assemble_document_checklist(program_name: str) -> list[str]:
+        """Return the statutory document checklist for a program."""
+        prog_key = None
+        for p in ProgramId:
+            if p.value == program_name:
+                prog_key = p
+                break
+        return list(_CHECKLISTS.get(prog_key, [])) if prog_key else []
+
+    @staticmethod
+    def calculate_appeal_deadline(days_since_denial: int, window_days: int) -> dict:
+        """Compute remaining days for fair hearing appeal window."""
+        remaining = max(0, window_days - days_since_denial)
+        return {
+            "filing_window_days": window_days,
+            "estimated_days_remaining": remaining,
+            "is_expired": days_since_denial > window_days,
+        }
+
+    @classmethod
+    def get_tool_signatures(cls) -> str:
+        """Expose typed Python signatures for model prompt generation."""
+        return (
+            "class ProgrammaticPreparerTools:\n"
+            "    @staticmethod\n"
+            "    def assemble_document_checklist(program_name: str) -> list[str]: ...\n"
+            "    @staticmethod\n"
+            "    def calculate_appeal_deadline(days_since_denial: int, window_days: int) -> dict: ...\n"
+        )
+
+
 class Preparer:
     def __init__(self, action_gate: ActionGate) -> None:
         self.action_gate = action_gate
+        self.tools = ProgrammaticPreparerTools()
+
+    def generate_prompt(self, program: ProgramId, jurisdiction: str) -> str:
+        """Generate prompt incorporating programmatic Python tool signatures."""
+        return (
+            f"You are the preparer for {program.value} in {jurisdiction}.\n"
+            "You have access to the following executable Python stubs:\n\n"
+            f"{ProgrammaticPreparerTools.get_tool_signatures()}\n"
+            "Use these tools directly to build document checklists and appeal packets."
+        )
 
     def prepare(
         self, assessment: Assessment, evidence: list[Evidence]
