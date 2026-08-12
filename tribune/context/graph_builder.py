@@ -69,7 +69,6 @@ class RepoContextGraphBuilder:
 
     def build_graph(self, max_depth: int = 5) -> RepoContextGraph:
         graph = RepoContextGraph(root_dir=self.root_dir)
-        root_path = Path(self.root_dir)
 
         for current_root, subdirs, files in os.walk(self.root_dir):
             # Exclude hidden, cache, and test directories
@@ -123,7 +122,7 @@ class RepoContextGraphBuilder:
             elif isinstance(item, ast.Assign):
                 for target in item.targets:
                     if isinstance(target, ast.Name) and target.id == "__all__":
-                        if isinstance(item.value, (ast.List, ast.Tuple)):
+                        if isinstance(item.value, ast.List | ast.Tuple):
                             for elt in item.value.elts:
                                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                                     node.exports.append(elt.value)

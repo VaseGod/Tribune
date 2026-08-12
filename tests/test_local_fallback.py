@@ -8,7 +8,6 @@ from tribune.config import TribuneSettings
 from tribune.providers.base import (
     Citation,
     CriterionResult,
-    EligibilityStatus,
     ProgramId,
     ReviewRequest,
     ReviewResult,

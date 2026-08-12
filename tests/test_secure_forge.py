@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from tribune.providers.llm_client import LLMCompletionRequest, LLMCompletionResponse, LocalRulesLLMAdapter
+from tribune.providers.llm_client import (
+    LLMCompletionRequest,
+    LLMCompletionResponse,
+)
 from tribune.security.secure_forge import SECURE_FORGE_SYSTEM_PROMPT, SecureForge
-from tribune.security.static_analysis import SecurityFinding, StaticAnalysisValidator
+from tribune.security.static_analysis import StaticAnalysisValidator
 
 
 class MockLLMProvider:

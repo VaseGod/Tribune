@@ -36,7 +36,13 @@ def test_signoff_intent_must_match_program_and_case():
 
 def test_citation_verification_gate_passes_for_valid_citations():
     from tribune.corpus.rule_store import LocalRuleStore
-    from tribune.types import Assessment, Citation, CriterionResult, CriterionOutcome, EligibilityStatus, RecommendedAction
+    from tribune.types import (
+        Assessment,
+        CriterionOutcome,
+        CriterionResult,
+        EligibilityStatus,
+        RecommendedAction,
+    )
 
     store = LocalRuleStore()
     citations = store.all_citations(ProgramId.SNAP, "EX")
@@ -74,7 +80,14 @@ def test_citation_verification_gate_passes_for_valid_citations():
 
 def test_citation_verification_gate_blocks_uncited_and_invalid_statutory_claims():
     from tribune.corpus.rule_store import LocalRuleStore
-    from tribune.types import Assessment, Citation, CriterionResult, CriterionOutcome, EligibilityStatus, RecommendedAction
+    from tribune.types import (
+        Assessment,
+        Citation,
+        CriterionOutcome,
+        CriterionResult,
+        EligibilityStatus,
+        RecommendedAction,
+    )
 
     store = LocalRuleStore()
     invalid_citation = Citation(

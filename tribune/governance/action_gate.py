@@ -11,8 +11,8 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 
-from ..types import Assessment, CriterionOutcome, PreparedMaterials, SubmissionReceipt
 from ..corpus.rule_store import RuleStore
+from ..types import Assessment, CriterionOutcome, PreparedMaterials, SubmissionReceipt
 
 
 class ActionBlocked(PermissionError):

@@ -7,7 +7,10 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from tribune.domain.boundary import DomainParser, FieldError, ValidationErrorList, parse_domain_object
+from tribune.domain.boundary import (
+    ValidationErrorList,
+    parse_domain_object,
+)
 
 
 class UserProfile(BaseModel):

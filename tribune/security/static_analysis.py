@@ -57,7 +57,7 @@ class ASTSecurityScanner(ast.NodeVisitor):
         self._formatted_vars: set[str] = set()
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if isinstance(node.value, (ast.JoinedStr, ast.BinOp)):
+        if isinstance(node.value, ast.JoinedStr | ast.BinOp):
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     self._formatted_vars.add(target.id)
@@ -120,7 +120,7 @@ class ASTSecurityScanner(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute) and node.func.attr in ("execute", "executemany"):
             if node.args:
                 first_arg = node.args[0]
-                is_unformatted = isinstance(first_arg, (ast.JoinedStr, ast.BinOp))
+                is_unformatted = isinstance(first_arg, ast.JoinedStr | ast.BinOp)
                 is_var_formatted = isinstance(first_arg, ast.Name) and first_arg.id in self._formatted_vars
                 if is_unformatted or is_var_formatted:
                     self.findings.append(

@@ -8,9 +8,10 @@ Fails early with structured ValidationErrorList if type parsing or constraints f
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Generic, Type, TypeVar
+from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, ValidationError as PydanticValidationError
+from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 T = TypeVar("T")
 
@@ -46,7 +47,7 @@ class ValidationErrorList(Exception):
 class DomainParser(Generic[T]):
     """Boundary parser enforcing 'Parse, Don't Validate' design patterns."""
 
-    def __init__(self, target_type: Type[T]) -> None:
+    def __init__(self, target_type: type[T]) -> None:
         self.target_type = target_type
 
     def parse(self, raw_payload: Any) -> T:
@@ -100,7 +101,7 @@ class DomainParser(Generic[T]):
             ) from exc
 
 
-def parse_domain_object(target_type: Type[T], raw_payload: Any) -> T:
+def parse_domain_object(target_type: type[T], raw_payload: Any) -> T:
     """Convenience function for parsing untrusted raw inputs into strongly typed domain objects."""
     parser = DomainParser(target_type)
     return parser.parse(raw_payload)
