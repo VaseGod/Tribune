@@ -155,3 +155,17 @@ class CanarySentinel:
             ok=ok,
             notes=notes,
         )
+
+    def generate_canary_token(self) -> str:
+        """Generate a dynamic canary token to inject into system context."""
+        import secrets
+        return f"CANARY-{secrets.token_hex(8).upper()}"
+
+    def verify_canary_isolation(self, canary_token: str, outputs: str | dict | list) -> bool:
+        """Verify canary tokens do not leak into extended-thinking output fields, reasoning payloads, or audit log exports."""
+        import json
+        dumped = json.dumps(outputs) if not isinstance(outputs, str) else outputs
+        return canary_token not in dumped
+
+
+CanaryEvaluator = CanarySentinel

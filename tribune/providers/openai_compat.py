@@ -36,6 +36,21 @@ from .base import (
 )
 
 
+import re
+
+_THINKING_BLOCK_RE = re.compile(
+    r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_reasoning_monologues(text: str) -> str:
+    """Isolate explicit, visible model text response and strictly ignore thinking monologues."""
+    if not isinstance(text, str):
+        return text
+    return _THINKING_BLOCK_RE.sub("", text).strip()
+
+
 class ProviderError(RuntimeError):
     pass
 
@@ -86,6 +101,49 @@ class OpenAICompatProvider:
 
     # -- transport ---------------------------------------------------------- #
 
+    @staticmethod
+    def sanitize_reasoning_payload(payload: dict) -> dict:
+        """Strip or neutralize all opaque/unverified reasoning fields from payloads."""
+        if not isinstance(payload, dict):
+            return payload
+
+        opaque_keys = {
+            "encrypted_content",
+            "thought_signature",
+            "raw_base64_blobs",
+            "reasoning_content",
+            "thought",
+            "thinking",
+        }
+
+        clean = {}
+        for k, v in payload.items():
+            if k in opaque_keys or "encrypted" in k.lower() or "thought_signature" in k.lower():
+                continue
+            if k == "messages" and isinstance(v, list):
+                clean_msgs = []
+                for msg in v:
+                    if isinstance(msg, dict):
+                        clean_msg = {}
+                        for mk, mv in msg.items():
+                            if mk in opaque_keys or "encrypted" in mk.lower() or "thought_signature" in mk.lower():
+                                continue
+                            clean_msg[mk] = mv
+                        clean_msgs.append(clean_msg)
+                    else:
+                        clean_msgs.append(msg)
+                clean[k] = clean_msgs
+            elif isinstance(v, dict):
+                clean[k] = OpenAICompatProvider.sanitize_reasoning_payload(v)
+            else:
+                clean[k] = v
+
+        return clean
+
+    def complete(self, payload: dict) -> dict:
+        """Sanitize payload prior to serialization."""
+        return self.sanitize_reasoning_payload(payload)
+
     def _chat(self, system: str, user: str) -> str:  # pragma: no cover - needs endpoint
         payload = {
             "model": self.model,
@@ -102,6 +160,7 @@ class OpenAICompatProvider:
             payload["extra_body"] = self.extra_body
             for k, v in self.extra_body.items():
                 payload[k] = v
+        payload = self.complete(payload)
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self._base}/chat/completions",
@@ -118,6 +177,7 @@ class OpenAICompatProvider:
         except (urllib.error.URLError, TimeoutError) as exc:
             raise ProviderError(f"request to {self._base} failed: {exc}") from exc
         content = body["choices"][0]["message"]["content"]
+        content = strip_reasoning_monologues(content)
         self._record_usage(body.get("usage"), system + user, content)
         return content
 

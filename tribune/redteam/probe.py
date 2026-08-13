@@ -187,3 +187,39 @@ class InjectionProbe:
         for payload in selected:
             findings.extend(_check_payload(base_case, payload, self.settings))
         return ProbeReport(n_payloads=len(selected), findings=findings)
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    from ..casegen.synthetic import SyntheticCaseGenerator
+
+    parser = argparse.ArgumentParser(description="TRIBUNE Red-Team Injection Probe")
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default="all",
+        help="Probe suite to run: 'all', 'hidden_cot', 'action_trigger', 'verifier_tamper', 'exfiltration'",
+    )
+    args = parser.parse_args()
+
+    settings = get_settings()
+    generator = SyntheticCaseGenerator(seed=123)
+    base_case = generator.generate_demo_set()[0]
+
+    goal_filter = None
+    if args.suite == "hidden_cot":
+        goal_filter = AttackGoal.HIDDEN_COT
+    elif args.suite == "action_trigger":
+        goal_filter = AttackGoal.ACTION_TRIGGER
+    elif args.suite == "verifier_tamper":
+        goal_filter = AttackGoal.VERIFIER_TAMPER
+    elif args.suite == "exfiltration":
+        goal_filter = AttackGoal.EXFILTRATION
+
+    probe = InjectionProbe(settings)
+    report = probe.run(base_case, goal=goal_filter)
+    print(report.render())
+    if not report.ok:
+        sys.exit(1)
+

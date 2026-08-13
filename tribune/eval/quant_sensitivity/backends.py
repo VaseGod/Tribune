@@ -69,6 +69,40 @@ def smoke_ladder() -> list[QuantRung]:
     ]
 
 
+def high_throughput_local_benchmark_ladder() -> list[QuantRung]:
+    """Evaluation configs to benchmark local high-throughput models for offline administrative preprocessing."""
+    return [
+        QuantRung(
+            label="muse-glimmer-30b-fp16",
+            quant_format="fp16",
+            provider_kind="openai_compat",
+            backend="vllm",
+            model="meta-muse-glimmer-30b",
+            base_url="http://localhost:8000/v1",
+            reference=True,
+            notes="Meta Muse Glimmer 30B full precision reference",
+        ),
+        QuantRung(
+            label="muse-glimmer-30b-int8",
+            quant_format="int8",
+            provider_kind="openai_compat",
+            backend="vllm",
+            model="meta-muse-glimmer-30b-int8",
+            base_url="http://localhost:8000/v1",
+            notes="Meta Muse Glimmer 30B quantized INT8 high-throughput",
+        ),
+        QuantRung(
+            label="nemotron-3.5-lightning-fp8",
+            quant_format="fp8",
+            provider_kind="openai_compat",
+            backend="sglang",
+            model="nemotron-3.5-lightning",
+            base_url="http://localhost:8001/v1",
+            notes="Nemotron 3.5 Lightning FP8 offline administrative preprocessing",
+        ),
+    ]
+
+
 def load_ladder_config(path: str) -> list[QuantRung]:
     """Load a real-endpoint ladder from JSON (see docs/quant_sensitivity.md)."""
     with open(path, encoding="utf-8") as fh:

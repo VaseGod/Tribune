@@ -60,6 +60,21 @@ def _check(address) -> None:
         )
 
 
+def inspect_outbound_payload(payload: dict | str) -> None:
+    """Inspect outbound API request payloads and flag/block unauthorized transmission of encrypted reasoning blocks."""
+    if _active is None:
+        return
+    import json
+    data_str = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+    forbidden_keys = ["encrypted_content", "thought_signature", "raw_base64_blobs"]
+    for key in forbidden_keys:
+        if key in data_str:
+            _active.blocked.append(f"payload_violation:{key}")
+            raise NetworkEgressBlocked(
+                f"Unauthorized transmission of encrypted reasoning blocks ({key}) detected in outbound API request payload."
+            )
+
+
 def install(allowlist: set[tuple[str, int]] | None = None, allow_hosts: set[str] | None = None) -> None:
     global _active, _orig_connect, _orig_connect_ex, _orig_create_connection
     if _active is not None:

@@ -125,3 +125,39 @@ def get_provider_for_role(role: str, settings=None, recorder=None):
     from .local_rules import LocalRulesProvider
 
     return LocalRulesProvider(role=role, recorder=recorder)
+
+
+def _canonical_state(state: dict) -> str:
+    body = {k: v for k, v in state.items() if k != "_hmac_signature"}
+    import json
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+def bind_session_state(state: dict, session_key: str) -> dict:
+    """Sign a local session state object with HMAC-SHA256."""
+    import hashlib
+    import hmac
+
+    canonical = _canonical_state(state)
+    sig = hmac.new(session_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    out = dict(state)
+    out["_hmac_signature"] = sig
+    return out
+
+
+def verify_session_state(signed_state: dict, session_key: str) -> dict:
+    """Verify session state object HMAC-SHA256 signature, raising ValueError if invalid or missing."""
+    import hashlib
+    import hmac
+
+    if not isinstance(signed_state, dict) or "_hmac_signature" not in signed_state:
+        raise ValueError("Session state block replayed without a valid session key signature.")
+    expected_sig = str(signed_state["_hmac_signature"])
+    canonical = _canonical_state(signed_state)
+    computed_sig = hmac.new(session_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, computed_sig):
+        raise ValueError("Session state HMAC signature verification failed.")
+    clean = dict(signed_state)
+    clean.pop("_hmac_signature", None)
+    return clean
+

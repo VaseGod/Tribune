@@ -72,6 +72,15 @@ class Verifier:
         self.rule_store = rule_store
         self.tools = ProgrammaticVerifierTools()
 
+    @staticmethod
+    def parse_visible_response(text: str) -> str:
+        """Parse only explicit, visible model text responses, ignoring unverified thinking monologues or block metadata."""
+        if not isinstance(text, str):
+            return text
+        import re
+        clean = re.sub(r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        return clean.strip()
+
     def generate_prompt(self, assessment: Assessment) -> str:
         """Generate prompt incorporating programmatic Python tool signatures."""
         return (

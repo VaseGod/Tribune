@@ -80,6 +80,16 @@ def test_af_unix_is_not_treated_as_egress():
         netguard._check("/tmp/some.sock")  # would raise if treated as egress
 
 
+def test_inspect_outbound_payload_blocks_encrypted_reasoning_blocks():
+    with netguard.deny_egress(allowlist=set()):
+        dirty_payload = {"messages": [{"role": "user", "content": "hello"}], "encrypted_content": "secret_blob"}
+        with pytest.raises(netguard.NetworkEgressBlocked, match="encrypted_content"):
+            netguard.inspect_outbound_payload(dirty_payload)
+
+        clean_payload = {"messages": [{"role": "user", "content": "hello"}]}
+        netguard.inspect_outbound_payload(clean_payload)  # passes
+
+
 # --- acceptance: the appeals eval touches no network ------------------------ #
 
 
@@ -95,3 +105,4 @@ def test_appeals_eval_runs_end_to_end_with_zero_egress():
     assert [r.abstained for r in again.result.records] == [
         r.abstained for r in outcome.result.records
     ]
+

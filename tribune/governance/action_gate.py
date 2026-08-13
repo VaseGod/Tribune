@@ -61,6 +61,11 @@ class ActionGate:
         if not assessment.citations:
             violations.append("Assessment contains no statutory citations.")
 
+        import re
+        thinking_re = re.compile(r"<(?:think|thought|reasoning)[^>]*>", re.IGNORECASE)
+        if thinking_re.search(assessment.rationale) or "<thought" in assessment.rationale.lower() or "<think" in assessment.rationale.lower():
+            violations.append("Assessment rationale contains non-deterministic model monologues or unverified reasoning outputs.")
+
         for citation in assessment.citations:
             if citation.citation_id not in active_ids:
                 violations.append(f"Invalid statutory reference citation ID '{citation.citation_id}'")

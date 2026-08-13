@@ -28,3 +28,16 @@ def test_canary_passes_on_fresh_baseline(tmp_path, monkeypatch):
         assert not report.confidently_wrong
     finally:
         reset_settings_cache()
+
+
+def test_canary_evaluator_token_isolation():
+    sentinel = CanarySentinel()
+    token = sentinel.generate_canary_token()
+    assert token.startswith("CANARY-")
+
+    safe_output = {"status": "likely_eligible", "rationale": "Valid reasoning"}
+    assert sentinel.verify_canary_isolation(token, safe_output) is True
+
+    leaked_output = {"status": "likely_eligible", "extended_thinking": f"Note {token}"}
+    assert sentinel.verify_canary_isolation(token, leaked_output) is False
+

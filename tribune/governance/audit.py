@@ -10,9 +10,42 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
+from typing import Any
 
 from ..types import AuditRecord, SMState
+
+_PII_PATTERNS = [
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # SSN
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),  # Email
+    re.compile(r"\b(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]?\d{4}\b"),  # Phone
+    re.compile(r"\b(?:BEN|MEMBER|CLIENT|APPLICANT)-\d{4,}\b", re.IGNORECASE),  # Benefit ID
+    re.compile(r"\b(?:sk|pk|api_key|secret_key|key|token)-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE),  # API key
+    re.compile(r"\bBearer\s+[A-Za-z0-9\._\-]+\b", re.IGNORECASE),  # Bearer token
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),  # JWT
+]
+
+
+def sanitize_audit_text(text: str) -> str:
+    """Sanitize PII and credential patterns in strings."""
+    if not isinstance(text, str):
+        return text
+    clean = text
+    for pattern in _PII_PATTERNS:
+        clean = pattern.sub("[REDACTED]", clean)
+    return clean
+
+
+def sanitize_audit_data(data: Any) -> Any:
+    """Recursively sanitize PII and credentials in event dictionaries and telemetry data."""
+    if isinstance(data, str):
+        return sanitize_audit_text(data)
+    elif isinstance(data, dict):
+        return {k: sanitize_audit_data(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_audit_data(x) for x in data]
+    return data
 
 
 def _canonical(record: AuditRecord) -> str:
@@ -55,18 +88,20 @@ class AuditLog:
     ) -> AuditRecord:
         chain = self._by_case.setdefault(case_id, [])
         prev_hash = chain[-1].record_hash if chain else ""
+        clean_action = sanitize_audit_text(action)
+        clean_payload = sanitize_audit_data(payload or {})
         record = AuditRecord(
             record_id=str(uuid.uuid4()),
             case_id=case_id,
             sequence=len(chain),
             state=state,
             agent=agent,
-            action=action,
+            action=clean_action,
             model_name=model_name,
             model_version=model_version,
             citation_ids=citation_ids or [],
             evidence_ids=evidence_ids or [],
-            payload=payload or {},
+            payload=clean_payload,
             prev_hash=prev_hash,
         )
         record = record.model_copy(update={"record_hash": _hash(record)})
