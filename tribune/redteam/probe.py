@@ -192,6 +192,7 @@ class InjectionProbe:
 if __name__ == "__main__":
     import argparse
     import sys
+
     from ..casegen.synthetic import SyntheticCaseGenerator
 
     parser = argparse.ArgumentParser(description="TRIBUNE Red-Team Injection Probe")

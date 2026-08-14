@@ -20,6 +20,7 @@ builds the Assessment, so an uncited eligibility claim remains impossible.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -34,9 +35,6 @@ from .base import (
     derive_status,
     recommend_action,
 )
-
-
-import re
 
 _THINKING_BLOCK_RE = re.compile(
     r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>",

@@ -111,7 +111,7 @@ class Verifier:
         self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
     ) -> tuple[float, list[dict]]:
         """Execute multi-step self-testing trajectory and cross-evaluate against statutory citation rules."""
-        from ..corpus.citations import LateInteractionRetriever, cross_evaluate_citations
+        from ..corpus.citations import cross_evaluate_citations
 
         program = assessment.program
         profile = get_profile(jurisdiction)
@@ -191,7 +191,7 @@ class Verifier:
 
         # Aggregate trajectory confidence
         weights = [0.25, 0.30, 0.20, 0.25]
-        total_score = sum(w * s["score"] for w, s in zip(weights, steps))
+        total_score = sum(w * s["score"] for w, s in zip(weights, steps, strict=False))
         return round(total_score, 4), steps
 
     def verify(

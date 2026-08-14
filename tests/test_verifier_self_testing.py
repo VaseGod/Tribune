@@ -1,6 +1,5 @@
 """Tests for Verifier Multi-Step Self-Testing Trajectories and Abstention Calibration."""
 
-import pytest
 
 from tribune.abstention.calibration import AssessmentDiagnostics, Calibrator
 from tribune.agents.verifier import Verifier
