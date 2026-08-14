@@ -149,6 +149,45 @@ candidates:
       must be judged at cost-per-verified-determination (see the Phase-1 cost
       model), never list price.
 
+  - candidate_id: grok-4.6
+    name: Grok 4.6
+    vendor: xAI
+    params: "hosted"
+    roles: [verifier, proposer]
+    role_note: primary high-tier engine for statutory determinations and verifications
+    license: proprietary-api
+    weights_status: api_only
+    weights_url: https://x.ai/api
+    weights_verified: false
+    serving: [api]
+    quant_formats: []
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Primary high-tier engine ($2.00/M input, $6.00/M output) for complex
+      statutory eligibility determinations and multi-step verification tasks.
+
+  - candidate_id: deepseek-v4-pro
+    name: DeepSeek V4 Pro
+    vendor: DeepSeek
+    params: "hosted"
+    roles: [proposer, verifier]
+    role_note: high-volume low-cost engine for document parsing and synthetic casegen
+    license: open-weights
+    weights_status: api_only
+    weights_url: https://api.deepseek.com/v1
+    weights_verified: false
+    serving: [api, vllm, sglang]
+    quant_formats: [fp8, gguf-q4_k_m]
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      High-volume, low-cost engine ($0.435/M input, $0.87/M output) for document
+      parsing, multi-modal intake processing, and synthetic case generation.
+
+
 muse_glimmer_local:
   provider: openai_compat
   base_url: "http://localhost:8080/v1"

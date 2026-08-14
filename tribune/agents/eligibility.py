@@ -92,6 +92,9 @@ class ProgrammaticEligibilityTools:
 
 
 class EligibilityProposer:
+    routing_intent: str = "statutory_determination"
+    target_engine: str = "Grok 4.6"
+
     def __init__(self, provider: ModelProvider, rule_store: RuleStore) -> None:
         self.provider = provider
         self.rule_store = rule_store

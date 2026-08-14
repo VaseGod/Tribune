@@ -21,8 +21,8 @@ class TribuneSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRIBUNE_", extra="ignore")
 
     # -- Model provider ----------------------------------------------------- #
-    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "anthropic", "deepseek", "vllm"
-    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm"] = "local_rules"
+    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai"
+    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai"] = "local_rules"
     openai_base_url: str = "http://localhost:8000/v1"
     openai_api_key: str = "not-needed-for-local-serving"
     openai_model: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -32,11 +32,16 @@ class TribuneSettings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-3-5-sonnet-20241022"
 
-    # DeepSeek API parameters (including DeepSeek-V4-Flash reasoning_effort)
+    # DeepSeek API parameters (including DeepSeek-V4-Flash & DeepSeek-V4-Pro)
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_model: str = "deepseek-v4-pro"
     deepseek_reasoning_effort: Literal["low", "medium", "high"] = "medium"
+
+    # Grok / xAI API parameters
+    grok_base_url: str = "https://api.x.ai/v1"
+    grok_api_key: str = ""
+    grok_model: str = "grok-4.6"
 
     # Open-weight / Local vLLM parameters
     vllm_base_url: str = "http://localhost:8000/v1"
@@ -53,21 +58,21 @@ class TribuneSettings(BaseSettings):
     static_analysis_timeout_s: float = 30.0
 
     # The verifier can run on a *stronger* model than the proposer.
-    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm"] = "local_rules"
-    verifier_model: str = "Qwen/Qwen2.5-32B-Instruct"
+    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai"] = "local_rules"
+    verifier_model: str = "grok-4.6"
     request_timeout_s: float = 60.0
 
     # -- Tiered Model Router ------------------------------------------------ #
     tier1_model: str = Field(
         default_factory=lambda: os.getenv(
             "DEFAULT_TIER1_MODEL",
-            os.getenv("TRIBUNE_DEFAULT_TIER1_MODEL", "GPT-5.6 Luna"),
+            os.getenv("TRIBUNE_DEFAULT_TIER1_MODEL", "DeepSeek V4 Pro"),
         )
     )
     tier2_model: str = Field(
         default_factory=lambda: os.getenv(
             "DEFAULT_TIER2_MODEL",
-            os.getenv("TRIBUNE_DEFAULT_TIER2_MODEL", "GPT-5.6 Sol"),
+            os.getenv("TRIBUNE_DEFAULT_TIER2_MODEL", "Grok 4.6"),
         )
     )
     tier1_provider: Literal["local_rules", "openai_compat"] = "local_rules"

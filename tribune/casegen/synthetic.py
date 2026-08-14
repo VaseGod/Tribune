@@ -61,6 +61,9 @@ def _str_value(value) -> str:
 
 
 class SyntheticCaseGenerator:
+    routing_intent: str = "synthetic_casegen"
+    default_engine: str = "DeepSeek V4 Pro"
+
     def __init__(self, seed: int = 7) -> None:
         self.seed = seed
 

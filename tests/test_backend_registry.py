@@ -36,6 +36,8 @@ def test_all_required_seed_candidates_present():
         "longcat-2.0",
         "qwen3.6-27b-nvfp4",
         "claude-sonnet-5",
+        "grok-4.6",
+        "deepseek-v4-pro",
     ]:
         assert required in ids
 
@@ -53,6 +55,15 @@ def test_status_flags_match_plan():
     assert sonnet.weights_status == "api_only"
     assert sonnet.promo_end_date == "2026-08-31"
     assert sonnet.roles == ["proposer"]
+    # Grok 4.6 is high-tier verifier and proposer
+    grok = by_id["grok-4.6"]
+    assert grok.weights_status == "api_only"
+    assert "verifier" in grok.roles
+    assert "proposer" in grok.roles
+    # DeepSeek V4 Pro is high-volume low-cost engine
+    dsv4pro = by_id["deepseek-v4-pro"]
+    assert dsv4pro.weights_status == "api_only"
+    assert "proposer" in dsv4pro.roles
     # GLM-5.2 is the incumbent verifier candidate.
     assert "verifier" in by_id["glm-5.2"].roles
     # No measured slots are pre-filled — they come from eval runs.

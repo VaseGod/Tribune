@@ -67,6 +67,9 @@ class ProgrammaticVerifierTools:
 
 
 class Verifier:
+    routing_intent: str = "multi_step_verification"
+    target_engine: str = "Grok 4.6"
+
     def __init__(self, provider: ModelProvider, rule_store: RuleStore) -> None:
         self.provider = provider
         self.rule_store = rule_store
@@ -89,6 +92,107 @@ class Verifier:
             f"{ProgrammaticVerifierTools.get_tool_signatures()}\n"
             "Use these tools directly to check citation mappings and re-derive statuses."
         )
+
+    def generate_self_testing_prompt(self, assessment: Assessment, jurisdiction: str) -> str:
+        """Leverage Grok 4.6 capabilities to prompt for explicit multi-step self-testing trajectories."""
+        return (
+            f"You are Grok 4.6 performing independent verification for assessment '{assessment.assessment_id}' "
+            f"under {jurisdiction} statutory rules.\n"
+            "Execute the following explicit multi-step self-testing trajectory:\n"
+            "1. Citation Integrity Check: Verify that all cited statutory rules exist, are active, and directly ground the claim.\n"
+            "2. Predicate Re-derivation: Re-evaluate each rule predicate independently against claimant evidence.\n"
+            "3. Global Coverage Assertion: Verify whether all statutory required criteria for the program are fully resolved.\n"
+            "4. Cross-Statute Coherence: Cross-evaluate intermediate determinations to ensure absence of legal contradictions.\n\n"
+            f"{ProgrammaticVerifierTools.get_tool_signatures()}\n"
+            "Emit your trajectory outcome in strict structured JSON format."
+        )
+
+    def execute_self_testing_trajectory(
+        self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
+    ) -> tuple[float, list[dict]]:
+        """Execute multi-step self-testing trajectory and cross-evaluate against statutory citation rules."""
+        from ..corpus.citations import LateInteractionRetriever, cross_evaluate_citations
+
+        program = assessment.program
+        profile = get_profile(jurisdiction)
+        view = EvidenceView(evidence)
+        ruleset = program_registry.get_ruleset(program)
+        active_citations = self.rule_store.all_citations(program, jurisdiction)
+        active_cids = {c.citation_id for c in active_citations}
+
+        steps: list[dict] = []
+
+        # Milestone 1: Citation Mapping & Cross-Evaluation
+        citation_valid = bool(assessment.citations) and all(c.citation_id in active_cids for c in assessment.citations)
+        query_ctx = f"{program.value} eligibility verification {jurisdiction} {assessment.status.value}"
+        cit_score = cross_evaluate_citations(assessment.citations, query_ctx) if assessment.citations else 0.0
+        m1_score = (1.0 if citation_valid else 0.0) * 0.5 + cit_score * 0.5
+        steps.append({
+            "step": 1,
+            "milestone": "Statutory Citation Mapping Verification",
+            "passed": citation_valid and (cit_score > 0.0 or not assessment.citations),
+            "score": round(m1_score, 4),
+            "citations_evaluated": len(assessment.citations),
+        })
+
+        # Milestone 2: Evidence Predicate Consistency
+        predicate_matches = 0
+        total_eval = 0
+        for crit in assessment.criteria:
+            rule = ruleset.get(crit.criterion_id)
+            if rule is not None:
+                recomputed = rule.predicate(view, profile)
+                total_eval += 1
+                if recomputed is crit.outcome:
+                    predicate_matches += 1
+        m2_score = (predicate_matches / total_eval) if total_eval > 0 else 1.0
+        steps.append({
+            "step": 2,
+            "milestone": "Evidence Predicate Consistency",
+            "passed": m2_score == 1.0,
+            "score": round(m2_score, 4),
+            "matches": f"{predicate_matches}/{total_eval}",
+        })
+
+        # Milestone 3: Statutory Coverage Completeness
+        assessed_req = {c.criterion_id for c in assessment.criteria if c.required}
+        req_total = len(ruleset.required_ids)
+        m3_score = (len(assessed_req) / req_total) if req_total > 0 else 1.0
+        steps.append({
+            "step": 3,
+            "milestone": "Statutory Coverage Completeness",
+            "passed": m3_score >= 1.0,
+            "score": round(m3_score, 4),
+            "covered": len(assessed_req),
+            "required_total": req_total,
+        })
+
+        # Milestone 4: Cross-Statute Coherence & Re-derivation Check
+        full_recompute = [
+            CriterionResult(
+                criterion_id=rule.criterion_id,
+                description=rule.description,
+                outcome=rule.predicate(view, profile),
+                required=rule.required,
+                citation_ids=[rule.citation(program, jurisdiction).citation_id],
+            )
+            for rule in ruleset.rules
+        ]
+        recomputed_status = derive_status(full_recompute, coverage_complete=True)
+        status_match = (not assessment.is_assertion) or (recomputed_status is assessment.status)
+        m4_score = 1.0 if status_match else 0.0
+        steps.append({
+            "step": 4,
+            "milestone": "Cross-Statute Coherence",
+            "passed": status_match,
+            "score": m4_score,
+            "recomputed_status": recomputed_status.value,
+        })
+
+        # Aggregate trajectory confidence
+        weights = [0.25, 0.30, 0.20, 0.25]
+        total_score = sum(w * s["score"] for w, s in zip(weights, steps))
+        return round(total_score, 4), steps
 
     def verify(
         self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
@@ -174,6 +278,11 @@ class Verifier:
             )
         )
 
+        # Execute multi-step self-testing trajectory
+        self_testing_score, trajectory_steps = self.execute_self_testing_trajectory(
+            assessment, evidence, jurisdiction
+        )
+
         approved = (
             not missing_citations
             and not unsupported_claims
@@ -194,4 +303,6 @@ class Verifier:
             unsupported_claims=unsupported_claims,
             incomplete_coverage=incomplete_coverage,
             reasons=reasons,
+            self_testing_score=self_testing_score,
+            trajectory_steps=trajectory_steps,
         )

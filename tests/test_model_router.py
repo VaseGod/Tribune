@@ -172,3 +172,41 @@ def test_router_generic_execute_with_routing():
 def test_factory_get_provider_for_role_router():
     provider = get_provider_for_role("router")
     assert isinstance(provider, ModelRouter)
+
+
+def test_orchestration_router_task_aware_allocation():
+    from tribune.orchestration.router import Router
+
+    orch_router = Router()
+
+    # Document parsing, intake, and synthetic generation route to DeepSeek V4 Pro ($0.435/M)
+    d1 = orch_router.route_task("document_parsing")
+    assert d1.target_model == "DeepSeek V4 Pro"
+    assert d1.cost_per_m_input == 0.435
+    assert d1.tier == 1
+
+    d2 = orch_router.route_task("multimodal_intake")
+    assert d2.target_model == "DeepSeek V4 Pro"
+    assert d2.tier == 1
+
+    d3 = orch_router.route_task("synthetic_casegen")
+    assert d3.target_model == "DeepSeek V4 Pro"
+    assert d3.tier == 1
+
+    # Complex statutory eligibility and verifications route to Grok 4.6 ($2.00/M)
+    d4 = orch_router.route_task("statutory_determination", program=ProgramId.MEDICAID)
+    assert d4.target_model == "Grok 4.6"
+    assert d4.cost_per_m_input == 2.00
+    assert d4.tier == 2
+
+    d5 = orch_router.route_task("multi_step_verification")
+    assert d5.target_model == "Grok 4.6"
+    assert d5.cost_per_m_input == 2.00
+    assert d5.tier == 2
+
+    # Escalation routes to Grok 4.6
+    init_route = orch_router.initial(ProgramId.MEDICAID)
+    esc_route = orch_router.escalate(ProgramId.MEDICAID, init_route)
+    assert esc_route.target_model == "Grok 4.6"
+    assert esc_route.cost_per_m_input == 2.00
+

@@ -103,6 +103,52 @@ def high_throughput_local_benchmark_ladder() -> list[QuantRung]:
     ]
 
 
+def moe_pruned_quant_ladder() -> list[QuantRung]:
+    """Evaluation ladder for pruned Mixture-of-Experts (MoE) variants (e.g. Qwen3.8-Max-MoE)
+
+    under dynamic 1-bit and low-bit quantization regimes across all benefit programs.
+    """
+    return [
+        QuantRung(
+            label="qwen3.8-max-moe-fp16",
+            quant_format="fp16",
+            provider_kind="mock",
+            backend="mock",
+            model="qwen3.8-max-moe",
+            flip_prob=0.0,
+            reference=True,
+            notes="Qwen3.8-Max-MoE full precision reference",
+        ),
+        QuantRung(
+            label="qwen3.8-max-moe-4bit",
+            quant_format="awq-4bit",
+            provider_kind="mock",
+            backend="mock",
+            model="qwen3.8-max-moe-4bit",
+            flip_prob=0.04,
+            notes="Qwen3.8-Max-MoE 4-bit AWQ pruned MoE",
+        ),
+        QuantRung(
+            label="qwen3.8-max-moe-2bit",
+            quant_format="gguf-q2_k",
+            provider_kind="mock",
+            backend="mock",
+            model="qwen3.8-max-moe-2bit",
+            flip_prob=0.18,
+            notes="Qwen3.8-Max-MoE 2-bit quantization",
+        ),
+        QuantRung(
+            label="qwen3.8-max-moe-1bit",
+            quant_format="gguf-iq1_s",
+            provider_kind="mock",
+            backend="mock",
+            model="qwen3.8-max-moe-1bit",
+            flip_prob=0.38,
+            notes="Qwen3.8-Max-MoE dynamic 1-bit quantization regime",
+        ),
+    ]
+
+
 def load_ladder_config(path: str) -> list[QuantRung]:
     """Load a real-endpoint ladder from JSON (see docs/quant_sensitivity.md)."""
     with open(path, encoding="utf-8") as fh:

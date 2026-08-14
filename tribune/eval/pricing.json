@@ -4,6 +4,38 @@
   "note": "Pricing is data, not code. First backend whose model_pattern matches wins, so keep specific patterns above catch-alls. Rates carry effective dates so promotional pricing expires on schedule. Self-hosted entries amortize $/GPU-hour over *your measured* throughput — replace the defaults with numbers measured on your hardware.",
   "backends": [
     {
+      "backend_id": "xai:grok-4.6",
+      "kind": "api",
+      "model_patterns": ["*grok-4.6*", "*grok-4*", "xai:*", "grok:*"],
+      "rates": [
+        {
+          "effective_from": "2026-01-01",
+          "effective_until": null,
+          "input_per_m": 2.00,
+          "output_per_m": 6.00,
+          "cache_read_per_m": 0.50,
+          "cache_write_per_m": 2.00,
+          "note": "xAI Grok 4.6 high-tier engine pricing"
+        }
+      ]
+    },
+    {
+      "backend_id": "deepseek:v4-pro",
+      "kind": "api",
+      "model_patterns": ["*deepseek-v4-pro*", "deepseek:deepseek-v4-pro*"],
+      "rates": [
+        {
+          "effective_from": "2026-01-01",
+          "effective_until": null,
+          "input_per_m": 0.435,
+          "output_per_m": 0.87,
+          "cache_read_per_m": 0.10,
+          "cache_write_per_m": 0.435,
+          "note": "DeepSeek V4 Pro high-volume low-cost engine pricing"
+        }
+      ]
+    },
+    {
       "backend_id": "deepseek:v4-flash",
       "kind": "api",
       "model_patterns": ["*deepseek-v4-flash*", "deepseek:deepseek-v4-flash*"],

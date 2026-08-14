@@ -300,6 +300,59 @@ class vLLMProviderAdapter(BaseHTTPProviderAdapter):
         )
 
 
+class GrokProviderAdapter(BaseHTTPProviderAdapter):
+    """Adapter for xAI Grok API protocol (/v1/chat/completions)."""
+
+    def __init__(self, settings: TribuneSettings | None = None, model: str | None = None) -> None:
+        cfg = settings or get_settings()
+        target_model = model or cfg.grok_model
+        super().__init__(
+            provider_name=f"xai:{target_model}",
+            base_url=cfg.grok_base_url,
+            api_key=cfg.grok_api_key,
+            model=target_model,
+            timeout_s=cfg.request_timeout_s,
+        )
+
+    def complete(self, request: LLMCompletionRequest) -> LLMCompletionResponse:
+        model = request.model or self.model
+        msgs: list[dict[str, str]] = []
+        if request.system_prompt:
+            msgs.append({"role": "system", "content": request.system_prompt})
+        msgs.extend(request.messages)
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": msgs,
+            "temperature": request.temperature,
+        }
+        if request.max_tokens:
+            payload["max_tokens"] = request.max_tokens
+        if request.response_format:
+            payload["response_format"] = request.response_format
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        body, latency_ms = self._post_json(f"{self.base_url}/chat/completions", payload, headers)
+
+        content = body["choices"][0]["message"]["content"]
+        usage = body.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
+
+        return LLMCompletionResponse(
+            content=content,
+            model=model,
+            provider_name=self.name,
+            input_tokens=int(usage.get("prompt_tokens", 0)),
+            output_tokens=int(usage.get("completion_tokens", 0)),
+            cached_tokens=int(details.get("cached_tokens", 0) or 0),
+            latency_ms=latency_ms,
+            raw_response=body,
+        )
+
+
 class LocalRulesLLMAdapter:
     """Deterministic offline adapter for local rules and testing."""
 
@@ -354,6 +407,8 @@ def get_llm_provider(
         return AnthropicProviderAdapter(settings=cfg, model=model)
     if p_kind == "deepseek":
         return DeepSeekProviderAdapter(settings=cfg, model=model)
+    if p_kind in ("grok", "xai"):
+        return GrokProviderAdapter(settings=cfg, model=model)
     if p_kind == "vllm":
         return vLLMProviderAdapter(settings=cfg, model=model)
     return LocalRulesLLMAdapter(settings=cfg, name=p_kind)

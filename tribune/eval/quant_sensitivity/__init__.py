@@ -8,7 +8,13 @@ Produces "TRIBUNE Eval Note #1: Does abstention calibration survive
 quantization?" as a markdown report.
 """
 
-from .backends import QuantRung, default_mock_ladder, smoke_ladder
+from .backends import (
+    QuantRung,
+    default_mock_ladder,
+    high_throughput_local_benchmark_ladder,
+    moe_pruned_quant_ladder,
+    smoke_ladder,
+)
 from .ladder import LadderResult, RungResult, run_ladder
 from .report import render_eval_note
 from .seedset import SEED_WEIGHTS, build_seed_set, load_manifest, seed_set_hash, write_manifest
@@ -16,6 +22,8 @@ from .seedset import SEED_WEIGHTS, build_seed_set, load_manifest, seed_set_hash,
 __all__ = [
     "QuantRung",
     "default_mock_ladder",
+    "high_throughput_local_benchmark_ladder",
+    "moe_pruned_quant_ladder",
     "smoke_ladder",
     "LadderResult",
     "RungResult",

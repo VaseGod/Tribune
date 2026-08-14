@@ -17,10 +17,27 @@ a failed verification always abstains.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 from dataclasses import dataclass, field
 
 from ..types import AbstentionScore, Assessment, EligibilityStatus, VerifierVerdict
+
+_PACKAGED_PARITY_THRESHOLDS = os.path.join(
+    os.path.dirname(__file__), "..", "eval", "parity_thresholds.json"
+)
+
+
+def load_parity_thresholds(path: str | None = None) -> dict[str, float]:
+    """Load configured parity and self-validation thresholds."""
+    target_path = path or _PACKAGED_PARITY_THRESHOLDS
+    if os.path.exists(target_path):
+        with open(target_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return {k: float(v) for k, v in payload.items() if isinstance(v, int | float)}
+    return {"min_self_validation_confidence": 0.85}
+
 
 # Logistic weights (priors). See module docstring.
 _W0 = -1.2
@@ -28,6 +45,7 @@ _W_COVERAGE = 1.0
 _W_RESOLVED = 1.0
 _W_MARGIN = 1.0
 _W_VERIFIER = 0.8
+_W_SELF_TESTING = 0.8
 _W_AMBIGUITY = 3.0
 
 
@@ -40,6 +58,7 @@ class AssessmentDiagnostics:
     resolved_fraction: float  # resolved required / required_total
     min_margin: float  # min normalized distance-to-threshold over evaluated criteria (1.0 if N/A)
     ambiguity_signals: list[str] = field(default_factory=list)
+    self_testing_score: float = 1.0
 
 
 def _sigmoid(x: float) -> float:
@@ -47,18 +66,45 @@ def _sigmoid(x: float) -> float:
 
 
 class Calibrator:
-    def __init__(self, threshold: float) -> None:
+    def __init__(
+        self,
+        threshold: float,
+        min_self_validation_confidence: float | None = None,
+        parity_thresholds_path: str | None = None,
+    ) -> None:
         self.threshold = threshold
+        parity_thresholds = load_parity_thresholds(parity_thresholds_path)
+        self.min_self_validation_confidence = (
+            min_self_validation_confidence
+            if min_self_validation_confidence is not None
+            else parity_thresholds.get("min_self_validation_confidence", 0.85)
+        )
 
     def confidence(self, diag: AssessmentDiagnostics, verdict: VerifierVerdict) -> tuple[float, dict[str, float]]:
         c = max(0.0, min(1.0, diag.coverage))
         r = max(0.0, min(1.0, diag.resolved_fraction))
         m = max(0.0, min(1.0, diag.min_margin))
         v = 1.0 if verdict.approved else 0.0
+        st = max(0.0, min(1.0, getattr(verdict, "self_testing_score", getattr(diag, "self_testing_score", 1.0))))
         a = float(len(diag.ambiguity_signals))
-        logit = _W0 + _W_COVERAGE * c + _W_RESOLVED * r + _W_MARGIN * m + _W_VERIFIER * v - _W_AMBIGUITY * a
+        logit = (
+            _W0
+            + _W_COVERAGE * c
+            + _W_RESOLVED * r
+            + _W_MARGIN * m
+            + _W_VERIFIER * v
+            + _W_SELF_TESTING * st
+            - _W_AMBIGUITY * a
+        )
         conf = round(_sigmoid(logit), 4)
-        features = {"coverage": c, "resolved": r, "margin": m, "verifier": v, "ambiguity": a}
+        features = {
+            "coverage": c,
+            "resolved": r,
+            "margin": m,
+            "verifier": v,
+            "self_testing": st,
+            "ambiguity": a,
+        }
         return conf, features
 
     def score(
@@ -68,8 +114,25 @@ class Calibrator:
         verdict: VerifierVerdict,
     ) -> AbstentionScore:
         conf, features = self.confidence(diag, verdict)
+        self_test_score = getattr(
+            verdict, "self_testing_score", getattr(diag, "self_testing_score", 1.0)
+        )
 
-        # Hard overrides — these always abstain regardless of the logistic score.
+        # Hard override 1: intermediate self-validation confidence below parity threshold
+        if self_test_score < self.min_self_validation_confidence:
+            return AbstentionScore(
+                calibrated_confidence=conf,
+                threshold=self.threshold,
+                abstain=True,
+                reason=(
+                    f"intermediate self-validation confidence ({self_test_score:.3f}) "
+                    f"fell below parity threshold ({self.min_self_validation_confidence:.3f}); "
+                    "escalated to manual administrative review"
+                ),
+                features=features,
+            )
+
+        # Hard override 2: verifier did not approve
         if not verdict.approved:
             return AbstentionScore(
                 calibrated_confidence=conf,
@@ -78,6 +141,8 @@ class Calibrator:
                 reason="verifier did not approve the assessment; cannot assert an unverified result",
                 features=features,
             )
+
+        # Hard override 3: indeterminate status
         if assessment.status is EligibilityStatus.INDETERMINATE:
             return AbstentionScore(
                 calibrated_confidence=conf,

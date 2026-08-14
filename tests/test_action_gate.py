@@ -129,3 +129,70 @@ def test_citation_verification_gate_blocks_uncited_and_invalid_statutory_claims(
         gate.authorize_submission(_materials(), signoff, assessment=assessment, rule_store=store)
 
 
+def test_supervisor_signature_verification():
+    from tribune.governance.action_gate import SupervisorSignature
+
+    sig = SupervisorSignature.issue("supervisor-alex", "external_api_call:c1")
+    assert sig.is_valid("external_api_call:c1") is True
+    assert sig.is_valid("external_api_call:c2") is False
+    assert sig.is_valid("other_action") is False
+
+
+def test_execute_tool_in_sandbox_blocks_without_supervisor_signature():
+    from tribune.governance.action_gate import ActionGate, PreConditionError
+
+    gate = ActionGate()
+
+    def dummy_tool(case_id: str, payload: str):
+        return {"status": "success", "case_id": case_id}
+
+    # Blocked in sandbox mode without supervisor signature
+    with pytest.raises(PreConditionError, match="restricted to read-only sandbox"):
+        gate.execute_tool(
+            tool_name="external_api_call",
+            tool_fn=dummy_tool,
+            kwargs={"case_id": "c1", "payload": "data"},
+            sandbox_mode=True,
+            supervisor_signature=None,
+        )
+
+
+def test_execute_tool_in_sandbox_permits_with_valid_supervisor_signature():
+    from tribune.governance.action_gate import ActionGate, SupervisorSignature
+
+    gate = ActionGate()
+
+    def dummy_tool(case_id: str, payload: str):
+        return {"status": "success", "case_id": case_id, "payload": payload}
+
+    sig = SupervisorSignature.issue("supervisor-alex", "external_api_call:c1")
+    res = gate.execute_tool(
+        tool_name="external_api_call",
+        tool_fn=dummy_tool,
+        kwargs={"case_id": "c1", "payload": "data"},
+        sandbox_mode=True,
+        supervisor_signature=sig,
+    )
+    assert res["status"] == "success"
+    assert res["case_id"] == "c1"
+
+
+def test_postcondition_assertion_verifies_receipt_integrity():
+    from tribune.governance.action_gate import ActionGate, PostConditionError
+    from tribune.types import SubmissionReceipt
+
+    gate = ActionGate()
+    materials = _materials()
+
+    # Invalid receipt with mismatched case_id
+    bad_receipt = SubmissionReceipt(
+        program=ProgramId.SNAP,
+        case_id="wrong_case",
+        authorized_by="user",
+        signoff_token="token123",
+    )
+    with pytest.raises(PostConditionError, match="receipt metadata does not match materials"):
+        gate.assert_postconditions(receipt=bad_receipt, materials=materials)
+
+
+

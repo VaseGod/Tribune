@@ -92,8 +92,15 @@ class OpenAICompatProvider:
         self.name = f"openai_compat:{model}"
         self.version = model
         self.recorder = recorder
-        self._base = settings.openai_base_url.rstrip("/")
-        self._key = settings.openai_api_key
+        if "grok" in model.lower() or "xai" in model.lower():
+            self._base = getattr(settings, "grok_base_url", settings.openai_base_url).rstrip("/")
+            self._key = getattr(settings, "grok_api_key", "") or settings.openai_api_key
+        elif "deepseek" in model.lower():
+            self._base = getattr(settings, "deepseek_base_url", settings.openai_base_url).rstrip("/")
+            self._key = getattr(settings, "deepseek_api_key", "") or settings.openai_api_key
+        else:
+            self._base = settings.openai_base_url.rstrip("/")
+            self._key = settings.openai_api_key
         self._timeout = settings.request_timeout_s
         self.extra_body = extra_body or {}
         self.temperature = temperature

@@ -330,6 +330,8 @@ class VerifierVerdict(StrictModel):
     unsupported_claims: list[str] = Field(default_factory=list)
     incomplete_coverage: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
+    self_testing_score: float = 1.0
+    trajectory_steps: list[dict] = Field(default_factory=list)
 
 
 class AbstentionScore(StrictModel):

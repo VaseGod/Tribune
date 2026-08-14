@@ -235,3 +235,22 @@ def test_pipeline_attaches_usage_including_replans_and_abstentions():
         records.extend(records_for_case(case, pipe.run_case(case)))
     rendered = compute_cost_report(records).render()
     assert "by outcome type" in rendered and "deterministic estimates" in rendered
+
+
+def test_default_pricing_for_grok_and_deepseek_v4_pro():
+    from tribune.eval.costmodel import default_cost_model
+
+    cm = default_cost_model()
+
+    # Grok 4.6: $2.00/M in, $6.00/M out
+    grok_call = _call(tokens_in=1_000_000, tokens_out=500_000, model="grok-4.6")
+    cost_grok, backend_grok = cm.cost_of_call(grok_call, on=date(2026, 8, 1))
+    assert backend_grok == "xai:grok-4.6"
+    assert abs(cost_grok - (2.00 + 0.5 * 6.00)) < 1e-9  # $5.00
+
+    # DeepSeek V4 Pro: $0.435/M in, $0.87/M out
+    deepseek_call = _call(tokens_in=2_000_000, tokens_out=1_000_000, model="deepseek-v4-pro")
+    cost_ds, backend_ds = cm.cost_of_call(deepseek_call, on=date(2026, 8, 1))
+    assert backend_ds == "deepseek:v4-pro"
+    assert abs(cost_ds - (2.0 * 0.435 + 1.0 * 0.87)) < 1e-9  # $1.74
+

@@ -5,5 +5,7 @@
   "max_kappa_delta": 0.10,
   "max_false_confidence_rate_delta": 0.02,
   "max_cost_rel_delta": 0.25,
-  "max_tokens_rel_delta": 0.40
+  "max_tokens_rel_delta": 0.40,
+  "min_self_validation_confidence": 0.85
 }
+

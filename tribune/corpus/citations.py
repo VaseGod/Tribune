@@ -113,3 +113,25 @@ def format_citation(c: Citation) -> str:
     """Human-readable one-line rendering used in disclosures."""
     loc = f" — {c.locator}" if c.locator else ""
     return f"[{c.source}] {c.title}{loc}"
+
+
+def cross_evaluate_citations(
+    citations: list[Citation],
+    query_context: str,
+    retriever: LateInteractionRetriever | None = None,
+) -> float:
+    """Cross-evaluate statutory citations against decision context via late-interaction retrieval.
+
+    Computes the mean alignment score across all statutory citations.
+    Returns float score in [0.0, 1.0].
+    """
+    if not citations:
+        return 0.0
+    r = retriever or LateInteractionRetriever()
+    scores = []
+    for cit in citations:
+        doc_text = f"{cit.title} {cit.source} {cit.text}"
+        score = r.score(query=query_context, doc_text=doc_text)
+        scores.append(max(0.0, min(1.0, score)))
+    return float(np.mean(scores)) if scores else 0.0
+

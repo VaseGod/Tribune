@@ -164,3 +164,10 @@ class CostModel:
             if backend_id and backend_id not in backend_ids:
                 backend_ids.append(backend_id)
         return total, (",".join(backend_ids) if backend_ids else None)
+
+
+def default_cost_model() -> CostModel:
+    """Return the CostModel loaded from the default packaged pricing.json or TRIBUNE_PRICING_PATH."""
+    path = os.environ.get("TRIBUNE_PRICING_PATH", _PACKAGED_PRICING)
+    return CostModel.load(path)
+

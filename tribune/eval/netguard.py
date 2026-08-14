@@ -19,16 +19,114 @@ IPC (AF_UNIX) is not egress and is left alone.
 
 from __future__ import annotations
 
+import json
+import re
 import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlparse
 
 
 class NetworkEgressBlocked(RuntimeError):
     pass
 
+
+class PromptInjectionDetected(ValueError):
+    """Raised when an incoming unstructured data stream contains malicious prompt injections."""
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# Real-time Prompt Injection Detection & Ingestion Safeguards
+# --------------------------------------------------------------------------- #
+
+_INJECTION_PATTERNS = [
+    re.compile(r"(?i)\b(?:ignore|disregard|override|forget)\s+(?:all\s+)?(?:previous|prior|system|above)\s+(?:instructions|prompts|rules|commands|directives|context)\b"),
+    re.compile(r"(?i)\b(?:system\s+override|admin\s+override|jailbreak|DAN\s+mode|developer\s+mode\s+enabled)\b"),
+    re.compile(r"(?i)\b(?:you\s+are\s+now\s+(?:an?\s+)?unrestricted|act\s+as\s+(?:an?\s+)?unfiltered)\b"),
+    re.compile(r"(?i)(?:<system>|\[SYSTEM\]|---END SYSTEM---|```system)"),
+    re.compile(r"(?i)\b(?:exfiltrate|leak\s+all\s+(?:ssn|pii|data)|disregard\s+(?:the\s+)?eligibility\s+rules)\b"),
+    re.compile(r"(?i)\b(?:mark\s+this\s+household\s+as\s+likely_eligible\s+for\s+every\s+program)\b"),
+]
+
+_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_PHONE_PATTERN = re.compile(r"\b(?:\+?1[-. ]?)?\(?[2-9]\d{2}\)?[-. ]?\d{3}[-. ]?\d{4}\b")
+_CC_PATTERN = re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b")
+
+
+def detect_prompt_injection(text: str) -> tuple[bool, list[str]]:
+    """Inspect text for prompt injection, jailbreak attempts, or system instruction overrides."""
+    if not isinstance(text, str) or not text:
+        return False, []
+    findings = []
+    for pat in _INJECTION_PATTERNS:
+        matches = pat.findall(text)
+        if matches:
+            findings.extend(matches if isinstance(matches[0], str) else [str(m) for m in matches])
+    return len(findings) > 0, findings
+
+
+def filter_prompt_injection(text: str, raise_on_detection: bool = False) -> str:
+    """Filter out or neutralize detected prompt injections in incoming data streams."""
+    if not isinstance(text, str) or not text:
+        return text
+    is_injected, findings = detect_prompt_injection(text)
+    if is_injected and raise_on_detection:
+        raise PromptInjectionDetected(f"Prompt injection detected in input stream: {findings}")
+    cleaned = text
+    for pat in _INJECTION_PATTERNS:
+        cleaned = pat.sub("[FILTERED_INJECTION_DIRECTIVE]", cleaned)
+    return cleaned
+
+
+def redact_ssn(text: str) -> str:
+    """Scrub Social Security Numbers (formatted and unformatted) from claimant text."""
+    if not isinstance(text, str):
+        return text
+    # Formatted XXX-XX-XXXX
+    text = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED_SSN]", text)
+    # SSN followed by 9 digits
+    text = re.sub(r"(?i)\b(ssn[:\s]+)(\d{9})\b", r"\1[REDACTED_SSN]", text)
+    return text
+
+
+def redact_pii(text: str) -> str:
+    """Scrub emails, phone numbers, credit card numbers, and SSNs from claimant files."""
+    if not isinstance(text, str):
+        return text
+    text = redact_ssn(text)
+    text = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", text)
+    text = _PHONE_PATTERN.sub("[REDACTED_PHONE]", text)
+    text = _CC_PATTERN.sub("[REDACTED_FINANCIAL]", text)
+    return text
+
+
+def scrub_claimant_payload(payload: Any) -> Any:
+    """Recursively scrub PII, SSN, and filter prompt injections from raw claimant structures."""
+    if isinstance(payload, str):
+        cleaned = redact_pii(payload)
+        return filter_prompt_injection(cleaned)
+    if isinstance(payload, dict):
+        return {k: scrub_claimant_payload(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [scrub_claimant_payload(item) for item in payload]
+    return payload
+
+
+def inspect_inbound_stream(data: Any, raise_on_injection: bool = False) -> Any:
+    """Ingestion safeguard: inspects inbound unstructured stream, sanitizing PII and blocking injection."""
+    if isinstance(data, str):
+        is_inj, findings = detect_prompt_injection(data)
+        if is_inj and raise_on_injection:
+            raise PromptInjectionDetected(f"Prompt injection detected: {findings}")
+    return scrub_claimant_payload(data)
+
+
+# --------------------------------------------------------------------------- #
+# Egress Guard
+# --------------------------------------------------------------------------- #
 
 @dataclass
 class _GuardState:
@@ -64,7 +162,6 @@ def inspect_outbound_payload(payload: dict | str) -> None:
     """Inspect outbound API request payloads and flag/block unauthorized transmission of encrypted reasoning blocks."""
     if _active is None:
         return
-    import json
     data_str = json.dumps(payload) if isinstance(payload, dict) else str(payload)
     forbidden_keys = ["encrypted_content", "thought_signature", "raw_base64_blobs"]
     for key in forbidden_keys:

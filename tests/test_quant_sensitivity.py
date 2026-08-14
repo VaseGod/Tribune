@@ -151,3 +151,46 @@ def test_committed_eval_note_exists():
     with open(path, encoding="utf-8") as fh:
         content = fh.read()
     assert "content hash" in content
+
+
+def test_moe_pruned_quant_ladder_runs_across_four_domains():
+    from tribune.eval.quant_sensitivity import moe_pruned_quant_ladder
+
+    # Ensure evaluation cases cover all benefit domains: SNAP, Medicaid, Housing, Unemployment, Appeals
+    cases = build_seed_set({
+        ProgramId.SNAP: 2,
+        ProgramId.MEDICAID: 2,
+        ProgramId.HOUSING: 2,
+        ProgramId.UNEMPLOYMENT: 2,
+        ProgramId.APPEALS: 2,
+    })
+    ladder = moe_pruned_quant_ladder()
+    result = run_ladder(ladder, cases=cases)
+
+    rung_labels = [r.rung.label for r in result.rungs]
+    assert rung_labels == [
+        "qwen3.8-max-moe-fp16",
+        "qwen3.8-max-moe-4bit",
+        "qwen3.8-max-moe-2bit",
+        "qwen3.8-max-moe-1bit",
+    ]
+
+    ref_rung = result.rungs[0]
+    one_bit_rung = result.rungs[3]
+
+    # Full precision reference agreements
+    assert ref_rung.kappa_vs_reference == 1.0
+    assert ref_rung.abstention_decision_agreement == 1.0
+
+    # 1-bit dynamic quantization regime experiences degradation/abstention drift
+    assert one_bit_rung.report.n == len(cases)
+    assert one_bit_rung.cost_report.n == len(cases)
+    # Verification decisions across all statutory domains ran successfully
+    programs_evaluated = {c.target_programs[0] for c in cases}
+    assert {
+        ProgramId.SNAP,
+        ProgramId.MEDICAID,
+        ProgramId.HOUSING,
+        ProgramId.UNEMPLOYMENT,
+    }.issubset(programs_evaluated)
+
