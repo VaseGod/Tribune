@@ -21,11 +21,16 @@ class TribuneSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRIBUNE_", extra="ignore")
 
     # -- Model provider ----------------------------------------------------- #
-    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai"
-    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai"] = "local_rules"
+    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini"
+    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini"] = "local_rules"
     openai_base_url: str = "http://localhost:8000/v1"
     openai_api_key: str = "not-needed-for-local-serving"
-    openai_model: str = "Qwen/Qwen2.5-7B-Instruct"
+    openai_model: str = "gemini-3.7-flash"
+
+    # Gemini API parameters
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.7-flash"
 
     # Anthropic API parameters
     anthropic_base_url: str = "https://api.anthropic.com/v1"
@@ -58,8 +63,8 @@ class TribuneSettings(BaseSettings):
     static_analysis_timeout_s: float = 30.0
 
     # The verifier can run on a *stronger* model than the proposer.
-    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai"] = "local_rules"
-    verifier_model: str = "grok-4.6"
+    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini"] = "local_rules"
+    verifier_model: str = "gpt-5.6-sol-ultrafast"
     request_timeout_s: float = 60.0
 
     # -- Tiered Model Router ------------------------------------------------ #

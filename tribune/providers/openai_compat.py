@@ -96,6 +96,9 @@ class OpenAICompatProvider:
         elif "deepseek" in model.lower():
             self._base = getattr(settings, "deepseek_base_url", settings.openai_base_url).rstrip("/")
             self._key = getattr(settings, "deepseek_api_key", "") or settings.openai_api_key
+        elif "gemini" in model.lower():
+            self._base = getattr(settings, "gemini_base_url", settings.openai_base_url).rstrip("/")
+            self._key = getattr(settings, "gemini_api_key", "") or settings.openai_api_key
         else:
             self._base = settings.openai_base_url.rstrip("/")
             self._key = settings.openai_api_key
@@ -103,6 +106,33 @@ class OpenAICompatProvider:
         self.extra_body = extra_body or {}
         self.temperature = temperature
         self.max_tokens = max_tokens
+
+    @property
+    def pricing_parameters(self) -> dict[str, float]:
+        """Return input and output pricing parameters per 1M tokens."""
+        m = self.model.lower()
+        if "gemini-3.7" in m or "gemini-3.7-flash" in m:
+            return {"input_cost_per_1m": 0.75, "output_cost_per_1m": 3.75}
+        if "gpt-5.6" in m or "gpt-5.6-sol-ultrafast" in m:
+            return {"input_cost_per_1m": 2.50, "output_cost_per_1m": 10.00}
+        if "grok-4.6" in m or "grok" in m:
+            return {"input_cost_per_1m": 2.00, "output_cost_per_1m": 6.00}
+        if "deepseek-v4-pro" in m:
+            return {"input_cost_per_1m": 0.435, "output_cost_per_1m": 0.87}
+        return {"input_cost_per_1m": 0.75, "output_cost_per_1m": 3.75}
+
+    def calculate_token_cost(
+        self, tokens_input: int, tokens_output: int, cache_read_tokens: int = 0
+    ) -> float:
+        """Calculate exact token cost for model inference."""
+        params = self.pricing_parameters
+        uncached_in = max(0, tokens_input - cache_read_tokens)
+        cost = (
+            uncached_in * params["input_cost_per_1m"]
+            + cache_read_tokens * (params["input_cost_per_1m"] * 0.25)
+            + tokens_output * params["output_cost_per_1m"]
+        ) / 1_000_000.0
+        return cost
 
     # -- transport ---------------------------------------------------------- #
 

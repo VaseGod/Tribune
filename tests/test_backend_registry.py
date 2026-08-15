@@ -155,3 +155,28 @@ def test_openai_compat_extra_body_forwarding():
     assert provider.temperature == 0.1
     assert provider.max_tokens == 4096
 
+
+def test_default_workhorse_and_providers_configuration():
+    registry = vr.load_registry(_REGISTRY)
+    assert registry.default_workhorse == "gemini-3.7-flash"
+    assert registry.providers is not None
+    assert "gemini-3.7-flash" in registry.providers
+    assert "gpt-5.6-sol-ultrafast" in registry.providers
+
+    g37 = registry.providers["gemini-3.7-flash"]
+    assert g37.provider_type == "openai_compat"
+    assert g37.model_name == "gemini-3.7-flash"
+    assert g37.input_cost_per_1m == 0.75
+    assert g37.output_cost_per_1m == 3.75
+    assert g37.max_context_tokens == 1048576
+    assert g37.supports_tools is True
+
+    gpt56 = registry.providers["gpt-5.6-sol-ultrafast"]
+    assert gpt56.provider_type == "openai_compat"
+    assert gpt56.model_name == "gpt-5.6-sol-ultrafast"
+    assert gpt56.input_cost_per_1m == 2.50
+    assert gpt56.output_cost_per_1m == 10.00
+    assert gpt56.tokens_per_second == 750
+    assert gpt56.supports_tools is True
+
+

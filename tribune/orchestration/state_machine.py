@@ -11,6 +11,8 @@ uncertain terminal state. Every transition is written to the audit log.
 
 from __future__ import annotations
 
+import time
+
 from ..governance.audit import AuditLog
 from ..instrumentation.usage import UsageRecorder
 from ..memory.consolidation import MemoryConsolidator
@@ -51,9 +53,12 @@ class CaseStateMachine:
         evidence: list,
         consolidator: MemoryConsolidator,
     ) -> ProgramOutcome:
+        prog_start = time.perf_counter()
         route = self.router.initial(program)
         attempt = 1
         replans = 0
+        total_cit_lat = 0.0
+        total_llm_lat = 0.0
 
         while True:
             self.audit.append(
@@ -65,9 +70,15 @@ class CaseStateMachine:
                 model_version=self.proposer.provider.version,
             )
             self._turn("proposer")
+            assess_start = time.perf_counter()
             assessment, diag = self.proposer.assess(
                 case_id, jurisdiction, program, evidence, k=route.k, attempt=attempt
             )
+            assess_lat = (time.perf_counter() - assess_start) * 1000.0
+            total_llm_lat += assess_lat
+            if hasattr(self.proposer.rule_store, "_retriever") and hasattr(self.proposer.rule_store._retriever, "last_latency_ms"):
+                total_cit_lat += self.proposer.rule_store._retriever.last_latency_ms
+
             consolidator.store_assessment(assessment)
             cit_ids = [c.citation_id for c in assessment.citations]
 
@@ -81,7 +92,10 @@ class CaseStateMachine:
                 citation_ids=cit_ids,
             )
             self._turn("verifier")
+            verify_start = time.perf_counter()
             verdict = self.verifier.verify(assessment, evidence, jurisdiction)
+            verify_lat = (time.perf_counter() - verify_start) * 1000.0
+            total_llm_lat += verify_lat
 
             if not verdict.approved:
                 if verdict.incomplete_coverage and attempt < self.max_attempts:
@@ -105,6 +119,7 @@ class CaseStateMachine:
                     action="abstain: assessment failed independent verification",
                     payload={"reason": abst.reason[:200]},
                 )
+                tot_lat = (time.perf_counter() - prog_start) * 1000.0
                 return ProgramOutcome(
                     program=program,
                     assessment=assessment,
@@ -113,6 +128,9 @@ class CaseStateMachine:
                     final_state=SMState.ABSTAIN,
                     abstained=True,
                     replans=replans,
+                    citation_latency_ms=total_cit_lat,
+                    llm_latency_ms=total_llm_lat,
+                    total_latency_ms=tot_lat,
                 )
 
             # Verified. Now decide assert vs. abstain via calibrated confidence.
@@ -129,6 +147,7 @@ class CaseStateMachine:
                         "threshold": f"{abst.threshold:.2f}",
                     },
                 )
+                tot_lat = (time.perf_counter() - prog_start) * 1000.0
                 return ProgramOutcome(
                     program=program,
                     assessment=assessment,
@@ -137,6 +156,9 @@ class CaseStateMachine:
                     final_state=SMState.ABSTAIN,
                     abstained=True,
                     replans=replans,
+                    citation_latency_ms=total_cit_lat,
+                    llm_latency_ms=total_llm_lat,
+                    total_latency_ms=tot_lat,
                 )
 
             if assessment.recommended_action is RecommendedAction.PREPARE_APPLICATION:
@@ -148,6 +170,7 @@ class CaseStateMachine:
                     action="prepared application materials (NOT submitted)",
                     citation_ids=cit_ids,
                 )
+                tot_lat = (time.perf_counter() - prog_start) * 1000.0
                 return ProgramOutcome(
                     program=program,
                     assessment=assessment,
@@ -157,6 +180,9 @@ class CaseStateMachine:
                     final_state=SMState.PREPARE,
                     abstained=False,
                     replans=replans,
+                    citation_latency_ms=total_cit_lat,
+                    llm_latency_ms=total_llm_lat,
+                    total_latency_ms=tot_lat,
                 )
 
             # Asserted a result that does not lead to preparing an application
@@ -169,6 +195,7 @@ class CaseStateMachine:
                 action=f"asserted {assessment.status.value}; recommend {assessment.recommended_action.value}",
                 citation_ids=cit_ids,
             )
+            tot_lat = (time.perf_counter() - prog_start) * 1000.0
             return ProgramOutcome(
                 program=program,
                 assessment=assessment,
@@ -177,4 +204,7 @@ class CaseStateMachine:
                 final_state=SMState.DONE,
                 abstained=False,
                 replans=replans,
+                citation_latency_ms=total_cit_lat,
+                llm_latency_ms=total_llm_lat,
+                total_latency_ms=tot_lat,
             )

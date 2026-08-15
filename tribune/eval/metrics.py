@@ -66,6 +66,11 @@ class EvalRecord:
     tokenizer_ids: list[str] = field(default_factory=list)
     language: str = "en"
     confidence: float | None = None  # calibrated confidence behind assert/abstain
+    # -- disaggregated latency breakdown (Phase 4) -- #
+    ocr_latency_ms: float = 0.0
+    citation_latency_ms: float = 0.0
+    llm_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
 
 
 def classify_outcome(r: EvalRecord) -> TaskOutcomeType:
@@ -205,11 +210,18 @@ class MetricsReport:
     over_refusal_rate: float
     abstention_aware_utility: float
     verifier_agreement: float
+    mean_ocr_latency_ms: float = float("nan")
+    mean_citation_latency_ms: float = float("nan")
+    mean_llm_latency_ms: float = float("nan")
+    mean_total_latency_ms: float = float("nan")
     per_program: dict[str, MetricsReport] = field(default_factory=dict)
 
     def render(self) -> str:
         def f(x: float) -> str:
             return "  n/a" if isnan(x) else f"{x:6.3f}"
+
+        def f_ms(x: float) -> str:
+            return "    n/a" if isnan(x) else f"{x:7.2f} ms"
 
         lines = [
             f"=== TRIBUNE evaluation — {self.scope} (n={self.n}) ===",
@@ -225,6 +237,11 @@ class MetricsReport:
             f"  over-refusal rate               : {f(self.over_refusal_rate)}   (abstained on clear cases)",
             f"  abstention-aware utility        : {f(self.abstention_aware_utility)}   (higher is better; max 1.0)",
             f"  TRIBUNE vs verifier agreement   : {f(self.verifier_agreement)}",
+            "  --- latency breakdown (disaggregated) ---",
+            f"  OCR ingestion latency (mean)    : {f_ms(self.mean_ocr_latency_ms)}",
+            f"  citation matching latency (mean): {f_ms(self.mean_citation_latency_ms)}",
+            f"  pure LLM generation (mean)      : {f_ms(self.mean_llm_latency_ms)}",
+            f"  total pipeline latency (mean)   : {f_ms(self.mean_total_latency_ms)}",
         ]
         return "\n".join(lines)
 
@@ -268,6 +285,16 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
     ]
     verifier_agreement = (len(matched) / len(asserted)) if asserted else float("nan")
 
+    ocr_latencies = [r.ocr_latency_ms for r in records if r.ocr_latency_ms > 0]
+    cit_latencies = [r.citation_latency_ms for r in records if r.citation_latency_ms > 0]
+    llm_latencies = [r.llm_latency_ms for r in records if r.llm_latency_ms > 0]
+    tot_latencies = [r.total_latency_ms for r in records if r.total_latency_ms > 0]
+
+    mean_ocr = (sum(ocr_latencies) / len(ocr_latencies)) if ocr_latencies else 0.0
+    mean_cit = (sum(cit_latencies) / len(cit_latencies)) if cit_latencies else 0.0
+    mean_llm = (sum(llm_latencies) / len(llm_latencies)) if llm_latencies else 0.0
+    mean_tot = (sum(tot_latencies) / len(tot_latencies)) if tot_latencies else 0.0
+
     return MetricsReport(
         scope=scope,
         n=n,
@@ -284,6 +311,10 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
         over_refusal_rate=over_refusal,
         abstention_aware_utility=util,
         verifier_agreement=verifier_agreement,
+        mean_ocr_latency_ms=mean_ocr,
+        mean_citation_latency_ms=mean_cit,
+        mean_llm_latency_ms=mean_llm,
+        mean_total_latency_ms=mean_tot,
     )
 
 

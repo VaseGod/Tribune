@@ -254,3 +254,24 @@ def test_default_pricing_for_grok_and_deepseek_v4_pro():
     assert backend_ds == "deepseek:v4-pro"
     assert abs(cost_ds - (2.0 * 0.435 + 1.0 * 0.87)) < 1e-9  # $1.74
 
+
+def test_pricing_for_gemini_and_gpt56_ultrafast():
+    from tribune.eval.costmodel import default_cost_model
+
+    cm = default_cost_model()
+
+    # Gemini 3.7 Flash: $0.75/M in, $3.75/M out, $0.1875 cache read
+    gemini_call = _call(tokens_in=1_000_000, tokens_out=200_000, cache_read=400_000, model="gemini-3.7-flash")
+    cost_gemini, backend_gemini = cm.cost_of_call(gemini_call, on=date(2026, 8, 1))
+    assert backend_gemini == "google:gemini-3.7-flash"
+    expected_gemini = (600_000 * 0.75 + 400_000 * 0.1875 + 200_000 * 3.75) / 1e6  # 0.45 + 0.075 + 0.75 = $1.275
+    assert abs(cost_gemini - expected_gemini) < 1e-9
+
+    # GPT-5.6 Sol UltraFast: $2.50/M in, $10.00/M out
+    gpt_call = _call(tokens_in=1_000_000, tokens_out=500_000, model="gpt-5.6-sol-ultrafast")
+    cost_gpt, backend_gpt = cm.cost_of_call(gpt_call, on=date(2026, 8, 1))
+    assert backend_gpt == "openai:gpt-5.6-sol-ultrafast"
+    expected_gpt = (1.0 * 2.50 + 0.5 * 10.00)  # $7.50
+    assert abs(cost_gpt - expected_gpt) < 1e-9
+
+

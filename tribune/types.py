@@ -542,6 +542,10 @@ class ProgramOutcome(BaseModel):
     abstained: bool = False
     replans: int = 0
     usage: TaskUsage | None = None
+    ocr_latency_ms: float = 0.0
+    citation_latency_ms: float = 0.0
+    llm_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
     human_path: str = (
         "A navigator or caseworker can review this with you. "
         "You may also contact the administering agency directly."
@@ -555,6 +559,10 @@ class CaseRunResult(BaseModel):
     jurisdiction: str
     outcomes: list[ProgramOutcome] = Field(default_factory=list)
     audit: list[AuditRecord] = Field(default_factory=list)
+    ocr_latency_ms: float = 0.0
+    citation_latency_ms: float = 0.0
+    llm_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
 
     def outcome_for(self, program: ProgramId) -> ProgramOutcome | None:
         for o in self.outcomes:

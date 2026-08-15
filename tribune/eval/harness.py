@@ -70,6 +70,10 @@ def records_for_case(case: SyntheticCase, result) -> list[EvalRecord]:
                 confidence=(
                     outcome.abstention.calibrated_confidence if outcome.abstention else None
                 ),
+                ocr_latency_ms=getattr(outcome, "ocr_latency_ms", 0.0) or getattr(result, "ocr_latency_ms", 0.0),
+                citation_latency_ms=getattr(outcome, "citation_latency_ms", 0.0) or getattr(result, "citation_latency_ms", 0.0),
+                llm_latency_ms=getattr(outcome, "llm_latency_ms", 0.0) or getattr(result, "llm_latency_ms", 0.0),
+                total_latency_ms=getattr(outcome, "total_latency_ms", 0.0) or getattr(result, "total_latency_ms", 0.0),
             )
         )
     return out

@@ -97,12 +97,16 @@ def parse_text_to_fields(text: str) -> dict[str, str]:
     return fast_heuristic_parse(text)
 
 
+import time
+
+
 class OcrIngest:
     name = "ocr"
 
     def __init__(self, settings: TribuneSettings) -> None:
         self._endpoint = settings.ocr_endpoint
         self._timeout = settings.request_timeout_s
+        self.last_latency_ms: float = 0.0
 
     def _ocr_image(self, image_path: str) -> str:  # pragma: no cover - needs endpoint
         payload = json.dumps({"image_path": image_path}).encode("utf-8")
@@ -120,6 +124,7 @@ class OcrIngest:
         return body.get("text", "")
 
     def ingest(self, doc: RawDocument) -> list[Evidence]:
+        start_t = time.perf_counter()
         fields = dict(doc.fields)
         if doc.text:
             fast_fields = fast_heuristic_parse(doc.text, doc.doc_type)
@@ -130,7 +135,9 @@ class OcrIngest:
         if fields:
             fields = {k: v for k, v in fields.items() if coerce_value(_safe_type(k), str(v)) is not None}
             parsed = RawDocument(doc_id=doc.doc_id, doc_type=doc.doc_type, text=doc.text, fields=fields)
-            return fields_to_evidence(parsed, IngestMethod.OCR)
+            res = fields_to_evidence(parsed, IngestMethod.OCR)
+            self.last_latency_ms = (time.perf_counter() - start_t) * 1000.0
+            return res
 
         # Path 2: Heavier OCR endpoint processing fallback for images without extracted text
         if self._endpoint and doc.image_path:  # pragma: no cover - needs endpoint
@@ -142,16 +149,22 @@ class OcrIngest:
                 text=text,
                 fields=fast_fields,
             )
-            return fields_to_evidence(parsed, IngestMethod.OCR)
+            res = fields_to_evidence(parsed, IngestMethod.OCR)
+            self.last_latency_ms = (time.perf_counter() - start_t) * 1000.0
+            return res
 
         fields = {k: v for k, v in fields.items() if coerce_value(_safe_type(k), str(v)) is not None}
         parsed = RawDocument(doc_id=doc.doc_id, doc_type=doc.doc_type, text=doc.text, fields=fields)
-        return fields_to_evidence(parsed, IngestMethod.OCR)
+        res = fields_to_evidence(parsed, IngestMethod.OCR)
+        self.last_latency_ms = (time.perf_counter() - start_t) * 1000.0
+        return res
 
     def ingest_many(self, docs: list[RawDocument]) -> list[Evidence]:
+        start_t = time.perf_counter()
         out: list[Evidence] = []
         for d in docs:
             out.extend(self.ingest(d))
+        self.last_latency_ms = (time.perf_counter() - start_t) * 1000.0
         return out
 
 

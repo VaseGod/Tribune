@@ -35,30 +35,9 @@ _QUERY_TERMS = {
     ProgramId.APPEALS: "appeal fair hearing timely request grounds deadline",
 }
 
-SNAP_GROSS_LIMITS_2026: dict[int, float] = {
-    1: 1580.0,
-    2: 2137.0,
-    3: 2694.0,
-    4: 3250.0,
-    5: 3807.0,
-    6: 4364.0,
-    7: 4921.0,
-    8: 5478.0,
-}
-
 
 class ProgrammaticEligibilityTools:
     """Typed Python stubs executed directly in-code by agent loops."""
-
-    @staticmethod
-    def calculate_snap_gross_income(monthly_earned: float, monthly_unearned: float, household_size: int) -> dict:
-        total_gross = monthly_earned + monthly_unearned
-        limit = SNAP_GROSS_LIMITS_2026.get(household_size, 0.0)
-        return {
-            "gross_income": total_gross,
-            "statutory_limit": limit,
-            "is_eligible_gross": total_gross <= limit,
-        }
 
     @staticmethod
     def evaluate_criterion(
@@ -79,13 +58,13 @@ class ProgrammaticEligibilityTools:
             met = str(evidence_value).strip() == str(statutory_threshold).strip()
         return {"evidence_value": evidence_value, "threshold": statutory_threshold, "operator": operator, "met": met}
 
-    @classmethod
-    def get_tool_signatures(cls) -> str:
-        """Expose typed Python signatures for model prompt generation."""
+    @staticmethod
+    def get_tool_signatures(rule_store: RuleStore | None = None, program: ProgramId | None = None, jurisdiction: str = "EX") -> str:
+        """Expose dynamically bound Python tool signatures strictly scoped to the target program."""
+        if rule_store is not None and program is not None:
+            return rule_store.get_program_tools(program, jurisdiction)
         return (
             "class ProgrammaticEligibilityTools:\n"
-            "    @staticmethod\n"
-            "    def calculate_snap_gross_income(monthly_earned: float, monthly_unearned: float, household_size: int) -> dict: ...\n"
             "    @staticmethod\n"
             "    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
         )
@@ -93,7 +72,7 @@ class ProgrammaticEligibilityTools:
 
 class EligibilityProposer:
     routing_intent: str = "statutory_determination"
-    target_engine: str = "Grok 4.6"
+    target_engine: str = "gemini-3.7-flash"
 
     def __init__(self, provider: ModelProvider, rule_store: RuleStore) -> None:
         self.provider = provider
@@ -110,12 +89,19 @@ class EligibilityProposer:
         return clean.strip()
 
     def generate_prompt(self, program: ProgramId, jurisdiction: str) -> str:
-        """Generate prompt incorporating programmatic Python tool signatures."""
+        """Generate prompt incorporating dynamically bound statutory tool signatures and scoped schema constraints.
+
+        Prunes all unselected benefit domain schemas to prevent tool-choice interference.
+        """
+        scoped_tools = self.rule_store.get_program_tools(program, jurisdiction)
+        scoped_schema = self.rule_store.get_scoped_schema(program, jurisdiction)
+        schema_summary = f"Program: {scoped_schema['program']} | Required Criteria: {scoped_schema['required_criteria']}"
         return (
             f"You are the eligibility proposer for {program.value} in {jurisdiction}.\n"
-            "You have access to the following executable Python stubs:\n\n"
-            f"{ProgrammaticEligibilityTools.get_tool_signatures()}\n"
-            "Use these tools directly to evaluate gross income thresholds and criteria."
+            f"Active Statutory Schema: {schema_summary}\n"
+            "You have access to the following dynamically bound executable Python stubs:\n\n"
+            f"{scoped_tools}\n"
+            "Use these tools directly to evaluate statutory criteria and thresholds. Unselected domain schemas are pruned."
         )
 
     def _query(self, program: ProgramId, jurisdiction: str) -> str:

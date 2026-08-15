@@ -65,6 +65,48 @@ class ModelProvider(Protocol):
     def review_assessment(self, req: ReviewRequest) -> ReviewResult: ...
 
 
+@dataclass
+class LowLatencyRoutingSpec:
+    """Specification for sub-second ultra-low-latency provider pipelines."""
+    target_model: str = "gpt-5.6-sol-ultrafast"
+    max_latency_ms: float = 1000.0
+    tokens_per_second: float = 750.0
+    fallback_model: str = "gemini-3.7-flash"
+    supports_tools: bool = True
+
+
+class UltraLowLatencyPipeline:
+    """Routing abstraction targeting sub-second inference models for high-speed policy gating."""
+
+    def __init__(
+        self,
+        primary_provider: ModelProvider,
+        fallback_provider: ModelProvider | None = None,
+        spec: LowLatencyRoutingSpec | None = None,
+    ) -> None:
+        self.primary_provider = primary_provider
+        self.fallback_provider = fallback_provider
+        self.spec = spec or LowLatencyRoutingSpec()
+        self.name = f"ultra_low_latency:{self.spec.target_model}"
+        self.version = self.spec.target_model
+
+    def synthesize_assessment(self, req: SynthesisRequest) -> SynthesisResult:
+        try:
+            return self.primary_provider.synthesize_assessment(req)
+        except Exception:
+            if self.fallback_provider:
+                return self.fallback_provider.synthesize_assessment(req)
+            raise
+
+    def review_assessment(self, req: ReviewRequest) -> ReviewResult:
+        try:
+            return self.primary_provider.review_assessment(req)
+        except Exception:
+            if self.fallback_provider:
+                return self.fallback_provider.review_assessment(req)
+            raise
+
+
 def derive_status(
     criteria: list[CriterionResult], coverage_complete: bool
 ) -> EligibilityStatus:

@@ -17,6 +17,23 @@
 
 version: 1
 seed_set: tribune-quant-seed-set          # the frozen 50-case set (Phase 2)
+default_workhorse: gemini-3.7-flash
+
+providers:
+  gemini-3.7-flash:
+    provider_type: openai_compat
+    model_name: gemini-3.7-flash
+    input_cost_per_1m: 0.75
+    output_cost_per_1m: 3.75
+    max_context_tokens: 1048576
+    supports_tools: true
+  gpt-5.6-sol-ultrafast:
+    provider_type: openai_compat
+    model_name: gpt-5.6-sol-ultrafast
+    input_cost_per_1m: 2.50
+    output_cost_per_1m: 10.00
+    tokens_per_second: 750
+    supports_tools: true
 
 candidates:
   - candidate_id: glm-5.2

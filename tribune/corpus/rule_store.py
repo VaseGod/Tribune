@@ -41,6 +41,10 @@ class RuleStore(Protocol):
 
     def all_citations(self, program: ProgramId, jurisdiction: str) -> list[Citation]: ...
 
+    def get_scoped_schema(self, program: ProgramId, jurisdiction: str) -> dict: ...
+
+    def get_program_tools(self, program: ProgramId, jurisdiction: str) -> str: ...
+
 
 def _doc_text(rule: Rule) -> str:
     return f"{rule.title}. {rule.description} {rule.text}"
@@ -87,6 +91,74 @@ class LocalRuleStore:
 
     def all_citations(self, program: ProgramId, jurisdiction: str) -> list[Citation]:
         return [r.citation(program, jurisdiction) for r in program_registry.get_ruleset(program).rules]
+
+    def get_scoped_schema(self, program: ProgramId, jurisdiction: str) -> dict:
+        """Extract schema and statutory criteria specifically for the target program, pruning others."""
+        ruleset = program_registry.get_ruleset(program)
+        citations = self.all_citations(program, jurisdiction)
+        return {
+            "program": program.value,
+            "jurisdiction": jurisdiction,
+            "required_criteria": ruleset.required_ids,
+            "rules": [
+                {
+                    "criterion_id": r.criterion_id,
+                    "title": r.title,
+                    "description": r.description,
+                    "required": r.required,
+                }
+                for r in ruleset.rules
+            ],
+            "citations": [c.source for c in citations],
+        }
+
+    def get_program_tools(self, program: ProgramId, jurisdiction: str) -> str:
+        """Generate typed Python signatures strictly scoped to the target program domain."""
+        if program == ProgramId.SNAP:
+            return (
+                f"class Programmatic{program.value.capitalize()}Tools:\n"
+                f"    @staticmethod\n"
+                f"    def calculate_snap_gross_income(monthly_earned: float, monthly_unearned: float, household_size: int) -> dict: ...\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
+            )
+        if program == ProgramId.MEDICAID:
+            return (
+                f"class Programmatic{program.value.capitalize()}Tools:\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_medicaid_magi_income(monthly_income: float, household_size: int, pathway: str) -> dict: ...\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
+            )
+        if program == ProgramId.HOUSING:
+            return (
+                f"class Programmatic{program.value.capitalize()}Tools:\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_housing_ami_limit(annual_income: float, household_size: int, jurisdiction: str) -> dict: ...\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
+            )
+        if program == ProgramId.UNEMPLOYMENT:
+            return (
+                f"class Programmatic{program.value.capitalize()}Tools:\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_base_period_earnings(earnings: float, separation_reason: str) -> dict: ...\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
+            )
+        if program == ProgramId.APPEALS:
+            return (
+                f"class Programmatic{program.value.capitalize()}Tools:\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_appeal_timeliness(days_since_denial: int, statutory_window: int = 90) -> dict: ...\n"
+                f"    @staticmethod\n"
+                f"    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
+            )
+        return (
+            "class ProgrammaticEligibilityTools:\n"
+            "    @staticmethod\n"
+            "    def evaluate_criterion(evidence_value: float | str | bool, statutory_threshold: float | str | bool, operator: str = '<=') -> dict: ...\n"
+        )
 
 
 class HostedRuleStore(LocalRuleStore):

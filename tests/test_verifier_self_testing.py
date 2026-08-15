@@ -52,7 +52,7 @@ def test_verifier_generate_self_testing_prompt():
     verifier = Verifier(provider=LocalRulesProvider(role="verifier"), rule_store=store)
 
     prompt = verifier.generate_self_testing_prompt(assessment, "EX")
-    assert "Grok 4.6" in prompt
+    assert "gpt-5.6-sol-ultrafast" in prompt
     assert "multi-step self-testing trajectory" in prompt
     assert "Citation Integrity Check" in prompt
     assert "Cross-Statute Coherence" in prompt

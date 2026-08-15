@@ -66,12 +66,26 @@ class Candidate(BaseModel):
         return self
 
 
+class ProviderSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_type: str
+    model_name: str
+    input_cost_per_1m: float
+    output_cost_per_1m: float
+    max_context_tokens: int | None = None
+    tokens_per_second: float | None = None
+    supports_tools: bool = True
+
+
 class Registry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int
     seed_set: str
     candidates: list[Candidate]
+    default_workhorse: str | None = None
+    providers: dict[str, ProviderSpec] | None = None
     muse_glimmer_local: dict | None = None
 
 
@@ -85,6 +99,7 @@ class Registry(BaseModel):
 
 
 Candidate.model_rebuild()
+ProviderSpec.model_rebuild()
 Registry.model_rebuild()
 
 

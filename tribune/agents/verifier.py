@@ -68,11 +68,17 @@ class ProgrammaticVerifierTools:
 
 class Verifier:
     routing_intent: str = "multi_step_verification"
-    target_engine: str = "Grok 4.6"
+    target_engine: str = "gpt-5.6-sol-ultrafast"
 
-    def __init__(self, provider: ModelProvider, rule_store: RuleStore) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        rule_store: RuleStore,
+        target_engine: str = "gpt-5.6-sol-ultrafast",
+    ) -> None:
         self.provider = provider
         self.rule_store = rule_store
+        self.target_engine = target_engine
         self.tools = ProgrammaticVerifierTools()
 
     @staticmethod
@@ -94,9 +100,9 @@ class Verifier:
         )
 
     def generate_self_testing_prompt(self, assessment: Assessment, jurisdiction: str) -> str:
-        """Leverage Grok 4.6 capabilities to prompt for explicit multi-step self-testing trajectories."""
+        """Leverage gpt-5.6-sol-ultrafast capabilities to prompt for explicit multi-step self-testing trajectories."""
         return (
-            f"You are Grok 4.6 performing independent verification for assessment '{assessment.assessment_id}' "
+            f"You are {self.target_engine} performing independent verification for assessment '{assessment.assessment_id}' "
             f"under {jurisdiction} statutory rules.\n"
             "Execute the following explicit multi-step self-testing trajectory:\n"
             "1. Citation Integrity Check: Verify that all cited statutory rules exist, are active, and directly ground the claim.\n"

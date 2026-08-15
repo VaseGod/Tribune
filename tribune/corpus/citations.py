@@ -70,11 +70,15 @@ class ScoredDoc:
     score: float
 
 
+import time
+
+
 class LateInteractionRetriever:
     """ColBERT-style MaxSim scorer over deterministic token embeddings."""
 
     def __init__(self) -> None:
         self._doc_cache: dict[str, np.ndarray] = {}
+        self.last_latency_ms: float = 0.0
 
     def index(self, doc_id: str, text: str) -> None:
         self._doc_cache[doc_id] = embed_text(text)
@@ -90,14 +94,18 @@ class LateInteractionRetriever:
         return float(per_query_max.mean())
 
     def score(self, query: str, doc_text: str, doc_id: str | None = None) -> float:
+        start_t = time.perf_counter()
         q = embed_text(query)
         if doc_id is not None and doc_id in self._doc_cache:
             d = self._doc_cache[doc_id]
         else:
             d = embed_text(doc_text)
-        return self.maxsim(q, d)
+        res = self.maxsim(q, d)
+        self.last_latency_ms = (time.perf_counter() - start_t) * 1000.0
+        return res
 
     def rank(self, query: str, docs: dict[str, str], k: int) -> list[ScoredDoc]:
+        start_t = time.perf_counter()
         q = embed_text(query)
         scored: list[ScoredDoc] = []
         for doc_id, text in docs.items():
@@ -106,6 +114,7 @@ class LateInteractionRetriever:
                 d = embed_text(text)
             scored.append(ScoredDoc(doc_id=doc_id, score=self.maxsim(q, d)))
         scored.sort(key=lambda s: s.score, reverse=True)
+        self.last_latency_ms = (time.perf_counter() - start_t) * 1000.0
         return scored[:k]
 
 
