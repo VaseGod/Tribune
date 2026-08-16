@@ -27,6 +27,7 @@ import os
 from dataclasses import dataclass
 from datetime import date
 from fnmatch import fnmatch
+from typing import Any
 
 from ..types import ModelCallUsage, TaskUsage
 

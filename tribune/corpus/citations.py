@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -68,9 +69,6 @@ def embed_text(text: str) -> np.ndarray:
 class ScoredDoc:
     doc_id: str
     score: float
-
-
-import time
 
 
 class LateInteractionRetriever:

@@ -9,22 +9,24 @@
 
 import asyncio
 import os
+
 import pytest
 
-from tribune.agents.verifier import VerificationReport, Verifier
+from tribune.agents.verifier import VerificationReport
 from tribune.casegen.synthetic import SyntheticCaseGenerator
-from tribune.config import TribuneSettings
-from tribune.corpus.rule_store import LocalRuleStore
-from tribune.eval.costmodel import CostModel, ParetoPoint
+from tribune.eval.costmodel import CostModel
 from tribune.eval.quant_sensitivity.backends import smoke_ladder
 from tribune.eval.quant_sensitivity.ladder import run_ladder
-from tribune.governance.action_gate import ActionBlocked, ActionGate, PreConditionError
+from tribune.governance.action_gate import ActionGate, PreConditionError
 from tribune.governance.audit import AuditLog, CheckpointManager
 from tribune.governance.disclosure import generate_determination_notice
-from tribune.memory.partitions import AccessDenied, CasePartition, PartitionManager, SubagentMemoryPartition
-from tribune.orchestration.dag import AsyncDAGRunner, DAG, DAGRunner, Task, TaskStatus
+from tribune.memory.partitions import (
+    AccessDenied,
+    PartitionManager,
+)
+from tribune.orchestration.dag import DAG, AsyncDAGRunner, Task, TaskStatus
 from tribune.orchestration.pipeline import CasePipeline
-from tribune.orchestration.router import RecoveryPlan, Router
+from tribune.orchestration.router import Router
 from tribune.types import (
     Assessment,
     Citation,
@@ -39,9 +41,7 @@ from tribune.types import (
     Provenance,
     RecommendedAction,
     SMState,
-    SyntheticCase,
 )
-
 
 # =========================================================================== #
 # Pillar 1: Subagent Worktree Isolation Tests
@@ -50,8 +50,8 @@ from tribune.types import (
 def test_subagent_memory_partition_isolation():
     """Verify that distinct subagent partitions are completely isolated from each other."""
     mgr = PartitionManager()
-    main_partition = mgr.open("case_pillar_1")
-    
+    mgr.open("case_pillar_1")
+
     # Open isolated subagent partitions for Medicaid and SNAP
     medicaid_subagent = mgr.open_subagent("case_pillar_1", "subagent_medicaid", program=ProgramId.MEDICAID)
     snap_subagent = mgr.open_subagent("case_pillar_1", "subagent_snap", program=ProgramId.SNAP)

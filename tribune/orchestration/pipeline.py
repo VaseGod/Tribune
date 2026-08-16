@@ -10,7 +10,6 @@ into an abstention rather than crashing the case.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -30,7 +29,7 @@ from ..ingestion.base import make_doc_ingest
 from ..instrumentation.tracing import init_tracing, span
 from ..instrumentation.usage import UsageRecorder
 from ..memory.consolidation import MemoryConsolidator, extract_statutory_constraints
-from ..memory.partitions import CasePartition, PartitionManager, SubagentMemoryPartition
+from ..memory.partitions import CasePartition, PartitionManager
 from ..providers.base import get_provider_for_role
 from ..types import CaseRunResult, Evidence, ProgramOutcome, SMState, SyntheticCase
 from .dag import AsyncDAGRunner, DAGRunner, Task

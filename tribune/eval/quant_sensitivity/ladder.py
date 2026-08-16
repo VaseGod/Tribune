@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 from ...config import TribuneSettings, get_settings
 from ...orchestration.pipeline import CasePipeline
-from ...types import GroundTruthLabel, SyntheticCase
-from ..costmodel import CostModel, ParetoPoint, default_cost_model
+from ...types import SyntheticCase
+from ..costmodel import ParetoPoint, default_cost_model
 from ..costreport import CostReport, compute_cost_report
 from ..harness import records_for_case
 from ..metrics import (

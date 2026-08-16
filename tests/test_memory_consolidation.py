@@ -2,7 +2,6 @@
 
 from tribune.memory.consolidation import (
     MemoryConsolidator,
-    StatutoryConstraintBlock,
     extract_statutory_constraints,
 )
 from tribune.memory.partitions import PartitionManager

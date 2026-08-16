@@ -8,6 +8,8 @@ human. This is the "here's why" explanation built from the audit trail.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..corpus.citations import format_citation
 from ..types import (
     CaseRunResult,
@@ -139,7 +141,6 @@ def generate_determination_notice(
 
     assessment = outcome.assessment
     prog_name = _humanize_program(outcome.program.value)
-    now_iso = assessment.assessment_id.split(":")[-1]
 
     lines = [
         "================================================================================",

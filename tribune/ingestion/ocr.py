@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -95,9 +96,6 @@ def fast_heuristic_parse(text: str, doc_type: str = "") -> dict[str, str]:
 def parse_text_to_fields(text: str) -> dict[str, str]:
     """Parse ``key: value`` lines from text into known evidence fields via fast heuristic path."""
     return fast_heuristic_parse(text)
-
-
-import time
 
 
 class OcrIngest:

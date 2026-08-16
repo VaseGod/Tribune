@@ -5,7 +5,6 @@ from tribune.corpus.citations import LateInteractionRetriever
 from tribune.eval.harness import EvalHarness
 from tribune.eval.metrics import EvalRecord, compute_metrics
 from tribune.ingestion.ocr import OcrIngest
-from tribune.orchestration.pipeline import CasePipeline
 from tribune.types import ProgramId, RawDocument
 
 

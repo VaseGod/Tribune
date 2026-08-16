@@ -117,7 +117,6 @@ class DAG:
         dependencies all reside in waves < k.
         """
         self.topological_order()  # Validates dependencies and cycle-freedom
-        indeg = {tid: len(t.deps) for tid, t in self._tasks.items()}
         completed: set[str] = set()
         waves: list[list[Task]] = []
 
@@ -142,7 +141,7 @@ class DAG:
     def from_dict(cls, data: dict[str, Any]) -> DAG:
         dag = cls()
         tasks_data = data.get("tasks", {})
-        for tid, tdict in tasks_data.items():
+        for tdict in tasks_data.values():
             dag.add(Task.from_dict(tdict))
         return dag
 
