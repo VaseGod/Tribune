@@ -10,9 +10,12 @@ rule and (in a served deployment) can route the re-derivation to a stronger mode
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from ..corpus import programs as program_registry
-from ..types import ProgramId
+from ..governance.audit import CheckpointManager
+from ..types import AuditRecord, ProgramId, ProgramOutcome
+from .dag import DAG, TaskStatus
 
 _COMPLEX = {ProgramId.MEDICAID, ProgramId.HOUSING}
 
@@ -24,6 +27,21 @@ class RouteDecision:
     note: str
     target_model: str = "DeepSeek V4 Pro"
     cost_per_m_input: float = 0.435
+
+
+@dataclass
+class RecoveryPlan:
+    """Reconstructed execution plan and state generated from a recovered checkpoint."""
+
+    case_id: str
+    jurisdiction: str
+    completed_task_ids: list[str]
+    pending_task_ids: list[str]
+    reconstructed_dag: DAG
+    restored_outcomes: list[ProgramOutcome]
+    restored_audit: list[AuditRecord]
+    memory_snapshot: dict[str, Any]
+    checkpoint_timestamp: str
 
 
 class Router:
@@ -55,6 +73,42 @@ class Router:
             note="escalated: full retrieval over all governing rules (and stronger Grok 4.6 model if served)",
             target_model="Grok 4.6",
             cost_per_m_input=2.00,
+        )
+
+    def inspect_checkpoint(self, path: str = ".tribune/last_run.json") -> RecoveryPlan | None:
+        """Inspect checkpoint file upon startup, detect incomplete runs, and reconstruct in-memory DAG and state."""
+        chk = CheckpointManager.load_checkpoint(path)
+        if not chk:
+            return None
+
+        dag_dict = chk.get("dag", {})
+        dag = DAG.from_dict(dag_dict)
+        completed_ids = set(chk.get("completed_task_ids", []))
+        all_ids = set(dag.tasks.keys())
+        pending_ids = [tid for tid in dag.topological_order() if tid.task_id not in completed_ids]
+
+        if not pending_ids and completed_ids == all_ids:
+            # All tasks completed in checkpoint
+            return None
+
+        for tid_str in completed_ids:
+            task = dag.get(tid_str)
+            if task:
+                task.status = TaskStatus.COMPLETED
+
+        restored_audit = [AuditRecord.model_validate(r) for r in chk.get("audit_records", [])]
+        restored_outcomes = [ProgramOutcome.model_validate(o) for o in chk.get("outcomes", [])]
+
+        return RecoveryPlan(
+            case_id=chk["case_id"],
+            jurisdiction=chk.get("jurisdiction", "EX"),
+            completed_task_ids=list(completed_ids),
+            pending_task_ids=[t.task_id for t in pending_ids],
+            reconstructed_dag=dag,
+            restored_outcomes=restored_outcomes,
+            restored_audit=restored_audit,
+            memory_snapshot=chk.get("memory_snapshot", {}),
+            checkpoint_timestamp=chk.get("timestamp", ""),
         )
 
     def route_task(
@@ -125,3 +179,6 @@ class Router:
             target_model="DeepSeek V4 Pro",
             cost_per_m_input=0.435,
         )
+
+
+__all__ = ["RouteDecision", "RecoveryPlan", "Router"]

@@ -16,6 +16,10 @@ review is folded in alongside the structural checks.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
 from ..corpus import programs as program_registry
 from ..corpus.programs.jurisdictions import get_profile
 from ..corpus.rule_store import RuleStore
@@ -24,10 +28,35 @@ from ..types import (
     Assessment,
     CriterionOutcome,
     CriterionResult,
+    EligibilityStatus,
     Evidence,
     EvidenceView,
+    ProgramId,
     VerifierVerdict,
 )
+
+
+@dataclass(frozen=True)
+class VerificationReport:
+    """Structured milestone verification report produced in Pass 1 of the two-stage pattern.
+
+    Formally certifies candidate eligibility findings, facts, and mathematical calculations
+    strictly against statutory rules loaded from RuleStore.
+    """
+
+    is_certified: bool
+    assessment_id: str
+    program: ProgramId
+    jurisdiction: str
+    recomputed_status: EligibilityStatus
+    milestone_steps: list[dict[str, Any]] = field(default_factory=list)
+    violated_rule_ids: list[str] = field(default_factory=list)
+    missing_citations: list[str] = field(default_factory=list)
+    unsupported_claims: list[str] = field(default_factory=list)
+    calculation_discrepancies: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    score: float = 1.0
+    certified_at: float = field(default_factory=time.time)
 
 
 class ProgrammaticVerifierTools:
@@ -200,9 +229,13 @@ class Verifier:
         total_score = sum(w * s["score"] for w, s in zip(weights, steps, strict=False))
         return round(total_score, 4), steps
 
-    def verify(
+    def evaluate_and_certify(
         self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
-    ) -> VerifierVerdict:
+    ) -> tuple[bool, VerificationReport]:
+        """Pass 1: Strictly evaluate and certify candidate findings against statutory rules.
+
+        Returns (is_certified, VerificationReport).
+        """
         program = assessment.program
         profile = get_profile(jurisdiction)
         view = EvidenceView(evidence)
@@ -210,16 +243,18 @@ class Verifier:
 
         missing_citations: list[str] = []
         unsupported_claims: list[str] = []
+        calculation_discrepancies: list[str] = []
+        violated_rule_ids: list[str] = []
         reasons: list[str] = []
 
-        # Mandatory citation verification against RuleStore
+        # 1. Statutory citation validity against RuleStore
         active_citations = self.rule_store.all_citations(program, jurisdiction)
         active_cids = {c.citation_id for c in active_citations}
         for cit in assessment.citations:
             if cit.citation_id not in active_cids:
                 missing_citations.append(f"invalid statutory citation '{cit.citation_id}'")
 
-        # Re-derive every criterion the assessment took a position on, from its rule.
+        # 2. Predicate and calculation verification
         recomputed_for_assessment: list[CriterionResult] = []
         for crit in assessment.criteria:
             rule = ruleset.get(crit.criterion_id)
@@ -244,20 +279,23 @@ class Verifier:
                 )
             )
             if recomputed is not crit.outcome:
+                violated_rule_ids.append(crit.criterion_id)
                 unsupported_claims.append(
                     f"criterion '{crit.criterion_id}': proposer said {crit.outcome.value}, "
                     f"re-derivation says {recomputed.value}"
                 )
 
-        # Coverage: were all required criteria assessed?
+        # 3. Coverage check: were all required criteria evaluated?
         assessed_required = {c.criterion_id for c in assessment.criteria if c.required}
         incomplete_coverage = [rid for rid in ruleset.required_ids if rid not in assessed_required]
         if incomplete_coverage:
+            for rid in incomplete_coverage:
+                violated_rule_ids.append(rid)
             reasons.append(
                 "assessment did not cover all required criteria: " + ", ".join(incomplete_coverage)
             )
 
-        # Independent status from a full re-derivation over every required rule.
+        # 4. Independent status from a full re-derivation over every required rule.
         full_recompute: list[CriterionResult] = []
         for rule in ruleset.rules:
             full_recompute.append(
@@ -271,11 +309,15 @@ class Verifier:
             )
         recomputed_status = derive_status(full_recompute, coverage_complete=True)
         if assessment.is_assertion and recomputed_status is not assessment.status:
+            calculation_discrepancies.append(
+                f"asserted status {assessment.status.value} != full re-derivation {recomputed_status.value}"
+            )
             unsupported_claims.append(
                 f"asserted status {assessment.status.value} is not supported by full "
                 f"re-derivation ({recomputed_status.value})"
             )
 
+        # 5. Model review request
         review = self.provider.review_assessment(
             ReviewRequest(
                 assessment=assessment,
@@ -284,31 +326,67 @@ class Verifier:
             )
         )
 
-        # Execute multi-step self-testing trajectory
+        # 6. Multi-step self-testing trajectory
         self_testing_score, trajectory_steps = self.execute_self_testing_trajectory(
             assessment, evidence, jurisdiction
         )
 
-        approved = (
+        is_certified = (
             not missing_citations
             and not unsupported_claims
             and not incomplete_coverage
+            and not calculation_discrepancies
             and review.supported
         )
+
         if missing_citations:
             reasons.append("missing/incorrect citations for: " + ", ".join(missing_citations))
         for c in review.concerns:
             reasons.append(f"model review concern: {c}")
-        if approved:
+        if is_certified:
             reasons.append("independent re-derivation from the cited rules confirms the assessment")
 
-        return VerifierVerdict(
-            approved=approved,
+        report = VerificationReport(
+            is_certified=is_certified,
+            assessment_id=assessment.assessment_id,
+            program=program,
+            jurisdiction=jurisdiction,
             recomputed_status=recomputed_status,
+            milestone_steps=trajectory_steps,
+            violated_rule_ids=violated_rule_ids,
             missing_citations=missing_citations,
             unsupported_claims=unsupported_claims,
-            incomplete_coverage=incomplete_coverage,
+            calculation_discrepancies=calculation_discrepancies,
             reasons=reasons,
-            self_testing_score=self_testing_score,
-            trajectory_steps=trajectory_steps,
+            score=self_testing_score,
         )
+        return is_certified, report
+
+    def verify(
+        self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
+    ) -> VerifierVerdict:
+        program = assessment.program
+        ruleset = program_registry.get_ruleset(program)
+
+        is_certified, report = self.evaluate_and_certify(assessment, evidence, jurisdiction)
+
+        assessed_required = {c.criterion_id for c in assessment.criteria if c.required}
+        incomplete_coverage = [rid for rid in ruleset.required_ids if rid not in assessed_required]
+
+        return VerifierVerdict(
+            approved=is_certified,
+            recomputed_status=report.recomputed_status,
+            missing_citations=report.missing_citations,
+            unsupported_claims=report.unsupported_claims,
+            incomplete_coverage=incomplete_coverage,
+            reasons=report.reasons,
+            self_testing_score=report.score,
+            trajectory_steps=report.milestone_steps,
+        )
+
+
+__all__ = [
+    "VerificationReport",
+    "Verifier",
+    "ProgrammaticVerifierTools",
+]

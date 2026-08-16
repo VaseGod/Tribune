@@ -102,6 +102,23 @@ For each program in a person's situation:
 5. If the assessment clears verification and confidence, the **preparer** assembles materials and a document checklist — but the **action-gate** enforces mandatory epistemic citation verification, ensuring no uncited claims or invalid statutory references can be submitted.
 6. Every step writes a record to an append-only, **hash-chained audit log**; `disclosure.py` renders it as a plain-language "here's why."
 
+### Core Architectural Pillars
+
+TRIBUNE is structured around 4 failure-resilient, governance-first architectural pillars:
+
+1. **Subagent Worktree Isolation (`tribune/memory/`, `tribune/orchestration/`):**
+   - Independent subagents run inside isolated `SubagentMemoryPartition` boundaries keyed by `(case_id, subagent_id, program)` with cross-subagent read protection (`AccessDenied`).
+   - Supports branching (`fork()`) and safe reconciliation (`merge_into()`), while `AsyncDAGRunner` schedules independent tasks into parallel topological waves.
+2. **Two-Stage Evaluator-Generator Pattern (`tribune/agents/`, `tribune/governance/`):**
+   - **Pass 1 (Milestone Verification):** `Verifier.evaluate_and_certify` performs independent statutory re-derivation, arithmetic checks, citation validity, and rule coverage checks to yield a certified `VerificationReport`.
+   - **Gating & Pass 2 (Notice Generation):** `ActionGate` enforces verification certification before `generate_determination_notice` can draft formal legal disclosure notices with statutory basis and fair hearing appeal rights.
+3. **Atomic Transaction Logging & Crash Recovery (`tribune/governance/`, `tribune/orchestration/`):**
+   - Step-level milestones are written atomically via `CheckpointManager` using temporary files and `os.replace` to prevent corrupted partial writes on unexpected process termination.
+   - On startup, `Router.inspect_checkpoint` detects interrupted cases and generates a `RecoveryPlan`; `CasePipeline.resume_from_checkpoint` restores memory partitions, replays audit trails, and executes only remaining pending tasks without duplicate computation.
+4. **Quantization Parity & Pareto Frontier Benchmarking (`tribune/eval/`):**
+   - Evaluation ladders track statutory citation precision/recall, false positive rate (FPR), false negative rate (FNR), and accuracy delta vs. full-precision reference backends.
+   - `CostModel.compute_pareto_frontier` runs multi-objective optimization (minimizing cost vs. maximizing accuracy/parity) across local quant tiers and cloud endpoints.
+
 ---
 
 ## Swapping in real backends (run it sovereignly)

@@ -125,6 +125,49 @@ class ActionGate:
 
         return len(violations) == 0, violations
 
+    def assert_evaluation_certified(
+        self,
+        report: Any,
+        assessment: Assessment | None = None,
+    ) -> None:
+        """Assert that an evaluation has cleared Pass 1 milestone verification before proceeding to generation."""
+        is_certified = getattr(report, "is_certified", False)
+        if not is_certified:
+            reasons = getattr(report, "reasons", ["unverified evaluation"])
+            raise PreConditionError(
+                f"Evaluation failed Pass 1 milestone verification: {'; '.join(reasons)}"
+            )
+        missing_citations = getattr(report, "missing_citations", [])
+        if missing_citations:
+            raise PreConditionError(
+                f"Evaluation contains uncited/invalid citations: {'; '.join(missing_citations)}"
+            )
+        unsupported = getattr(report, "unsupported_claims", [])
+        if unsupported:
+            raise PreConditionError(
+                f"Evaluation contains unsupported statutory claims: {'; '.join(unsupported)}"
+            )
+
+    def authorize_notice_generation(
+        self,
+        assessment: Assessment,
+        verification_report: Any | None = None,
+        rule_store: RuleStore | None = None,
+    ) -> bool:
+        """Enforce two-stage verification gate before allowing determination/disclosure notice generation.
+
+        Blocks single-pass generation and uncertified drafts.
+        """
+        if verification_report is not None:
+            self.assert_evaluation_certified(verification_report, assessment)
+
+        is_valid, violations = self.verify_citations(assessment, rule_store)
+        if not is_valid:
+            raise PreConditionError(
+                f"Notice generation blocked due to statutory citation violations: {'; '.join(violations)}"
+            )
+        return True
+
     def assert_preconditions(
         self,
         materials: PreparedMaterials | None = None,

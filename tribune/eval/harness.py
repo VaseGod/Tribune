@@ -50,6 +50,8 @@ def records_for_case(case: SyntheticCase, result) -> list[EvalRecord]:
             asserted_status = outcome.assessment.status.value
         verifier_status = outcome.verdict.recomputed_status.value if outcome.verdict else None
         usage = outcome.usage
+        citations_list = [c.citation_id for c in outcome.assessment.citations] if outcome.assessment else []
+        decisive = list(gt.decisive_criteria) if hasattr(gt, "decisive_criteria") else []
         out.append(
             EvalRecord(
                 case_id=case.case_id,
@@ -74,6 +76,8 @@ def records_for_case(case: SyntheticCase, result) -> list[EvalRecord]:
                 citation_latency_ms=getattr(outcome, "citation_latency_ms", 0.0) or getattr(result, "citation_latency_ms", 0.0),
                 llm_latency_ms=getattr(outcome, "llm_latency_ms", 0.0) or getattr(result, "llm_latency_ms", 0.0),
                 total_latency_ms=getattr(outcome, "total_latency_ms", 0.0) or getattr(result, "total_latency_ms", 0.0),
+                citations=citations_list,
+                decisive_criteria=decisive,
             )
         )
     return out

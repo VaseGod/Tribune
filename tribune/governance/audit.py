@@ -108,6 +108,10 @@ class AuditLog:
         chain.append(record)
         return record
 
+    def load_records(self, case_id: str, records: list[AuditRecord]) -> None:
+        """Restore audit records into the in-memory chain during crash recovery."""
+        self._by_case[case_id] = list(records)
+
     def records(self, case_id: str) -> list[AuditRecord]:
         return list(self._by_case.get(case_id, []))
 
@@ -121,3 +125,97 @@ class AuditLog:
                 return False
             prev = rec.record_hash
         return True
+
+
+class CheckpointManager:
+    """Zero-data-loss atomic state-write operations and crash recovery manager.
+
+    Writes execution checkpoints atomically to `.tribune/last_run.json` using a temporary file
+    and atomic file replacement to protect against corruptions during unexpected process crashes.
+    """
+
+    DEFAULT_PATH = ".tribune/last_run.json"
+
+    @classmethod
+    def save_checkpoint(
+        cls,
+        case_id: str,
+        jurisdiction: str,
+        dag_dict: dict[str, Any],
+        completed_task_ids: list[str],
+        outcomes_data: list[dict[str, Any]],
+        memory_snapshot: dict[str, Any],
+        audit_records: list[AuditRecord],
+        metadata: dict[str, Any] | None = None,
+        path: str | None = None,
+    ) -> str:
+        """Atomically persist a milestone checkpoint."""
+        import os
+
+        final_path = path or cls.DEFAULT_PATH
+        dirname = os.path.dirname(final_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+
+        temp_path = f"{final_path}.tmp.{uuid.uuid4().hex}"
+        payload = {
+            "checkpoint_version": 1,
+            "timestamp": _canonical_now(),
+            "case_id": case_id,
+            "jurisdiction": jurisdiction,
+            "dag": dag_dict,
+            "completed_task_ids": completed_task_ids,
+            "outcomes": outcomes_data,
+            "memory_snapshot": memory_snapshot,
+            "audit_records": [r.model_dump(mode="json") for r in audit_records],
+            "metadata": metadata or {},
+        }
+
+        with open(temp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        os.replace(temp_path, final_path)
+        return final_path
+
+    @classmethod
+    def load_checkpoint(cls, path: str | None = None) -> dict[str, Any] | None:
+        """Load and deserialize checkpoint from disk, returning None if absent or corrupt."""
+        import os
+
+        target_path = path or cls.DEFAULT_PATH
+        if not os.path.exists(target_path):
+            return None
+        try:
+            with open(target_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    @classmethod
+    def clear_checkpoint(cls, path: str | None = None) -> bool:
+        """Remove checkpoint after successful execution completion."""
+        import os
+
+        target_path = path or cls.DEFAULT_PATH
+        if os.path.exists(target_path):
+            try:
+                os.remove(target_path)
+                return True
+            except OSError:
+                pass
+        return False
+
+
+def _canonical_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+__all__ = [
+    "AuditLog",
+    "CheckpointManager",
+    "sanitize_audit_text",
+    "sanitize_audit_data",
+]

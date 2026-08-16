@@ -71,6 +71,9 @@ class EvalRecord:
     citation_latency_ms: float = 0.0
     llm_latency_ms: float = 0.0
     total_latency_ms: float = 0.0
+    # -- statutory citations & decisive criteria -- #
+    citations: list[str] = field(default_factory=list)
+    decisive_criteria: list[str] = field(default_factory=list)
 
 
 def classify_outcome(r: EvalRecord) -> TaskOutcomeType:
@@ -215,6 +218,11 @@ class MetricsReport:
     mean_llm_latency_ms: float = float("nan")
     mean_total_latency_ms: float = float("nan")
     per_program: dict[str, MetricsReport] = field(default_factory=dict)
+
+    @property
+    def accuracy(self) -> float:
+        """Alias for raw_agreement_vs_truth."""
+        return self.raw_agreement_vs_truth
 
     def render(self) -> str:
         def f(x: float) -> str:

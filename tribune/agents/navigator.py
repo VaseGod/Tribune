@@ -53,7 +53,7 @@ class Navigator:
     def plan(self, case: SyntheticCase) -> DAG:
         """Dynamically bind and expose only DAG tasks for programs in the case intake payload."""
         dag = DAG()
-        dag.add(Task(task_id="gather", kind="gather"))
+        dag.add(Task(task_id="gather", kind="gather", subagent_id="subagent_gather"))
         for program in case.target_programs:
             dag.add(
                 Task(
@@ -61,6 +61,7 @@ class Navigator:
                     kind="assess",
                     deps=["gather"],
                     program=program,
+                    subagent_id=f"subagent_{program.value}",
                 )
             )
         return dag

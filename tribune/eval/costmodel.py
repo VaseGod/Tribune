@@ -98,6 +98,20 @@ def _parse_rate(obj: dict) -> Rate:
     )
 
 
+@dataclass(frozen=True)
+class ParetoPoint:
+    """A point on the cost-versus-parity evaluation plane."""
+
+    label: str
+    backend_id: str
+    cost_per_1k: float
+    accuracy: float
+    parity_score: float
+    cost_savings_pct: float
+    is_pareto_optimal: bool
+    dominated_by: tuple[str, ...] = ()
+
+
 class CostModel:
     def __init__(self, backends: list[BackendPricing]) -> None:
         self.backends = backends
@@ -165,9 +179,74 @@ class CostModel:
                 backend_ids.append(backend_id)
         return total, (",".join(backend_ids) if backend_ids else None)
 
+    def compute_pareto_frontier(
+        self,
+        points_data: list[dict[str, Any]],
+        reference_label: str = "fp16",
+    ) -> list[ParetoPoint]:
+        """Compute the Pareto frontier optimizing (minimize cost, maximize accuracy/parity).
+
+        A candidate A is dominated by candidate B if B has cost <= A and parity/accuracy >= A
+        with at least one strict inequality.
+        """
+        if not points_data:
+            return []
+
+        # Find reference cost
+        ref_cost = next((p["cost_per_1k"] for p in points_data if p["label"] == reference_label), None)
+        if ref_cost is None or ref_cost == 0:
+            ref_cost = max((p["cost_per_1k"] for p in points_data), default=1.0) or 1.0
+
+        pareto_points: list[ParetoPoint] = []
+        n = len(points_data)
+
+        for i in range(n):
+            p1 = points_data[i]
+            cost1 = float(p1["cost_per_1k"])
+            acc1 = float(p1.get("accuracy", 1.0))
+            par1 = float(p1.get("parity_score", acc1))
+            savings_pct = max(0.0, (1.0 - (cost1 / ref_cost)) * 100.0) if ref_cost > 0 else 0.0
+
+            dominated_by: list[str] = []
+            for j in range(n):
+                if i == j:
+                    continue
+                p2 = points_data[j]
+                cost2 = float(p2["cost_per_1k"])
+                acc2 = float(p2.get("accuracy", 1.0))
+                par2 = float(p2.get("parity_score", acc2))
+
+                # Domination condition: p2 is as cheap as p1 and as accurate/parity as p1, and strictly better in one
+                if cost2 <= cost1 and par2 >= par1 and (cost2 < cost1 or par2 > par1):
+                    dominated_by.append(p2["label"])
+
+            pareto_points.append(
+                ParetoPoint(
+                    label=p1["label"],
+                    backend_id=p1.get("backend_id", p1["label"]),
+                    cost_per_1k=cost1,
+                    accuracy=acc1,
+                    parity_score=par1,
+                    cost_savings_pct=round(savings_pct, 2),
+                    is_pareto_optimal=len(dominated_by) == 0,
+                    dominated_by=tuple(dominated_by),
+                )
+            )
+
+        return pareto_points
+
 
 def default_cost_model() -> CostModel:
     """Return the CostModel loaded from the default packaged pricing.json or TRIBUNE_PRICING_PATH."""
     path = os.environ.get("TRIBUNE_PRICING_PATH", _PACKAGED_PRICING)
     return CostModel.load(path)
+
+
+__all__ = [
+    "Rate",
+    "BackendPricing",
+    "ParetoPoint",
+    "CostModel",
+    "default_cost_model",
+]
 

@@ -56,6 +56,11 @@ class CostReport:
     total_tokens_output: int = 0
     estimated_tokens_present: bool = False
 
+    @property
+    def cost_per_1k_cases(self) -> float:
+        """Cost per 1,000 cases in USD."""
+        return (self.mean_cost_usd * 1000.0) if not isnan(self.mean_cost_usd) else 0.0
+
     def render(self) -> str:
         def usd(x: float) -> str:
             return "     n/a" if isnan(x) else f"{x:8.5f}"
