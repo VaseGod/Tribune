@@ -98,3 +98,52 @@ def test_trajectory_buffer_preserves_static_prefix_and_immutability():
     assert len(buffer2.frames) == 2
     assert buffer2.static_prefix == static_prefix
     assert buffer2.latest_evidence == ev
+
+
+def test_reasonmaxxer_rolling_reasoning_compaction():
+    from tribune.memory.consolidation import compact_latent_reasoning_trace
+
+    # Create 12 verbose latent reasoning steps with thinking monologues
+    trace = [
+        {"step_index": i, "content": f"<think>Evaluating income step {i}: calculating monthly deductions</think> Income verification sub-step {i} satisfied."}
+        for i in range(12)
+    ]
+
+    summary, compacted_steps = compact_latent_reasoning_trace(trace, max_visible_steps=3)
+
+    assert summary["compacted_count"] == 9
+    assert len(compacted_steps) == 4  # 1 summary block + 3 recent steps
+    assert compacted_steps[0]["type"] == "compacted_latent_summary"
+    assert "COMPACTED STATE SUMMARY" in compacted_steps[0]["content"]
+    assert compacted_steps[1]["step_index"] == 9
+    assert compacted_steps[2]["step_index"] == 10
+    assert compacted_steps[3]["step_index"] == 11
+
+
+def test_vram_protection_gate(monkeypatch):
+    from tribune.memory.consolidation import VRAMProtectionGate
+
+    pm = PartitionManager()
+    partition = pm.open("vram-test-case")
+    consolidator = MemoryConsolidator(partition)
+
+    # 1. Normal usage (80%) -> ubatch preserved, no consolidation triggered
+    monkeypatch.setenv("TRIBUNE_SIMULATED_VRAM_USAGE", "0.80")
+    new_ubatch, triggered = VRAMProtectionGate.check_and_enforce_vram_protection(
+        current_ubatch_size=512,
+        vram_usage_threshold=0.95,
+        consolidator=consolidator,
+    )
+    assert new_ubatch == 512
+    assert not triggered
+
+    # 2. Critical usage (96% > 95%) -> ubatch halved (512 -> 256), consolidation triggered
+    monkeypatch.setenv("TRIBUNE_SIMULATED_VRAM_USAGE", "0.96")
+    new_ubatch_critical, triggered_critical = VRAMProtectionGate.check_and_enforce_vram_protection(
+        current_ubatch_size=512,
+        vram_usage_threshold=0.95,
+        consolidator=consolidator,
+    )
+    assert new_ubatch_critical == 256
+    assert triggered_critical
+

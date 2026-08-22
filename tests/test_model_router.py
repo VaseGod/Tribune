@@ -210,3 +210,66 @@ def test_orchestration_router_task_aware_allocation():
     assert esc_route.target_model == "Grok 4.6"
     assert esc_route.cost_per_m_input == 2.00
 
+
+def test_reasonmaxxer_routing_complex_extraction():
+    router = ModelRouter()
+    # Complex extraction maps to Tier 0 (local dense Qwen3.8-27B)
+    assert router.classify_task(intent="complex_extraction") == 0
+    assert router.classify_task(intent="multi_step_extraction") == 0
+    assert router.classify_task(intent="complex_document_extraction") == 0
+    assert router.classify_task(intent="extraction", context_length=3000) == 0
+
+    # Standard tasks follow latency / cost rules
+    assert router.classify_task(intent="parsing") == 1
+    assert router.classify_task(intent="classification") == 1
+    assert router.classify_task(intent="reasoning") == 2
+
+
+def test_reasonmaxxer_route_document_extraction_execution():
+    router = ModelRouter()
+    res = router.route_document_extraction(
+        prompt="Extract all income sources and medical expense items from 73k token appeal document.",
+        context="Appeal Case #10293",
+        temperature=1.0,
+        top_p=0.95,
+    )
+    assert res["status"] == "success"
+    assert res["model"] == "qwen3.8-27b"
+    assert res["temperature"] == 1.0
+    assert res["top_p"] == 0.95
+    assert router.stats["local_dense_calls"] == 1
+
+
+def test_reasonmaxxer_local_dense_fallback():
+    local_failing = MockFailingProvider(fail_with_exception=True)
+    tier2 = MockSuccessProvider("tier2_sol")
+    router = ModelRouter(local_dense_provider=local_failing, tier2_provider=tier2)
+
+    def fn_local():
+        raise RuntimeError("Local llama.cpp OOM error")
+
+    def fn_tier2():
+        return "tier2_commercial_success"
+
+    res = router.route_and_execute(
+        fn_tier1=lambda: "tier1",
+        fn_tier2=fn_tier2,
+        intent="complex_extraction",
+        fn_local=fn_local,
+    )
+    assert res == "tier2_commercial_success"
+    assert router.stats["local_dense_fallbacks"] == 1
+    assert router.stats["tier2_calls"] == 1
+
+
+def test_reasonmaxxer_rollback_toggle(monkeypatch):
+    monkeypatch.setenv("TRIBUNE_ENABLE_REASONMAXXER", "false")
+    reset_settings_cache()
+    router = ModelRouter()
+    assert not router.enable_reasonmaxxer
+
+    # With ReasonMaxxer disabled, extraction does not go to tier 0
+    assert router.classify_task(intent="complex_extraction") == 1
+    assert router.classify_task(intent="reasoning") == 2
+
+

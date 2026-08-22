@@ -21,6 +21,8 @@ from ..agents.navigator import Navigator
 from ..agents.preparer import Preparer
 from ..agents.verifier import Verifier
 from ..config import TribuneSettings, get_settings
+from ..context.graph_builder import AgentGraphBuilder
+from ..context.workspace import WorkspaceContext
 from ..corpus.rule_store import make_rule_store
 from ..eval.costmodel import CostModel
 from ..governance.action_gate import ActionGate
@@ -31,7 +33,16 @@ from ..instrumentation.usage import UsageRecorder
 from ..memory.consolidation import MemoryConsolidator, extract_statutory_constraints
 from ..memory.partitions import CasePartition, PartitionManager
 from ..providers.base import get_provider_for_role
-from ..types import CaseRunResult, Evidence, ProgramOutcome, SMState, SyntheticCase
+from ..types import (
+    CaseRunResult,
+    DeltaPatch,
+    Evidence,
+    PatchOperationType,
+    PatchProvenance,
+    ProgramOutcome,
+    SMState,
+    SyntheticCase,
+)
 from .dag import AsyncDAGRunner, DAGRunner, Task
 from .router import RecoveryPlan, Router
 from .state_machine import CaseStateMachine
@@ -117,6 +128,7 @@ class CasePipeline:
         self.audit = AuditLog()
         self.runner = DAGRunner()
         self.async_runner = AsyncDAGRunner()
+        self.workspace: WorkspaceContext | None = None
         self.sm = CaseStateMachine(
             proposer=self.proposer,
             verifier=self.verifier,
@@ -152,6 +164,19 @@ class CasePipeline:
     def run_case(self, case: SyntheticCase) -> CaseRunResult:
         with span("run_case", case_id=case.case_id, jurisdiction=case.jurisdiction):
             start_t = time.perf_counter()
+
+            # Initialize Shared Workspace Context for multi-agent execution
+            self.workspace = WorkspaceContext(case_id=case.case_id, jurisdiction=case.jurisdiction)
+            self.workspace.apply_patch(
+                DeltaPatch(
+                    run_id=case.case_id,
+                    agent_id="navigator",
+                    operation=PatchOperationType.REPLACE,
+                    path="/documents",
+                    value=[d.model_dump(mode="json") for d in case.documents],
+                    provenance=PatchProvenance(agent_id="navigator"),
+                )
+            )
 
             self.recorder.start_case(case.case_id, case.language)
             partition = self.partitions.open(case.case_id)
@@ -190,6 +215,20 @@ class CasePipeline:
                     ocr_lat = getattr(self.ingest, "last_latency_ms", (time.perf_counter() - g_start) * 1000.0)
                     result.ocr_latency_ms = ocr_lat
                     evidence = consolidator.consolidate_evidence()
+
+                    # Write structured delta patch to workspace context
+                    if self.workspace:
+                        self.workspace.apply_patch(
+                            DeltaPatch(
+                                run_id=case.case_id,
+                                agent_id="gather",
+                                operation=PatchOperationType.REPLACE,
+                                path="/evidence",
+                                value=[e.model_dump(mode="json") for e in evidence],
+                                provenance=PatchProvenance(agent_id="gather"),
+                            )
+                        )
+
                     trajectory = trajectory.append(
                         SMState.GATHER,
                         "navigator",
@@ -225,6 +264,55 @@ class CasePipeline:
                     outcome.ocr_latency_ms = ocr_lat
                     result.citation_latency_ms = max(result.citation_latency_ms, outcome.citation_latency_ms)
                     result.llm_latency_ms += outcome.llm_latency_ms
+
+                    # Write outcome delta patch to shared workspace
+                    if self.workspace:
+                        if outcome.assessment:
+                            self.workspace.apply_patch(
+                                DeltaPatch(
+                                    run_id=case.case_id,
+                                    agent_id=f"proposer_{program.value}",
+                                    operation=PatchOperationType.REPLACE,
+                                    path=f"/assessments/{program.value}",
+                                    value=outcome.assessment.model_dump(mode="json"),
+                                    provenance=PatchProvenance(
+                                        agent_id=f"proposer_{program.value}",
+                                        task_id=task.task_id,
+                                        citation_keys=[c.citation_id for c in outcome.assessment.citations],
+                                        confidence=outcome.assessment.self_confidence,
+                                    ),
+                                )
+                            )
+                        if outcome.verdict:
+                            self.workspace.apply_patch(
+                                DeltaPatch(
+                                    run_id=case.case_id,
+                                    agent_id=f"verifier_{program.value}",
+                                    operation=PatchOperationType.REPLACE,
+                                    path=f"/verification_verdicts/{program.value}",
+                                    value=outcome.verdict.model_dump(mode="json"),
+                                    provenance=PatchProvenance(
+                                        agent_id=f"verifier_{program.value}",
+                                        task_id=task.task_id,
+                                        confidence=outcome.verdict.self_testing_score,
+                                    ),
+                                )
+                            )
+                        if outcome.materials:
+                            self.workspace.apply_patch(
+                                DeltaPatch(
+                                    run_id=case.case_id,
+                                    agent_id=f"preparer_{program.value}",
+                                    operation=PatchOperationType.REPLACE,
+                                    path=f"/materials/{program.value}",
+                                    value=outcome.materials.model_dump(mode="json"),
+                                    provenance=PatchProvenance(
+                                        agent_id=f"preparer_{program.value}",
+                                        task_id=task.task_id,
+                                    ),
+                                )
+                            )
+
                     trajectory = trajectory.append(
                         outcome.final_state,
                         "state_machine",
@@ -264,6 +352,11 @@ class CasePipeline:
             result.total_latency_ms = (time.perf_counter() - start_t) * 1000.0
             result.audit = self.audit.records(case.case_id)
 
+            if self.workspace:
+                result.workspace_version = self.workspace.version
+                agent_count = max(4, len(case.target_programs) * 2 + 2)
+                result.token_reduction = self.workspace.calculate_token_reduction(agent_count=agent_count)
+
             # Clear checkpoint upon successful complete run
             CheckpointManager.clear_checkpoint(self.checkpoint_path)
             return result
@@ -272,6 +365,18 @@ class CasePipeline:
         """Asynchronous execution of case DAG with parallel subagent wave fan-out."""
         with span("run_case_async", case_id=case.case_id, jurisdiction=case.jurisdiction):
             start_t = time.perf_counter()
+
+            self.workspace = WorkspaceContext(case_id=case.case_id, jurisdiction=case.jurisdiction)
+            self.workspace.apply_patch(
+                DeltaPatch(
+                    run_id=case.case_id,
+                    agent_id="navigator",
+                    operation=PatchOperationType.REPLACE,
+                    path="/documents",
+                    value=[d.model_dump(mode="json") for d in case.documents],
+                    provenance=PatchProvenance(agent_id="navigator"),
+                )
+            )
 
             self.recorder.start_case(case.case_id, case.language)
             partition = self.partitions.open(case.case_id)
@@ -310,6 +415,19 @@ class CasePipeline:
                     ocr_lat = getattr(self.ingest, "last_latency_ms", (time.perf_counter() - g_start) * 1000.0)
                     result.ocr_latency_ms = ocr_lat
                     evidence = consolidator.consolidate_evidence()
+
+                    if self.workspace:
+                        self.workspace.apply_patch(
+                            DeltaPatch(
+                                run_id=case.case_id,
+                                agent_id="gather",
+                                operation=PatchOperationType.REPLACE,
+                                path="/evidence",
+                                value=[e.model_dump(mode="json") for e in evidence],
+                                provenance=PatchProvenance(agent_id="gather"),
+                            )
+                        )
+
                     trajectory = trajectory.append(
                         SMState.GATHER,
                         "navigator",
@@ -349,6 +467,54 @@ class CasePipeline:
                     outcome.ocr_latency_ms = ocr_lat
                     result.citation_latency_ms = max(result.citation_latency_ms, outcome.citation_latency_ms)
                     result.llm_latency_ms += outcome.llm_latency_ms
+
+                    if self.workspace:
+                        if outcome.assessment:
+                            self.workspace.apply_patch(
+                                DeltaPatch(
+                                    run_id=case.case_id,
+                                    agent_id=f"proposer_{program.value}",
+                                    operation=PatchOperationType.REPLACE,
+                                    path=f"/assessments/{program.value}",
+                                    value=outcome.assessment.model_dump(mode="json"),
+                                    provenance=PatchProvenance(
+                                        agent_id=f"proposer_{program.value}",
+                                        task_id=task.task_id,
+                                        citation_keys=[c.citation_id for c in outcome.assessment.citations],
+                                        confidence=outcome.assessment.self_confidence,
+                                    ),
+                                )
+                            )
+                        if outcome.verdict:
+                            self.workspace.apply_patch(
+                                DeltaPatch(
+                                    run_id=case.case_id,
+                                    agent_id=f"verifier_{program.value}",
+                                    operation=PatchOperationType.REPLACE,
+                                    path=f"/verification_verdicts/{program.value}",
+                                    value=outcome.verdict.model_dump(mode="json"),
+                                    provenance=PatchProvenance(
+                                        agent_id=f"verifier_{program.value}",
+                                        task_id=task.task_id,
+                                        confidence=outcome.verdict.self_testing_score,
+                                    ),
+                                )
+                            )
+                        if outcome.materials:
+                            self.workspace.apply_patch(
+                                DeltaPatch(
+                                    run_id=case.case_id,
+                                    agent_id=f"preparer_{program.value}",
+                                    operation=PatchOperationType.REPLACE,
+                                    path=f"/materials/{program.value}",
+                                    value=outcome.materials.model_dump(mode="json"),
+                                    provenance=PatchProvenance(
+                                        agent_id=f"preparer_{program.value}",
+                                        task_id=task.task_id,
+                                    ),
+                                )
+                            )
+
                     trajectory = trajectory.append(
                         outcome.final_state,
                         "state_machine",
@@ -386,6 +552,11 @@ class CasePipeline:
             await self.async_runner.run_async(dag, async_executor)
             result.total_latency_ms = (time.perf_counter() - start_t) * 1000.0
             result.audit = self.audit.records(case.case_id)
+
+            if self.workspace:
+                result.workspace_version = self.workspace.version
+                agent_count = max(4, len(case.target_programs) * 2 + 2)
+                result.token_reduction = self.workspace.calculate_token_reduction(agent_count=agent_count)
 
             CheckpointManager.clear_checkpoint(self.checkpoint_path)
             return result
@@ -481,4 +652,5 @@ class CasePipeline:
 
     def run_cases(self, cases: list[SyntheticCase]) -> list[CaseRunResult]:
         return [self.run_case(c) for c in cases]
+
 

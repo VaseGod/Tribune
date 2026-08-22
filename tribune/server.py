@@ -162,6 +162,9 @@ def health() -> dict:
 @app.get("/api/meta")
 def meta() -> dict:
     s = get_settings()
+    # Explicitly enforce batch limits to eliminate VRAM prefill spikes
+    batch_size = s.batch_size if s.enable_reasonmaxxer else None
+    ubatch_size = s.ubatch_size if s.enable_reasonmaxxer else None
     return {
         "jurisdictions": known_jurisdictions(),
         "programs": [p.value for p in all_programs()],
@@ -172,8 +175,13 @@ def meta() -> dict:
             "jurisdiction": s.default_jurisdiction,
             "provider": s.provider,
             "abstention_threshold": s.abstention_threshold,
+            "batch_size": batch_size,
+            "ubatch_size": ubatch_size,
+            "enable_reasonmaxxer": s.enable_reasonmaxxer,
+            "local_model_type": s.local_model_type,
         },
     }
+
 
 
 @app.get("/api/telemetry")

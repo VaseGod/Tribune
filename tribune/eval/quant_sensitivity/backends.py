@@ -149,6 +149,59 @@ def moe_pruned_quant_ladder() -> list[QuantRung]:
     ]
 
 
+def qwen3_8_27b_dense_ladder() -> list[QuantRung]:
+    """Evaluation ladder benchmarking local dense Qwen3.8-27B across IQ4_XS, Q4_K_M, Q3_K_XL, and Q8_0 tiers."""
+    return [
+        QuantRung(
+            label="qwen3.8-27b-fp16",
+            quant_format="fp16",
+            provider_kind="mock",
+            backend="llama.cpp",
+            model="qwen3.8-27b",
+            flip_prob=0.0,
+            reference=True,
+            notes="Qwen3.8-27B full precision reference",
+        ),
+        QuantRung(
+            label="qwen3.8-27b-q8_0",
+            quant_format="gguf-q8_0",
+            provider_kind="mock",
+            backend="llama.cpp",
+            model="qwen3.8-27b-q8_0",
+            flip_prob=0.005,
+            notes="Qwen3.8-27B Q8_0 high precision quant",
+        ),
+        QuantRung(
+            label="qwen3.8-27b-q4_k_m",
+            quant_format="gguf-q4_k_m",
+            provider_kind="mock",
+            backend="llama.cpp",
+            model="qwen3.8-27b-q4_k_m",
+            flip_prob=0.010,
+            notes="Qwen3.8-27B Q4_K_M standard 4-bit quantization",
+        ),
+        QuantRung(
+            label="qwen3.8-27b-iq4_xs",
+            quant_format="gguf-iq4_xs",
+            provider_kind="mock",
+            backend="llama.cpp",
+            model="qwen3.8-27b-iq4_xs",
+            flip_prob=0.012,
+            notes="Qwen3.8-27B IQ4_XS ultra-compact 4-bit importance matrix quantization targeting 16GB VRAM at 70+ tok/s",
+        ),
+        QuantRung(
+            label="qwen3.8-27b-q3_k_xl",
+            quant_format="gguf-q3_k_xl",
+            provider_kind="mock",
+            backend="llama.cpp",
+            model="qwen3.8-27b-q3_k_xl",
+            flip_prob=0.015,
+            notes="Qwen3.8-27B Q3_K_XL ultra-compact 3-bit quant for 16GB VRAM",
+        ),
+    ]
+
+
+
 def load_ladder_config(path: str) -> list[QuantRung]:
     """Load a real-endpoint ladder from JSON (see docs/quant_sensitivity.md)."""
     with open(path, encoding="utf-8") as fh:

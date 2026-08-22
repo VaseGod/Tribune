@@ -37,6 +37,7 @@ class RungResult:
     accuracy_delta_vs_reference: float = float("nan")
     citation_precision: float = 1.0
     citation_recall: float = 1.0
+    citation_retention: float = 1.0
     false_positive_rate: float = 0.0
     false_negative_rate: float = 0.0
     decision_parity_score: float = 1.0
@@ -102,6 +103,8 @@ def _compute_error_rates(records: list[EvalRecord]) -> tuple[float, float]:
 def _run_rung(
     rung: QuantRung, cases: list[SyntheticCase], base_settings: TribuneSettings
 ) -> RungResult:
+    from ...corpus.citations import track_quant_citation_retention
+
     settings = settings_for_rung(rung, base_settings)
     pipeline = CasePipeline(settings)
     mount_rung(pipeline, rung)
@@ -111,6 +114,7 @@ def _run_rung(
         records.extend(records_for_case(case, result))
     ece, brier = calibration_over_assertions(records)
     prec, rec = _compute_citation_metrics(records)
+    retention = track_quant_citation_retention(records)
     fpr, fnr = _compute_error_rates(records)
     return RungResult(
         rung=rung,
@@ -121,9 +125,11 @@ def _run_rung(
         brier=brier,
         citation_precision=prec,
         citation_recall=rec,
+        citation_retention=retention,
         false_positive_rate=fpr,
         false_negative_rate=fnr,
     )
+
 
 
 def _compare_to_reference(rung: RungResult, reference: RungResult) -> None:

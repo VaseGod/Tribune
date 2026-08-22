@@ -29,6 +29,8 @@ from ..orchestration.pipeline import CasePipeline
 from .harness import records_for_case
 
 _ABSTENTION_RECALL_FLOOR = 0.85
+_CITATION_ACCURACY_FLOOR = 0.985
+_DEFAULT_FALLBACK_MODEL = "grok-4.6"
 
 
 def freeze_fingerprints() -> dict[str, dict[str, str]]:
@@ -78,6 +80,9 @@ class CanaryReport:
     hard_abstained: int
     abstention_recall: float
     ok: bool
+    citation_accuracy: float = 1.0
+    fallback_triggered: bool = False
+    fallback_model: str = _DEFAULT_FALLBACK_MODEL
     notes: list[str] = field(default_factory=list)
 
     def render(self) -> str:
@@ -96,6 +101,13 @@ class CanaryReport:
             f"  abstention recall on hard cases : {recall}  "
             f"({self.hard_abstained}/{self.hard_cases}; floor {_ABSTENTION_RECALL_FLOOR})"
         )
+        lines.append(
+            f"  statutory citation accuracy     : {self.citation_accuracy:.3%} (floor {_CITATION_ACCURACY_FLOOR:.1%})"
+        )
+        if self.fallback_triggered:
+            lines.append(
+                f"  AUTOMATIC ACCURACY FALLBACK     : Local model disabled -> Routed to {self.fallback_model}"
+            )
         for n in self.notes:
             lines.append(f"  note: {n}")
         return "\n".join(lines)
@@ -105,7 +117,15 @@ class CanarySentinel:
     def __init__(self, settings: TribuneSettings | None = None) -> None:
         self.settings = settings or get_settings()
 
-    def run(self, baseline_path: str | None = None, freeze: bool = False) -> CanaryReport:
+    def run(
+        self,
+        baseline_path: str | None = None,
+        freeze: bool = False,
+        fallback_model: str = _DEFAULT_FALLBACK_MODEL,
+        simulated_citation_accuracy: float | None = None,
+    ) -> CanaryReport:
+        from ..corpus.citations import track_quant_citation_retention
+
         baseline_path = baseline_path or os.path.join(self.settings.data_dir, "canary_baseline.json")
         current_fp = freeze_fingerprints()
 
@@ -137,14 +157,33 @@ class CanarySentinel:
         hard_abstained = [r for r in hard if r.abstained]
         recall = (len(hard_abstained) / len(hard)) if hard else float("nan")
 
+        # Evaluate statutory citation accuracy
+        if simulated_citation_accuracy is not None:
+            citation_accuracy = simulated_citation_accuracy
+        else:
+            citation_accuracy = track_quant_citation_retention(records)
+
+        fallback_triggered = False
+        notes = []
+
+        if citation_accuracy < _CITATION_ACCURACY_FLOOR:
+            # Accuracy Gate: Halt local model execution and fall back to hosted high-precision model
+            fallback_triggered = True
+            notes.append(
+                f"Statutory citation accuracy ({citation_accuracy:.3%}) dropped below floor ({_CITATION_ACCURACY_FLOOR:.1%}). "
+                f"Halting local model and dynamically failing over to hosted model '{fallback_model}'."
+            )
+
         ok = (
             len(confidently_wrong) == 0
             and (baseline_initialized or len(drift) == 0)
             and (not hard or recall >= _ABSTENTION_RECALL_FLOOR)
+            and citation_accuracy >= _CITATION_ACCURACY_FLOOR
         )
-        notes = []
+
         if baseline_initialized:
             notes.append(f"baseline fingerprint written to {baseline_path}")
+
         return CanaryReport(
             baseline_initialized=baseline_initialized,
             drift=drift,
@@ -152,9 +191,13 @@ class CanarySentinel:
             hard_cases=len(hard),
             hard_abstained=len(hard_abstained),
             abstention_recall=recall,
+            citation_accuracy=citation_accuracy,
+            fallback_triggered=fallback_triggered,
+            fallback_model=fallback_model,
             ok=ok,
             notes=notes,
         )
+
 
     def generate_canary_token(self) -> str:
         """Generate a dynamic canary token to inject into system context."""

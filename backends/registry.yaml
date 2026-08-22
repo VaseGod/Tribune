@@ -34,8 +34,38 @@ providers:
     output_cost_per_1m: 10.00
     tokens_per_second: 750
     supports_tools: true
+  qwen3.8-27b:
+    provider_type: llama.cpp
+    model_name: qwen3.8-27b
+    input_cost_per_1m: 0.10
+    output_cost_per_1m: 0.20
+    max_context_tokens: 131072
+    supports_tools: true
+    spec_type: ngram-mod,draft-mtp
+    spec_draft_max: 2
+    kv_quant_type: q4_1
 
 candidates:
+  - candidate_id: qwen3.8-27b
+    name: Qwen 3.8 27B
+    vendor: Alibaba
+    params: "27B"
+    roles: [proposer, verifier]
+    role_note: primary dense local frontier model for ReasonMaxxer long-context processing
+    license: open-weights
+    weights_status: downloadable
+    weights_url: https://huggingface.co/Qwen/Qwen3.8-27B
+    weights_verified: false
+    serving: [llama.cpp]
+    quant_formats: [gguf-q8_0, gguf-q4_k_m, gguf-q3_k_xl, q4_1]
+    context_window: 131072
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Primary dense local frontier model configured for ReasonMaxxer sparse reasoning
+      with MTP speculative decoding (spec-type: ngram-mod,draft-mtp, spec-draft-n-max: 2)
+      and q4_1 KV cache quantization to fit 73k+ token context in 16GB VRAM.
+
   - candidate_id: glm-5.2
     name: GLM-5.2
     vendor: Zhipu AI
@@ -216,4 +246,18 @@ muse_glimmer_local:
       speculative_drafter: "DFlash"
       sliding_window_attention: true
       kv_cache_type: "q8_0"
+
+qwen3_8_27b_local:
+  provider: llama.cpp
+  base_url: "http://localhost:8080/v1"
+  model_name: "qwen3.8-27b"
+  parameters:
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 16384
+    extra_body:
+      spec_type: "ngram-mod,draft-mtp"
+      spec_draft_n_max: 2
+      kv_cache_type: "q4_1"
+
 

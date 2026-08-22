@@ -9,6 +9,7 @@ records past their TTL — useful for a deployment that wants case data to expir
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -282,8 +283,132 @@ class MemoryConsolidator:
         full_compacted = f"{system_header}\n\n{compacted_body}"
         return constraints, full_compacted
 
+    def compact_latent_reasoning_traces(
+        self, trace_steps: list[dict[str, Any] | str], max_visible_steps: int = 3
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Compact older intermediate latent reasoning steps into a structured state summary.
+
+        Preserves the last `max_visible_steps` while replacing earlier verbose monologues
+        with consolidated statutory state representations to reduce context length.
+        """
+        return compact_latent_reasoning_trace(trace_steps, max_visible_steps=max_visible_steps)
+
     # -- lifecycle ---------------------------------------------------------- #
 
     def expire(self) -> int:
         return self.partition.purge_expired()
+
+
+def compact_latent_reasoning_trace(
+    trace_steps: list[dict[str, Any] | str],
+    max_visible_steps: int = 3,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Compacts older latent reasoning steps into structured state summaries during intermediate agent trace generation.
+
+    Returns:
+        (structured_state_summary, retained_recent_steps)
+    """
+    if not trace_steps:
+        return {"summary": "empty trace", "compacted_count": 0}, []
+
+    norm_steps: list[dict[str, Any]] = []
+    for i, step in enumerate(trace_steps):
+        if isinstance(step, dict):
+            norm_steps.append(step)
+        else:
+            norm_steps.append({"step_index": i, "content": str(step), "type": "reasoning"})
+
+    if len(norm_steps) <= max_visible_steps:
+        return {
+            "summary": f"All {len(norm_steps)} step(s) retained in active context.",
+            "compacted_count": 0,
+            "extracted_facts": [],
+        }, norm_steps
+
+    older_steps = norm_steps[:-max_visible_steps]
+    recent_steps = norm_steps[-max_visible_steps:]
+
+    # Extract key facts, conclusions, and criterion transitions from older steps
+    extracted_facts: list[str] = []
+    milestones: list[str] = []
+
+    for s in older_steps:
+        content = str(s.get("content", s.get("thought", s.get("action", ""))))
+        # Clean thinking tags
+        clean = re.sub(r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+        if not clean:
+            clean = content[:150]
+        if "satisfied" in clean.lower():
+            milestones.append(f"Satisfied criterion: {clean[:80]}")
+        elif "income" in clean.lower():
+            extracted_facts.append(f"Income evaluation: {clean[:80]}")
+        elif clean:
+            milestones.append(clean[:80])
+
+    structured_summary = {
+        "summary": f"Compacted {len(older_steps)} historical latent reasoning steps.",
+        "compacted_count": len(older_steps),
+        "milestones": milestones[:10],
+        "extracted_facts": extracted_facts[:10],
+        "compression_ratio": round((len(older_steps) / len(norm_steps)), 3),
+    }
+
+    # Prepend summary block to the retained recent steps
+    summary_step = {
+        "step_index": 0,
+        "type": "compacted_latent_summary",
+        "structured_summary": structured_summary,
+        "content": f"[COMPACTED STATE SUMMARY of {len(older_steps)} earlier steps: {len(milestones)} milestone(s) resolved]",
+    }
+
+    return structured_summary, [summary_step, *recent_steps]
+
+
+class VRAMProtectionGate:
+    """Monitors host VRAM usage and triggers prefill protection and micro-batch adjustments."""
+
+    @staticmethod
+    def get_vram_usage_ratio() -> float:
+        """Obtain current GPU VRAM utilization ratio [0.0, 1.0]."""
+        # 1. Attempt pynvml check if available
+        try:
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            pynvml.nvmlShutdown()
+            return float(info.used) / float(info.total)
+        except Exception:
+            pass
+
+        # 2. Check environment variable override for testing / simulation
+        env_vram = os.getenv("TRIBUNE_SIMULATED_VRAM_USAGE")
+        if env_vram is not None:
+            try:
+                return float(env_vram)
+            except ValueError:
+                pass
+
+        return 0.0
+
+    @classmethod
+    def check_and_enforce_vram_protection(
+        cls,
+        current_ubatch_size: int,
+        vram_usage_threshold: float = 0.95,
+        consolidator: MemoryConsolidator | None = None,
+    ) -> tuple[int, bool]:
+        """If host OS metrics indicate VRAM usage exceeds 95% of capacity:
+
+        automatically halve the current micro-batch limit and trigger a memory consolidation pass.
+        Returns: (new_ubatch_size, triggered)
+        """
+        usage = cls.get_vram_usage_ratio()
+        if usage >= vram_usage_threshold:
+            new_ubatch = max(1, current_ubatch_size // 2)
+            if consolidator is not None:
+                consolidator.consolidate_evidence()
+            return new_ubatch, True
+        return current_ubatch_size, False
+
 

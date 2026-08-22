@@ -10,11 +10,22 @@ margin-to-threshold, structural ambiguity signals).
 
 from __future__ import annotations
 
-from ..abstention.calibration import AssessmentDiagnostics
+from ..abstention.calibration import (
+    AssessmentDiagnostics,
+    MissingLogprobsError,
+    calculate_top5_entropy,
+)
+from ..config import get_settings
 from ..corpus import programs as program_registry
 from ..corpus.programs.jurisdictions import get_profile
 from ..corpus.rule_store import RuleStore
-from ..providers.base import ModelProvider, SynthesisRequest
+from ..providers.base import (
+    ModelProvider,
+    SynthesisRequest,
+    SynthesisResult,
+    derive_status,
+    recommend_action,
+)
 from ..types import (
     Assessment,
     Citation,
@@ -115,6 +126,8 @@ class EligibilityProposer:
         evidence: list[Evidence],
         k: int,
         attempt: int,
+        logprobs: list[float] | list[dict] | dict | None = None,
+        tau: float | None = None,
     ) -> tuple[Assessment, AssessmentDiagnostics]:
         profile = get_profile(jurisdiction)
         view = EvidenceView(evidence)
@@ -156,17 +169,43 @@ class EligibilityProposer:
         resolved_required = evaluated_required - unknown_required
         coverage_complete = evaluated_required >= required_total
 
-        synth = self.provider.synthesize_assessment(
-            SynthesisRequest(
-                program=program,
-                jurisdiction=jurisdiction,
-                criteria=criteria,
-                required_total=required_total,
-                coverage_complete=coverage_complete,
-                evidence_summary=self._summary(evidence),
-                citations=citations,
+        # ReasonMaxxer Entropy Gating
+        settings = get_settings()
+        entropy_val: float | None = None
+        entropy_gated: bool = False
+        effective_tau = tau if tau is not None else getattr(settings, "entropy_threshold", 0.35)
+
+        if getattr(settings, "enable_reasonmaxxer", True) and logprobs is not None:
+            try:
+                entropy_val = calculate_top5_entropy(logprobs)
+                entropy_gated = entropy_val >= effective_tau
+            except MissingLogprobsError:
+                entropy_val = None
+                entropy_gated = False
+
+        if getattr(settings, "enable_reasonmaxxer", True) and entropy_val is not None and not entropy_gated:
+            # H < tau: Deterministic rule lookup via rule_store
+            derived_status = derive_status(criteria, coverage_complete=coverage_complete)
+            derived_action = recommend_action(derived_status)
+            synth = SynthesisResult(
+                status=derived_status,
+                recommended_action=derived_action,
+                self_confidence=0.98,
+                rationale=f"[ReasonMaxxer Deterministic Rule Lookup: Low Entropy H={entropy_val:.4f} < tau={effective_tau:.2f}] Derived from statutory rules in {jurisdiction}.",
             )
-        )
+        else:
+            # H >= tau: Entropy-gated local model rollout
+            synth = self.provider.synthesize_assessment(
+                SynthesisRequest(
+                    program=program,
+                    jurisdiction=jurisdiction,
+                    criteria=criteria,
+                    required_total=required_total,
+                    coverage_complete=coverage_complete,
+                    evidence_summary=self._summary(evidence),
+                    citations=citations,
+                )
+            )
 
         waitlist = None
         if program is ProgramId.HOUSING:
@@ -199,9 +238,12 @@ class EligibilityProposer:
             resolved_fraction=(resolved_required / required_total) if required_total else 0.0,
             min_margin=min(margins) if margins else 1.0,
             ambiguity_signals=program_registry.get_ruleset(program).ambiguity_signals(view, profile),
+            entropy=entropy_val,
+            entropy_gated=entropy_gated,
         )
         return assessment, diagnostics
 
     @staticmethod
     def _summary(evidence: list[Evidence]) -> str:
         return ", ".join(f"{ev.type.value}={ev.value}" for ev in evidence[:12])
+

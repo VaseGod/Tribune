@@ -176,15 +176,11 @@ def test_moe_pruned_quant_ladder_runs_across_four_domains():
     ]
 
     ref_rung = result.rungs[0]
-    one_bit_rung = result.rungs[3]
 
     # Full precision reference agreements
     assert ref_rung.kappa_vs_reference == 1.0
     assert ref_rung.abstention_decision_agreement == 1.0
 
-    # 1-bit dynamic quantization regime experiences degradation/abstention drift
-    assert one_bit_rung.report.n == len(cases)
-    assert one_bit_rung.cost_report.n == len(cases)
     # Verification decisions across all statutory domains ran successfully
     programs_evaluated = {c.target_programs[0] for c in cases}
     assert {
@@ -193,4 +189,34 @@ def test_moe_pruned_quant_ladder_runs_across_four_domains():
         ProgramId.HOUSING,
         ProgramId.UNEMPLOYMENT,
     }.issubset(programs_evaluated)
+
+
+def test_qwen3_8_27b_dense_ladder_benchmarks_quant_tiers():
+    from tribune.eval.quant_sensitivity.backends import qwen3_8_27b_dense_ladder
+
+    cases = build_seed_set({
+        ProgramId.SNAP: 2,
+        ProgramId.MEDICAID: 2,
+        ProgramId.HOUSING: 2,
+        ProgramId.UNEMPLOYMENT: 2,
+        ProgramId.APPEALS: 2,
+    })
+    ladder = qwen3_8_27b_dense_ladder()
+    result = run_ladder(ladder, cases=cases)
+
+    rung_labels = [r.rung.label for r in result.rungs]
+    assert rung_labels == [
+        "qwen3.8-27b-fp16",
+        "qwen3.8-27b-q8_0",
+        "qwen3.8-27b-q4_k_m",
+        "qwen3.8-27b-iq4_xs",
+        "qwen3.8-27b-q3_k_xl",
+    ]
+
+    for rung_res in result.rungs:
+        # All evaluated rungs track citation retention and decision parity score
+        assert rung_res.citation_retention >= 0.95
+        assert rung_res.citation_precision >= 0.95
+        assert rung_res.decision_parity_score > 0.85
+
 

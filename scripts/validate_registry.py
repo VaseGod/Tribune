@@ -76,6 +76,9 @@ class ProviderSpec(BaseModel):
     max_context_tokens: int | None = None
     tokens_per_second: float | None = None
     supports_tools: bool = True
+    spec_type: str | None = None
+    spec_draft_max: int | None = None
+    kv_quant_type: str | None = None
 
 
 class Registry(BaseModel):
@@ -87,6 +90,7 @@ class Registry(BaseModel):
     default_workhorse: str | None = None
     providers: dict[str, ProviderSpec] | None = None
     muse_glimmer_local: dict | None = None
+    qwen3_8_27b_local: dict | None = None
 
 
     @model_validator(mode="after")

@@ -97,6 +97,16 @@ class CaseStateMachine:
             verify_lat = (time.perf_counter() - verify_start) * 1000.0
             total_llm_lat += verify_lat
 
+            # Live Continuous Audit Judge Hook: 100% trace monitoring
+            if hasattr(self.audit, "evaluate_and_log_verifier"):
+                self.audit.evaluate_and_log_verifier(
+                    case_id=case_id,
+                    assessment=assessment,
+                    verdict=verdict,
+                    evidence=evidence,
+                    jurisdiction=jurisdiction,
+                )
+
             if not verdict.approved:
                 if verdict.incomplete_coverage and attempt < self.max_attempts:
                     route = self.router.escalate(program, route)

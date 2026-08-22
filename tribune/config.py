@@ -87,6 +87,55 @@ class TribuneSettings(BaseSettings):
         default_factory=lambda: os.getenv("TRIBUNE_MCP_AUTH_TOKEN", "")
     )
 
+    # -- ReasonMaxxer & Local Dense Model Configuration -------------------- #
+    enable_reasonmaxxer: bool = Field(
+        default_factory=lambda: str(
+            os.getenv("TRIBUNE_ENABLE_REASONMAXXER", "true")
+        ).lower()
+        in ("true", "1", "yes")
+    )
+    local_model_path: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_LOCAL_MODEL_PATH", "")
+    )
+    local_model_type: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_LOCAL_MODEL_TYPE", "qwen3.8-27b")
+    )
+    route_strategy: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_ROUTE_STRATEGY", "latency-budget")
+    )
+    kv_quant_type: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_KV_QUANT_TYPE", "q4_1")
+    )
+    spec_type: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_SPEC_TYPE", "ngram-mod,draft-mtp")
+    )
+    spec_draft_max: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_SPEC_DRAFT_MAX", "2"))
+    )
+    batch_size: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_BATCH_SIZE", "1024"))
+    )
+    ubatch_size: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_UBATCH_SIZE", "512"))
+    )
+    entropy_threshold: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_ENTROPY_THRESHOLD", "0.35"))
+    )
+    flash_attention: bool = Field(
+        default_factory=lambda: str(
+            os.getenv("TRIBUNE_FLASH_ATTENTION", "true")
+        ).lower()
+        in ("true", "1", "yes")
+    )
+    local_runtime_quant: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_LOCAL_RUNTIME_QUANT", "IQ4_XS")
+    )
+    memory_budget_gb: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_MEMORY_BUDGET_GB", "16.0"))
+    )
+
+
+
     # -- Rule store / retrieval --------------------------------------------- #
     rule_store: Literal["local", "hosted"] = "local"
     hosted_vector_url: str = ""

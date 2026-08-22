@@ -74,6 +74,13 @@ class EvalRecord:
     # -- statutory citations & decisive criteria -- #
     citations: list[str] = field(default_factory=list)
     decisive_criteria: list[str] = field(default_factory=list)
+    # -- continuous audit judge metrics (Phase 3) -- #
+    perceived_error_score: float | None = None
+    uncited_claim_score: float | None = None
+    citation_coverage_score: float | None = None
+    rule_reference_coverage: float | None = None
+    judge_confidence: float | None = None
+    judge_cost_usd: float = 0.0
 
 
 def classify_outcome(r: EvalRecord) -> TaskOutcomeType:
@@ -217,6 +224,13 @@ class MetricsReport:
     mean_citation_latency_ms: float = float("nan")
     mean_llm_latency_ms: float = float("nan")
     mean_total_latency_ms: float = float("nan")
+    perceived_error_rate: float = float("nan")
+    uncited_claim_rate: float = float("nan")
+    mean_judge_confidence: float = float("nan")
+    mean_citation_coverage: float = float("nan")
+    mean_rule_reference_coverage: float = float("nan")
+    mean_judge_cost_usd: float = float("nan")
+    total_judge_cost_usd: float = 0.0
     per_program: dict[str, MetricsReport] = field(default_factory=dict)
 
     @property
@@ -245,6 +259,13 @@ class MetricsReport:
             f"  over-refusal rate               : {f(self.over_refusal_rate)}   (abstained on clear cases)",
             f"  abstention-aware utility        : {f(self.abstention_aware_utility)}   (higher is better; max 1.0)",
             f"  TRIBUNE vs verifier agreement   : {f(self.verifier_agreement)}",
+            "  --- continuous audit & judge metrics ---",
+            f"  perceived error rate (mean)     : {f(self.perceived_error_rate)}",
+            f"  uncited claim rate (mean)       : {f(self.uncited_claim_rate)}",
+            f"  statutory citation coverage     : {f(self.mean_citation_coverage)}",
+            f"  rule reference coverage         : {f(self.mean_rule_reference_coverage)}",
+            f"  judge confidence (mean)         : {f(self.mean_judge_confidence)}",
+            f"  judge evaluation cost (total)   : ${self.total_judge_cost_usd:.6f}",
             "  --- latency breakdown (disaggregated) ---",
             f"  OCR ingestion latency (mean)    : {f_ms(self.mean_ocr_latency_ms)}",
             f"  citation matching latency (mean): {f_ms(self.mean_citation_latency_ms)}",
@@ -303,6 +324,22 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
     mean_llm = (sum(llm_latencies) / len(llm_latencies)) if llm_latencies else 0.0
     mean_tot = (sum(tot_latencies) / len(tot_latencies)) if tot_latencies else 0.0
 
+    # Continuous Audit Judge aggregations
+    perceived_errs = [r.perceived_error_score for r in records if r.perceived_error_score is not None]
+    uncited_claims = [r.uncited_claim_score for r in records if r.uncited_claim_score is not None]
+    cit_coverages = [r.citation_coverage_score for r in records if r.citation_coverage_score is not None]
+    rule_coverages = [r.rule_reference_coverage for r in records if r.rule_reference_coverage is not None]
+    judge_confs = [r.judge_confidence for r in records if r.judge_confidence is not None]
+    judge_costs = [r.judge_cost_usd for r in records if r.judge_cost_usd > 0]
+
+    p_err = (sum(perceived_errs) / len(perceived_errs)) if perceived_errs else float("nan")
+    u_claim = (sum(uncited_claims) / len(uncited_claims)) if uncited_claims else float("nan")
+    c_cov = (sum(cit_coverages) / len(cit_coverages)) if cit_coverages else float("nan")
+    r_cov = (sum(rule_coverages) / len(rule_coverages)) if rule_coverages else float("nan")
+    j_conf = (sum(judge_confs) / len(judge_confs)) if judge_confs else float("nan")
+    mean_j_cost = (sum(judge_costs) / len(judge_costs)) if judge_costs else 0.0
+    tot_j_cost = sum(judge_costs)
+
     return MetricsReport(
         scope=scope,
         n=n,
@@ -323,6 +360,13 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
         mean_citation_latency_ms=mean_cit,
         mean_llm_latency_ms=mean_llm,
         mean_total_latency_ms=mean_tot,
+        perceived_error_rate=p_err,
+        uncited_claim_rate=u_claim,
+        mean_judge_confidence=j_conf,
+        mean_citation_coverage=c_cov,
+        mean_rule_reference_coverage=r_cov,
+        mean_judge_cost_usd=mean_j_cost,
+        total_judge_cost_usd=tot_j_cost,
     )
 
 

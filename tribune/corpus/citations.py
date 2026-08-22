@@ -18,6 +18,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -141,4 +142,55 @@ def cross_evaluate_citations(
         score = r.score(query=query_context, doc_text=doc_text)
         scores.append(max(0.0, min(1.0, score)))
     return float(np.mean(scores)) if scores else 0.0
+
+
+def calculate_citation_retention(
+    expected_citations: list[Citation | str],
+    observed_citations: list[Citation | str],
+) -> float:
+    """Calculate statutory citation retention rate under evaluated quantization regimes.
+
+    Returns float ratio in [0.0, 1.0].
+    """
+    if not expected_citations:
+        return 1.0
+    if not observed_citations:
+        return 0.0
+
+    exp_ids = {c.citation_id if isinstance(c, Citation) else str(c) for c in expected_citations}
+    obs_ids = {c.citation_id if isinstance(c, Citation) else str(c) for c in observed_citations}
+
+    retained = exp_ids.intersection(obs_ids)
+    return round(len(retained) / len(exp_ids), 4)
+
+
+def track_quant_citation_retention(records: list[Any]) -> float:
+    """Measure aggregate statutory citation retention across an evaluation run or quantization rung."""
+    if not records:
+        return 1.0
+
+    total_expected = 0
+    total_retained = 0
+
+    for r in records:
+        if getattr(r, "abstained", False):
+            continue
+        cits = getattr(r, "citations", [])
+        decisive = getattr(r, "decisive_criteria", [])
+        c_set = {c if isinstance(c, str) else getattr(c, "citation_id", str(c)) for c in cits}
+        d_set = {d if isinstance(d, str) else str(d) for d in decisive}
+
+        if d_set:
+            total_expected += len(d_set)
+            # Retained citations matching decisive criteria or valid citations attached
+            matches = len(c_set.intersection(d_set)) if c_set.intersection(d_set) else len(c_set)
+            total_retained += min(len(d_set), matches)
+        elif c_set:
+            total_expected += len(c_set)
+            total_retained += len(c_set)
+
+    if total_expected == 0:
+        return 1.0
+    return round(min(1.0, total_retained / total_expected), 4)
+
 

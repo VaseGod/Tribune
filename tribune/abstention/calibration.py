@@ -49,6 +49,81 @@ _W_SELF_TESTING = 0.8
 _W_AMBIGUITY = 3.0
 
 
+class MissingLogprobsError(ValueError):
+    """Raised when token-level logprobs are missing from the inference server."""
+    pass
+
+
+def calculate_top5_entropy(logprobs: list[float] | list[dict] | dict | None) -> float:
+    """Calculate Shannon entropy over the base model's top-5 token predictions at statutory decision boundaries.
+
+    Supports:
+    - list of float log-probabilities (natural log ln(p) or base-e logprobs)
+    - list of dicts: e.g. [{"logprob": -0.1}, ...]
+    - dict with "top_logprobs" or "logprobs" key
+
+    Returns:
+        Entropy H in bits (base 2).
+    Raises:
+        MissingLogprobsError if logprobs are missing, empty, or unparseable.
+    """
+    if logprobs is None:
+        raise MissingLogprobsError("Logprobs payload is None; top-5 log probabilities required.")
+
+    raw_list: list[float] = []
+    if isinstance(logprobs, dict):
+        cand = logprobs.get("top_logprobs") or logprobs.get("logprobs") or logprobs.get("content")
+        if isinstance(cand, list):
+            logprobs = cand
+        else:
+            raise MissingLogprobsError("Invalid logprobs dictionary structure from inference server.")
+
+    if isinstance(logprobs, list):
+        for item in logprobs:
+            if isinstance(item, int | float):
+                raw_list.append(float(item))
+            elif isinstance(item, dict):
+                lp = item.get("logprob")
+                if lp is not None and isinstance(lp, int | float):
+                    raw_list.append(float(lp))
+            if len(raw_list) >= 5:
+                break
+
+    if not raw_list:
+        raise MissingLogprobsError("No valid token logprobs extracted from inference server response.")
+
+    # Convert log-probabilities to probabilities: p_i = exp(logprob)
+    # Using log-sum-exp normalization for numerical stability
+    max_lp = max(raw_list)
+    exps = [math.exp(lp - max_lp) for lp in raw_list]
+    sum_exps = sum(exps)
+    if sum_exps <= 0.0:
+        return 0.0
+
+    probs = [e / sum_exps for e in exps]
+
+    # Shannon entropy: H = - sum(p * log2(p))
+    entropy = 0.0
+    for p in probs:
+        if p > 1e-12:
+            entropy -= p * math.log2(p)
+
+    return round(entropy, 4)
+
+
+def evaluate_decision_entropy(
+    logprobs: list[float] | list[dict] | dict | None,
+    tau: float = 0.35,
+) -> tuple[float, bool]:
+    """Evaluate decision node entropy H against threshold tau.
+
+    Returns:
+        (entropy, is_gated) where is_gated is True if H >= tau (statutory ambiguity requiring model rollout).
+    """
+    h = calculate_top5_entropy(logprobs)
+    return h, h >= tau
+
+
 @dataclass
 class AssessmentDiagnostics:
     required_total: int
@@ -59,6 +134,9 @@ class AssessmentDiagnostics:
     min_margin: float  # min normalized distance-to-threshold over evaluated criteria (1.0 if N/A)
     ambiguity_signals: list[str] = field(default_factory=list)
     self_testing_score: float = 1.0
+    entropy: float | None = None
+    entropy_gated: bool = False
+
 
 
 def _sigmoid(x: float) -> float:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime, timezone
+from typing import Any
 
 from pydantic import (
     BaseModel,
@@ -563,9 +564,82 @@ class CaseRunResult(BaseModel):
     citation_latency_ms: float = 0.0
     llm_latency_ms: float = 0.0
     total_latency_ms: float = 0.0
+    workspace_version: int = 0
+    token_reduction: TokenReductionMetric | None = None
 
     def outcome_for(self, program: ProgramId) -> ProgramOutcome | None:
         for o in self.outcomes:
             if o.program is program:
                 return o
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Workspace & Delta Patch Architecture
+# --------------------------------------------------------------------------- #
+
+
+class PatchOperationType(str, enum.Enum):
+    ADD = "add"
+    REPLACE = "replace"
+    REMOVE = "remove"
+    TEST = "test"
+    APPEND_UNIQUE = "append_unique"
+    MERGE_DICT = "merge_dict"
+
+
+class PatchProvenance(StrictModel):
+    """Provenance tracking origin, citations, and confidence for a delta patch."""
+
+    agent_id: str
+    timestamp: datetime = Field(default_factory=_utcnow)
+    task_id: str = ""
+    citation_keys: list[str] = Field(default_factory=list)
+    rule_ids: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
+    rationale_reference: str = ""
+    notes: str = ""
+
+
+class DeltaPatch(StrictModel):
+    """Structured JSON patch operation modifying central shared workspace state.
+
+    Supports JSON-pointer paths, version pinning, and conflict constraints.
+    """
+
+    schema_version: int = 1
+    run_id: str
+    agent_id: str
+    operation: PatchOperationType
+    path: str  # e.g. "/evidence", "/assessments/snap", "/metadata/status"
+    value: Any = None
+    expected_version: int | None = None  # Optimistic concurrency check
+    conflict_strategy: str = "error"  # "error" | "overwrite" | "merge"
+    provenance: PatchProvenance = Field(
+        default_factory=lambda: PatchProvenance(agent_id="unknown")
+    )
+
+
+class WorkspaceSnapshot(StrictModel):
+    """Immutable snapshot of the shared workspace state."""
+
+    version: int
+    case_id: str
+    jurisdiction: str
+    state_data: dict[str, Any]
+    patch_count: int
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class TokenReductionMetric(BaseModel):
+    """Metrics measuring token volume reductions from shared workspace context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    baseline_tokens: int
+    workspace_tokens: int
+    reduction_percentage: float
+    agent_count: int
+    patch_volume_bytes: int
+    state_size_bytes: int
+

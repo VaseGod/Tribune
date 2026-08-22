@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from typing import Any
@@ -69,9 +70,13 @@ def _hash(record: AuditRecord) -> str:
     return hashlib.sha256(_canonical(record).encode("utf-8")).hexdigest()
 
 
+from .judge import JudgeEvaluator, JudgeResult, get_default_judge
+
+
 class AuditLog:
     def __init__(self) -> None:
         self._by_case: dict[str, list[AuditRecord]] = {}
+        self._judge_results: dict[str, list[JudgeResult]] = {}
 
     def append(
         self,
@@ -107,6 +112,111 @@ class AuditLog:
         record = record.model_copy(update={"record_hash": _hash(record)})
         chain.append(record)
         return record
+
+    def evaluate_and_log_verifier(
+        self,
+        case_id: str,
+        assessment: Any,
+        verdict: Any,
+        evidence: list[Any],
+        jurisdiction: str,
+        judge: JudgeEvaluator | None = None,
+    ) -> tuple[AuditRecord, JudgeResult]:
+        """Live execution hook: Evaluate verifier output using a specialized audit judge and log structured telemetry."""
+        judge_eval = judge or get_default_judge()
+        judge_res = judge_eval.evaluate(assessment, verdict, evidence, jurisdiction)
+        self._judge_results.setdefault(case_id, []).append(judge_res)
+
+        payload = {
+            "program": str(getattr(assessment, "program", "unknown")),
+            "judge_name": str(judge_res.judge_name),
+            "judge_version": str(judge_res.judge_version),
+            "passed": str(judge_res.passed),
+            "perceived_error_score": f"{judge_res.perceived_error_score:.4f}",
+            "uncited_claim_score": f"{judge_res.uncited_claim_score:.4f}",
+            "citation_coverage_score": f"{judge_res.citation_coverage_score:.4f}",
+            "rule_reference_coverage": f"{judge_res.rule_reference_coverage:.4f}",
+            "judge_confidence": f"{judge_res.judge_confidence:.4f}",
+            "judge_cost_usd": f"{judge_res.cost_estimate:.6f}",
+            "reasons": "; ".join(judge_res.reasons)[:300],
+        }
+        cit_ids = [c.citation_id for c in getattr(assessment, "citations", [])]
+        record = self.append(
+            case_id=case_id,
+            state=SMState.VERIFY,
+            agent="verifier_judge",
+            action=f"continuous audit evaluation ({judge_res.judge_name}: passed={judge_res.passed})",
+            model_name=judge_res.judge_name,
+            model_version=judge_res.judge_version,
+            citation_ids=cit_ids,
+            evidence_ids=getattr(assessment, "evidence_ids", []),
+            payload=payload,
+        )
+        return record, judge_res
+
+    def query(
+        self,
+        case_id: str | None = None,
+        state: SMState | None = None,
+        agent: str | None = None,
+        search_text: str | None = None,
+    ) -> list[AuditRecord]:
+        """Query audit records with structured filters."""
+        cases = [case_id] if case_id else list(self._by_case.keys())
+        results: list[AuditRecord] = []
+        for cid in cases:
+            for rec in self._by_case.get(cid, []):
+                if state is not None and rec.state != state:
+                    continue
+                if agent is not None and rec.agent != agent:
+                    continue
+                if search_text is not None and (search_text.lower() not in rec.action.lower()):
+                    continue
+                results.append(rec)
+        return results
+
+    def judge_results(self, case_id: str | None = None) -> list[JudgeResult]:
+        """Retrieve all structured judge evaluation results."""
+        if case_id:
+            return list(self._judge_results.get(case_id, []))
+        all_res: list[JudgeResult] = []
+        for res_list in self._judge_results.values():
+            all_res.extend(res_list)
+        return all_res
+
+    def calculate_live_metrics(self, case_id: str | None = None) -> dict[str, float]:
+        """Calculate real-time aggregated metrics across all evaluated verifier traces."""
+        judges = self.judge_results(case_id)
+        if not judges:
+            return {
+                "perceived_error_rate": 0.0,
+                "uncited_claim_rate": 0.0,
+                "mean_citation_coverage": 1.0,
+                "mean_rule_reference_coverage": 1.0,
+                "mean_judge_confidence": 1.0,
+                "total_judge_cost_usd": 0.0,
+                "eval_count": 0.0,
+            }
+
+        n = len(judges)
+        return {
+            "perceived_error_rate": round(sum(j.perceived_error_score for j in judges) / n, 4),
+            "uncited_claim_rate": round(sum(j.uncited_claim_score for j in judges) / n, 4),
+            "mean_citation_coverage": round(sum(j.citation_coverage_score for j in judges) / n, 4),
+            "mean_rule_reference_coverage": round(sum(j.rule_reference_coverage for j in judges) / n, 4),
+            "mean_judge_confidence": round(sum(j.judge_confidence for j in judges) / n, 4),
+            "total_judge_cost_usd": round(sum(j.cost_estimate for j in judges), 6),
+            "eval_count": float(n),
+        }
+
+    def export_jsonl(self, path: str, case_id: str | None = None) -> int:
+        """Export queryable audit log records to JSONL file."""
+        records = self.query(case_id=case_id)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r.model_dump(mode="json"), default=str) + "\n")
+        return len(records)
 
     def load_records(self, case_id: str, records: list[AuditRecord]) -> None:
         """Restore audit records into the in-memory chain during crash recovery."""
