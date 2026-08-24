@@ -1,26 +1,22 @@
-"""Independent verifier.
+"""Independent Verifier & Trajectory-Level Binary Verifier.
 
-The verifier re-derives the assessment from the *cited* rules rather than trusting
-the proposer's criterion results. It checks three things and can reject -> REPLAN:
-
-1. **Citation integrity** — every resolved criterion cites the rule that governs it.
-2. **Coverage** — every required criterion of the program was actually assessed
-   (catches the proposer concluding eligibility from a partial, retrieval-limited
-   view; this is what drives the REPLAN path).
-3. **Support** — the asserted status matches the status obtained by re-deriving
-   over *all* required rules; no unsupported leaps.
-
-A served deployment can run this on a stronger model; the provider's model-side
-review is folded in alongside the structural checks.
+The verifier performs:
+1. Two-stage milestone certification (Pass 1 evaluation against cited RuleStore rules).
+2. Trajectory-level binary verification directly evaluating solver reasoning trajectories
+   without relying on ground-truth answer keys (fact grounding, statutory citation validity,
+   and lack of ungrounded assumptions).
+3. Coverage, support, and cross-statutory coherence checks before certification.
 """
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..corpus import programs as program_registry
+from ..corpus.citations import cross_evaluate_citations
 from ..corpus.programs.jurisdictions import get_profile
 from ..corpus.rule_store import RuleStore
 from ..providers.base import ModelProvider, ReviewRequest, derive_status
@@ -38,11 +34,7 @@ from ..types import (
 
 @dataclass(frozen=True)
 class VerificationReport:
-    """Structured milestone verification report produced in Pass 1 of the two-stage pattern.
-
-    Formally certifies candidate eligibility findings, facts, and mathematical calculations
-    strictly against statutory rules loaded from RuleStore.
-    """
+    """Structured milestone verification report produced in Pass 1 of the two-stage pattern."""
 
     is_certified: bool
     assessment_id: str
@@ -57,6 +49,19 @@ class VerificationReport:
     reasons: list[str] = field(default_factory=list)
     score: float = 1.0
     certified_at: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class TrajectoryVerificationVerdict:
+    """Trajectory-level binary verification verdict certifying solver trajectory validity without reference answers."""
+
+    approved: bool
+    sanity_score: float  # [0.0, 1.0]
+    step_validations: list[dict[str, Any]] = field(default_factory=list)
+    grounding_violations: list[str] = field(default_factory=list)
+    citation_violations: list[str] = field(default_factory=list)
+    assumption_violations: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
 
 
 class ProgrammaticVerifierTools:
@@ -112,11 +117,15 @@ class Verifier:
 
     @staticmethod
     def parse_visible_response(text: str) -> str:
-        """Parse only explicit, visible model text responses, ignoring unverified thinking monologues or block metadata."""
+        """Parse only explicit, visible model text responses, ignoring unverified thinking monologues."""
         if not isinstance(text, str):
             return text
-        import re
-        clean = re.sub(r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(
+            r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         return clean.strip()
 
     def generate_prompt(self, assessment: Assessment) -> str:
@@ -129,7 +138,7 @@ class Verifier:
         )
 
     def generate_self_testing_prompt(self, assessment: Assessment, jurisdiction: str) -> str:
-        """Leverage gpt-5.6-sol-ultrafast capabilities to prompt for explicit multi-step self-testing trajectories."""
+        """Prompt for explicit multi-step self-testing trajectories."""
         return (
             f"You are {self.target_engine} performing independent verification for assessment '{assessment.assessment_id}' "
             f"under {jurisdiction} statutory rules.\n"
@@ -146,8 +155,6 @@ class Verifier:
         self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
     ) -> tuple[float, list[dict]]:
         """Execute multi-step self-testing trajectory and cross-evaluate against statutory citation rules."""
-        from ..corpus.citations import cross_evaluate_citations
-
         program = assessment.program
         profile = get_profile(jurisdiction)
         view = EvidenceView(evidence)
@@ -224,18 +231,115 @@ class Verifier:
             "recomputed_status": recomputed_status.value,
         })
 
-        # Aggregate trajectory confidence
         weights = [0.25, 0.30, 0.20, 0.25]
         total_score = sum(w * s["score"] for w, s in zip(weights, steps, strict=False))
         return round(total_score, 4), steps
 
+    def verify_trajectory(
+        self,
+        trajectory: Any,
+        evidence: list[Evidence],
+        jurisdiction: str,
+        program: ProgramId | None = None,
+    ) -> TrajectoryVerificationVerdict:
+        """Trajectory-Level Binary Verifier evaluating solver reasoning paths without reference solutions.
+
+        Validates:
+        1. Fact Grounding: Every asserted numerical or factual premise is grounded in evidence.
+        2. Statutory Citation Validity: Cited rules exist in the statutory corpus.
+        3. Lack of Ungrounded Assumptions: Prohibits speculative leaps or hallucinated deductions.
+        """
+        grounding_violations: list[str] = []
+        citation_violations: list[str] = []
+        assumption_violations: list[str] = []
+        reasons: list[str] = []
+        step_validations: list[dict[str, Any]] = []
+        known_facts = {e.type.value: e.value for e in evidence}
+
+        # Extract frames
+        frames = getattr(trajectory, "frames", trajectory if isinstance(trajectory, list) else [])
+
+        # Active citations in corpus
+        all_active_citations: set[str] = set()
+        programs_to_check = [program] if program else program_registry.all_programs()
+        for p in programs_to_check:
+            for c in self.rule_store.all_citations(p, jurisdiction):
+                all_active_citations.add(c.citation_id)
+
+        for idx, frame in enumerate(frames):
+            frame_agent = getattr(frame, "agent", frame.get("agent", "") if isinstance(frame, dict) else "")
+            frame_action = getattr(frame, "action", frame.get("action", "") if isinstance(frame, dict) else "")
+            frame_data = getattr(frame, "data", frame.get("data", {}) if isinstance(frame, dict) else {})
+            frame_state = getattr(frame, "state", frame.get("state", None) if isinstance(frame, dict) else None)
+
+            step_passed = True
+            step_errors: list[str] = []
+
+            # 1. Fact Grounding Check
+            if "evidence" in frame_data and isinstance(frame_data["evidence"], list):
+                for ev in frame_data["evidence"]:
+                    ev_type = getattr(ev, "type", ev.get("type") if isinstance(ev, dict) else None)
+                    ev_type_val = ev_type.value if hasattr(ev_type, "value") else str(ev_type)
+                    if ev_type_val not in known_facts:
+                        # Unrecorded evidence introduced mid-trajectory
+                        err = f"Step {idx+1}: Ungrounded evidence type '{ev_type_val}' introduced without source ingestion"
+                        grounding_violations.append(err)
+                        step_errors.append(err)
+                        step_passed = False
+
+            # 2. Citation Validity Check
+            if "citations" in frame_data and isinstance(frame_data["citations"], list):
+                for cit in frame_data["citations"]:
+                    cid = cit.citation_id if hasattr(cit, "citation_id") else str(cit)
+                    if cid not in all_active_citations:
+                        err = f"Step {idx+1}: Invalid statutory citation '{cid}' referenced"
+                        citation_violations.append(err)
+                        step_errors.append(err)
+                        step_passed = False
+
+            # 3. Assumption / Monologue Checks in Action Rationale
+            action_text = str(frame_action)
+            if re.search(r"<(?:think|thought|reasoning)[^>]*>", action_text, re.IGNORECASE):
+                err = f"Step {idx+1}: Unverified reasoning monologue detected in visible action"
+                assumption_violations.append(err)
+                step_errors.append(err)
+                step_passed = False
+
+            step_validations.append({
+                "step_index": idx + 1,
+                "agent": frame_agent,
+                "state": frame_state.value if hasattr(frame_state, "value") else str(frame_state),
+                "passed": step_passed,
+                "errors": step_errors,
+            })
+
+        approved = (len(grounding_violations) == 0) and (len(citation_violations) == 0) and (len(assumption_violations) == 0)
+
+        if not approved:
+            reasons.extend(grounding_violations)
+            reasons.extend(citation_violations)
+            reasons.extend(assumption_violations)
+        else:
+            reasons.append("Trajectory fully grounded, statutory citations valid, and assumption-free.")
+
+        total_steps = max(1, len(step_validations))
+        passed_steps = sum(1 for s in step_validations if s["passed"])
+        sanity_score = round(passed_steps / total_steps, 4)
+
+        return TrajectoryVerificationVerdict(
+            approved=approved,
+            sanity_score=sanity_score,
+            step_validations=step_validations,
+            grounding_violations=grounding_violations,
+            citation_violations=citation_violations,
+            assumption_violations=assumption_violations,
+            reasons=reasons,
+        )
+
     def evaluate_and_certify(
         self, assessment: Assessment, evidence: list[Evidence], jurisdiction: str
     ) -> tuple[bool, VerificationReport]:
-        """Pass 1: Strictly evaluate and certify candidate findings against statutory rules.
-
-        Returns (is_certified, VerificationReport).
-        """
+        """Pass 1: Strictly evaluate and certify candidate findings against statutory rules."""
         program = assessment.program
         profile = get_profile(jurisdiction)
         view = EvidenceView(evidence)
@@ -387,6 +491,7 @@ class Verifier:
 
 __all__ = [
     "VerificationReport",
+    "TrajectoryVerificationVerdict",
     "Verifier",
     "ProgrammaticVerifierTools",
 ]

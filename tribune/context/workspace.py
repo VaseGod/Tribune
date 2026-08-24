@@ -1,24 +1,30 @@
-"""Central Shared Workspace Context & Delta Patch Architecture.
+"""Central Shared Workspace Context, Delta Patch Architecture, & Automated Disk Offloading.
 
-Provides a unified, file-backed/in-memory shared state store for multi-agent workflows.
-Agents read structured slices and emit structured JSON delta patches instead of
-re-serializing full conversational history, reducing redundant token generation by ~42%.
+Provides:
+1. Unified, in-memory shared state store for multi-agent workflows with JSON pointer navigation.
+2. Optimistic concurrency control, structured JSON delta patches, and broadcast subscriptions.
+3. Automated session state offloader (`DiskBackedSessionManager`): spills inactive case
+   context, raw OCR payloads, and historical transcripts to compressed local disk storage
+   after an idle threshold, retaining lightweight references in RAM with transparent async re-hydration.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import gzip
 import json
 import os
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from ..types import (
     DeltaPatch,
     PatchOperationType,
-    PatchProvenance,
     TokenReductionMetric,
     WorkspaceSnapshot,
 )
@@ -205,6 +211,7 @@ class WorkspaceContext:
     - Scoped state slicing to prevent conversational history bloat
     - Deterministic replay from patch history
     - Token generation accounting & reduction measurement
+    - Last access timestamping for automatic disk offloading
     """
 
     def __init__(
@@ -221,6 +228,10 @@ class WorkspaceContext:
         self._patch_history: list[DeltaPatch] = []
         self._subscribers: dict[str, list[Callable[[DeltaPatch], None]]] = {}
         self._patch_bytes_total = 0
+        self.last_accessed_at = time.time()
+
+    def _touch(self) -> None:
+        self.last_accessed_at = time.time()
 
     @property
     def version(self) -> int:
@@ -229,11 +240,13 @@ class WorkspaceContext:
     @property
     def patch_history(self) -> list[DeltaPatch]:
         with self._lock:
+            self._touch()
             return list(self._patch_history)
 
     def subscribe(self, channel: str, callback: Callable[[DeltaPatch], None]) -> None:
         """Register a subscriber callback for patches affecting a specific channel/path prefix."""
         with self._lock:
+            self._touch()
             self._subscribers.setdefault(channel, []).append(callback)
 
     def _notify_subscribers(self, patch: DeltaPatch) -> None:
@@ -249,6 +262,7 @@ class WorkspaceContext:
     def apply_patch(self, patch: DeltaPatch) -> WorkspaceSnapshot:
         """Apply a structured delta patch transactionally with optimistic concurrency control."""
         with self._lock:
+            self._touch()
             # Check expected version constraint if specified
             if patch.expected_version is not None and patch.expected_version != self._state.version:
                 if patch.conflict_strategy == "error":
@@ -276,6 +290,7 @@ class WorkspaceContext:
     def apply_patches(self, patches: list[DeltaPatch]) -> list[WorkspaceSnapshot]:
         """Atomically apply a sequence of delta patches."""
         with self._lock:
+            self._touch()
             snapshots = []
             for p in patches:
                 snapshots.append(self.apply_patch(p))
@@ -287,6 +302,7 @@ class WorkspaceContext:
         Prevents quadratic conversational re-serialization by projecting only required keys.
         """
         with self._lock:
+            self._touch()
             if not read_scopes or "*" in read_scopes:
                 return self._state.to_dict()
 
@@ -312,11 +328,13 @@ class WorkspaceContext:
     def read_path(self, path: str) -> Any:
         """Read a single value from the workspace state via JSON pointer."""
         with self._lock:
+            self._touch()
             return copy.deepcopy(self._state.get_value_at_path(path))
 
     def snapshot(self) -> WorkspaceSnapshot:
         """Create an immutable snapshot of current workspace state."""
         with self._lock:
+            self._touch()
             return WorkspaceSnapshot(
                 version=self._state.version,
                 case_id=self.case_id,
@@ -325,6 +343,34 @@ class WorkspaceContext:
                 patch_count=len(self._patch_history),
                 timestamp=datetime.now(timezone.utc),
             )
+
+    def serialize_full_session(self) -> dict[str, Any]:
+        """Serialize full in-memory workspace session including state and patch history for disk offload."""
+        with self._lock:
+            return {
+                "case_id": self.case_id,
+                "jurisdiction": self.jurisdiction,
+                "version": self._state.version,
+                "state_data": self._state.to_dict(),
+                "patch_history": [p.model_dump(mode="json") for p in self._patch_history],
+                "patch_bytes_total": self._patch_bytes_total,
+                "last_accessed_at": self.last_accessed_at,
+            }
+
+    @classmethod
+    def deserialize_full_session(cls, payload: dict[str, Any]) -> WorkspaceContext:
+        """Deserialize full session data into an active WorkspaceContext."""
+        ctx = cls(case_id=payload["case_id"], jurisdiction=payload.get("jurisdiction", "EX"))
+        ctx._state = WorkspaceState(
+            case_id=payload["case_id"],
+            jurisdiction=payload.get("jurisdiction", "EX"),
+            initial_data=payload.get("state_data", {}),
+        )
+        ctx._state.version = payload.get("version", 0)
+        ctx._patch_history = [DeltaPatch.model_validate(p) for p in payload.get("patch_history", [])]
+        ctx._patch_bytes_total = payload.get("patch_bytes_total", 0)
+        ctx.last_accessed_at = payload.get("last_accessed_at", time.time())
+        return ctx
 
     def _persist_snapshot(self) -> None:
         """Persist workspace state snapshot atomically to disk if storage_path configured."""
@@ -357,17 +403,9 @@ class WorkspaceContext:
         agent_count: int = 8,
         turns_per_agent: int = 2,
     ) -> TokenReductionMetric:
-        """Measure token volume reduction achieved by shared workspace vs direct conversational re-serialization.
-
-        In a standard multi-agent pipeline (e.g. 8 agents):
-        - Direct message passing: Each agent re-serializes cumulative dialog history across all prior turns:
-          T_baseline = sum_{i=1..N} (History_i + Output_i) ≈ O(N^2 * turn_size)
-        - Shared Workspace Context: Agents receive only scoped state slices and emit concise JSON delta patches:
-          T_workspace = N * (Slice_size + Patch_size) ≈ O(N * (slice + patch))
-
-        Yields ~42% to 65% reduction in total token generation.
-        """
+        """Measure token volume reduction achieved by shared workspace vs direct conversational re-serialization."""
         with self._lock:
+            self._touch()
             state_dict = self._state.to_dict()
             state_json = json.dumps(state_dict, default=str)
             state_bytes = len(state_json.encode("utf-8"))
@@ -381,12 +419,10 @@ class WorkspaceContext:
                 cumulative_tokens += 120  # average agent turn addition
 
             # Workspace calculation: Scoped slice + compact delta patch
-            # Each agent reads ~30% of total state (slice) + emits ~35 token patch
             avg_slice_tokens = int(base_turn_tokens * 0.32)
             avg_patch_tokens = max(25, self._patch_bytes_total // (max(1, len(self._patch_history)) * 4))
             workspace_tokens = agent_count * turns_per_agent * (avg_slice_tokens + avg_patch_tokens)
 
-            # Ensure realistic bounding
             reduction = max(0.0, (baseline_tokens - workspace_tokens) / max(1, baseline_tokens)) * 100.0
 
             return TokenReductionMetric(
@@ -399,9 +435,175 @@ class WorkspaceContext:
             )
 
 
+# --------------------------------------------------------------------------- #
+# Automated Session State Offloader (DiskBackedSessionManager)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class SessionStub:
+    """Lightweight in-memory reference to an offloaded/spilled session."""
+
+    case_id: str
+    jurisdiction: str
+    version: int
+    disk_path: str
+    compressed_size_bytes: int
+    spilled_at: float
+    last_accessed_at: float
+
+
+class DiskBackedSessionManager:
+    """Automated session state offloader for multi-case runtime memory management.
+
+    Monitors in-memory case contexts and automatically spills inactive case data
+    (documents, OCR payloads, historical transcripts, and state) to compressed local
+    disk storage (`.tribune/sessions/{case_id}.json.gz`) when idle or exceeding capacity,
+    retaining lightweight `SessionStub` metadata in RAM. Provides transparent sync and async
+    re-hydration on access.
+    """
+
+    def __init__(
+        self,
+        storage_dir: str = ".tribune/sessions",
+        idle_timeout_seconds: float = 300.0,  # 5 minutes idle threshold
+        max_active_sessions: int = 16,
+    ) -> None:
+        self.storage_dir = os.path.abspath(storage_dir)
+        self.idle_timeout_seconds = idle_timeout_seconds
+        self.max_active_sessions = max_active_sessions
+        os.makedirs(self.storage_dir, exist_ok=True)
+
+        self._lock = threading.RLock()
+        self._async_lock = asyncio.Lock()
+        self._active_sessions: dict[str, WorkspaceContext] = {}
+        self._spilled_stubs: dict[str, SessionStub] = {}
+        self._bytes_spilled_total = 0
+
+    def open_session(self, case_id: str, jurisdiction: str = "EX") -> WorkspaceContext:
+        """Get existing session or initialize a new active WorkspaceContext."""
+        with self._lock:
+            if case_id in self._active_sessions:
+                sess = self._active_sessions[case_id]
+                sess.last_accessed_at = time.time()
+                return sess
+
+            if case_id in self._spilled_stubs:
+                return self.rehydrate(case_id)
+
+            sess = WorkspaceContext(case_id=case_id, jurisdiction=jurisdiction)
+            self._active_sessions[case_id] = sess
+            self._enforce_capacity_limit()
+            return sess
+
+    def get_session(self, case_id: str) -> WorkspaceContext | None:
+        """Transparently get session, automatically rehydrating from disk if spilled."""
+        with self._lock:
+            if case_id in self._active_sessions:
+                sess = self._active_sessions[case_id]
+                sess.last_accessed_at = time.time()
+                return sess
+            if case_id in self._spilled_stubs:
+                return self.rehydrate(case_id)
+            return None
+
+    async def get_session_async(self, case_id: str) -> WorkspaceContext | None:
+        """Asynchronously get or rehydrate a workspace session."""
+        async with self._async_lock:
+            return await asyncio.to_thread(self.get_session, case_id)
+
+    def spill_session(self, case_id: str) -> str | None:
+        """Spill an active in-memory session to compressed gzip disk storage."""
+        with self._lock:
+            if case_id not in self._active_sessions:
+                return None
+
+            ctx = self._active_sessions[case_id]
+            data = ctx.serialize_full_session()
+            json_bytes = json.dumps(data, default=str).encode("utf-8")
+            compressed = gzip.compress(json_bytes)
+
+            file_path = os.path.join(self.storage_dir, f"{case_id}.json.gz")
+            tmp_path = f"{file_path}.tmp"
+            with open(tmp_path, "wb") as fh:
+                fh.write(compressed)
+            os.replace(tmp_path, file_path)
+
+            stub = SessionStub(
+                case_id=case_id,
+                jurisdiction=ctx.jurisdiction,
+                version=ctx.version,
+                disk_path=file_path,
+                compressed_size_bytes=len(compressed),
+                spilled_at=time.time(),
+                last_accessed_at=ctx.last_accessed_at,
+            )
+            self._spilled_stubs[case_id] = stub
+            self._bytes_spilled_total += len(compressed)
+            del self._active_sessions[case_id]
+            return file_path
+
+    def rehydrate(self, case_id: str) -> WorkspaceContext:
+        """Transparently decompress and rehydrate a spilled session from disk into active RAM."""
+        with self._lock:
+            if case_id in self._active_sessions:
+                return self._active_sessions[case_id]
+
+            if case_id not in self._spilled_stubs:
+                raise FileNotFoundError(f"No active or offloaded session found for case_id '{case_id}'")
+
+            stub = self._spilled_stubs[case_id]
+            with gzip.open(stub.disk_path, "rb") as fh:
+                json_bytes = fh.read()
+            payload = json.loads(json_bytes.decode("utf-8"))
+
+            ctx = WorkspaceContext.deserialize_full_session(payload)
+            ctx.last_accessed_at = time.time()
+
+            self._active_sessions[case_id] = ctx
+            del self._spilled_stubs[case_id]
+            self._enforce_capacity_limit()
+            return ctx
+
+    def check_and_spill_idle(self, now_override: float | None = None) -> list[str]:
+        """Check all active sessions and spill those exceeding the idle timeout."""
+        with self._lock:
+            now = now_override if now_override is not None else time.time()
+            spilled_ids = []
+            for case_id, sess in list(self._active_sessions.items()):
+                if now - sess.last_accessed_at >= self.idle_timeout_seconds:
+                    self.spill_session(case_id)
+                    spilled_ids.append(case_id)
+            return spilled_ids
+
+    def _enforce_capacity_limit(self) -> None:
+        """Evict and spill least recently accessed active sessions if exceeding max active count."""
+        if len(self._active_sessions) <= self.max_active_sessions:
+            return
+
+        sorted_sessions = sorted(self._active_sessions.values(), key=lambda s: s.last_accessed_at)
+        excess = len(self._active_sessions) - self.max_active_sessions
+        for sess in sorted_sessions[:excess]:
+            self.spill_session(sess.case_id)
+
+    def stats(self) -> dict[str, Any]:
+        """Return runtime session memory and offloading statistics."""
+        with self._lock:
+            return {
+                "active_sessions_count": len(self._active_sessions),
+                "spilled_sessions_count": len(self._spilled_stubs),
+                "bytes_spilled_total": self._bytes_spilled_total,
+                "idle_timeout_seconds": self.idle_timeout_seconds,
+                "max_active_sessions": self.max_active_sessions,
+                "storage_dir": self.storage_dir,
+            }
+
+
 __all__ = [
     "WorkspaceState",
     "WorkspaceContext",
     "PatchValidationError",
     "VersionConflictError",
+    "SessionStub",
+    "DiskBackedSessionManager",
 ]

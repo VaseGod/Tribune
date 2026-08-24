@@ -1,10 +1,10 @@
-"""Routing by case complexity.
+"""Routing by case complexity, Pareto cost optimization, & crash recovery planning.
 
-The router decides the retrieval breadth (top-k) and provider tier for a program,
-and how to escalate on REPLAN. Complex programs (Medicaid, Housing) start with a
-deliberately *narrow* retrieval so the verifier's coverage check exercises the
-REPLAN path; on escalation the router widens retrieval to cover every governing
-rule and (in a served deployment) can route the re-derivation to a stronger model.
+The router decides:
+1. Retrieval breadth (top-k) and provider tier for a program.
+2. Escalation strategy on REPLAN (widens retrieval + escalates to Tier 2 reasoning models).
+3. Dynamic task-aware work allocation (Pareto cost-efficiency vs accuracy).
+4. Checkpoint inspection and in-memory DAG reconstruction for crash recovery.
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ class RouteDecision:
     note: str
     target_model: str = "DeepSeek V4 Pro"
     cost_per_m_input: float = 0.435
+    cost_per_m_output: float = 0.87
+    sla_target_ms: float = 500.0
+    allow_cache: bool = True
+    speculative_draft: bool = False
 
 
 @dataclass
@@ -45,6 +49,8 @@ class RecoveryPlan:
 
 
 class Router:
+    """Orchestration router managing model tiers, top-k retrieval bounds, and crash recovery."""
+
     def initial(self, program: ProgramId) -> RouteDecision:
         total = len(program_registry.get_ruleset(program).rules)
         if program in _COMPLEX:
@@ -56,6 +62,9 @@ class Router:
                 note="complex program: narrow first pass",
                 target_model="DeepSeek V4 Pro",
                 cost_per_m_input=0.435,
+                cost_per_m_output=0.87,
+                sla_target_ms=450.0,
+                speculative_draft=True,
             )
         return RouteDecision(
             tier=1,
@@ -63,6 +72,9 @@ class Router:
             note="standard program: full retrieval",
             target_model="DeepSeek V4 Pro",
             cost_per_m_input=0.435,
+            cost_per_m_output=0.87,
+            sla_target_ms=350.0,
+            speculative_draft=True,
         )
 
     def escalate(self, program: ProgramId, current: RouteDecision) -> RouteDecision:
@@ -73,6 +85,9 @@ class Router:
             note="escalated: full retrieval over all governing rules (and stronger Grok 4.6 model if served)",
             target_model="Grok 4.6",
             cost_per_m_input=2.00,
+            cost_per_m_output=6.00,
+            sla_target_ms=1200.0,
+            speculative_draft=False,
         )
 
     def inspect_checkpoint(self, path: str = ".tribune/last_run.json") -> RecoveryPlan | None:
@@ -119,10 +134,10 @@ class Router:
     ) -> RouteDecision:
         """Dynamic, task-aware work allocation:
 
-        - High-volume document parsing, multi-modal intake processing, and synthetic case generation
-          routed to DeepSeek V4 Pro ($0.435/M input tokens).
-        - Complex statutory eligibility determinations and independent verifications
-          routed to Grok 4.6 ($2.00/M input tokens).
+        - Tier 1 (Routine / Triage): High-volume document parsing, multi-modal intake processing,
+          deterministic checklists, and synthetic case generation routed to DeepSeek V4 Pro ($0.435/M).
+        - Tier 2 (Escalation / Contested): Complex statutory eligibility determinations, multi-step
+          verifications, appeals briefs, and edge-case reasoning routed to Grok 4.6 ($2.00/M).
         """
         task_norm = (task_type or "").lower().strip()
 
@@ -140,6 +155,7 @@ class Router:
             "search_query_generation",
             "extraction",
             "utility",
+            "triage",
         }
 
         tier2_tasks = {
@@ -152,6 +168,8 @@ class Router:
             "rederivation",
             "reasoning",
             "edge_case_analysis",
+            "appeals",
+            "contested",
         }
 
         if task_norm in tier1_tasks:
@@ -161,6 +179,9 @@ class Router:
                 note=f"high-volume task '{task_type}' routed to DeepSeek V4 Pro",
                 target_model="DeepSeek V4 Pro",
                 cost_per_m_input=0.435,
+                cost_per_m_output=0.87,
+                sla_target_ms=350.0,
+                speculative_draft=True,
             )
 
         if task_norm in tier2_tasks or (program in _COMPLEX and task_norm not in tier1_tasks) or context_length > 4000:
@@ -170,6 +191,9 @@ class Router:
                 note=f"complex statutory reasoning task '{task_type}' routed to Grok 4.6",
                 target_model="Grok 4.6",
                 cost_per_m_input=2.00,
+                cost_per_m_output=6.00,
+                sla_target_ms=1200.0,
+                speculative_draft=False,
             )
 
         return RouteDecision(
@@ -178,6 +202,9 @@ class Router:
             note=f"standard task '{task_type}' routed to DeepSeek V4 Pro",
             target_model="DeepSeek V4 Pro",
             cost_per_m_input=0.435,
+            cost_per_m_output=0.87,
+            sla_target_ms=350.0,
+            speculative_draft=True,
         )
 
 

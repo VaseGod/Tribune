@@ -8,11 +8,10 @@ import unittest
 from tribune.casegen.synthetic import SyntheticCaseGenerator
 from tribune.corpus.rule_store import LocalRuleStore
 from tribune.governance.audit import AuditLog
-from tribune.governance.judge import HeuristicJudge, JudgeResult, LocalClassifierJudge, RemoteJudge
+from tribune.governance.judge import HeuristicJudge, LocalClassifierJudge
 from tribune.orchestration.pipeline import CasePipeline
 from tribune.types import (
     Assessment,
-    Citation,
     CriterionOutcome,
     CriterionResult,
     EligibilityStatus,
@@ -159,7 +158,7 @@ class TestAuditJudge(unittest.TestCase):
         pipe = CasePipeline()
 
         for case in cases:
-            res = pipe.run_case(case)
+            pipe.run_case(case)
             # Ensure every program run produced verifier judge trace
             judge_records = pipe.audit.query(case_id=case.case_id, agent="verifier_judge")
             self.assertGreaterEqual(len(judge_records), 1)

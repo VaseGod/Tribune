@@ -16,6 +16,7 @@ import uuid
 from typing import Any
 
 from ..types import AuditRecord, SMState
+from .judge import JudgeEvaluator, JudgeResult, get_default_judge
 
 _PII_PATTERNS = [
     re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # SSN
@@ -68,9 +69,6 @@ def _canonical(record: AuditRecord) -> str:
 
 def _hash(record: AuditRecord) -> str:
     return hashlib.sha256(_canonical(record).encode("utf-8")).hexdigest()
-
-
-from .judge import JudgeEvaluator, JudgeResult, get_default_judge
 
 
 class AuditLog:

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import unittest
+
 import pytest
 
 from tribune.providers.base import SynthesisRequest
 from tribune.providers.local_rules import (
     LocalGGUFProvider,
-    LocalRulesProvider,
     LocalRuntimeConfig,
     benchmark_local_inference,
     detect_runtime_capabilities,

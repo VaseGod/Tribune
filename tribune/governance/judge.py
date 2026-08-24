@@ -1,15 +1,19 @@
-"""Continuous Audit Judge Evaluators & Live Trace Monitoring.
+"""Continuous Audit Judge Evaluators, Live Trace Monitoring, & Governance Reward Oracle.
 
-Embeds lightweight, pluggable judge evaluators directly into the live execution pipeline.
-Evaluates 100% of verifier outputs in real time for perceived error rate, uncited claim rate,
-citation coverage, and rule reference integrity at ~82-99% lower cost than frontier cloud APIs.
+Provides:
+1. Pluggable judge evaluators (HeuristicJudge, LocalClassifierJudge, RemoteJudge) evaluating
+   100% of verifier outputs in real time for perceived error rate, uncited claims, and citation coverage.
+2. Governance Reward Oracle & Invariant Checks for synthetic trajectory synthesis and verification:
+   - Oracle Check: Validates trajectory outcome alignment against environment ground truth.
+   - No-Op Invariance Check: Penalizes redundant, circular, or hallucinatory procedural steps.
+   - Unsolved-State Penalty: Penalizes determinations concluding eligibility while blocking hidden ambiguities remain.
 """
 
 from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,7 +21,9 @@ from ..types import (
     Assessment,
     CriterionOutcome,
     Evidence,
+    ProgramOutcome,
     StrictModel,
+    SyntheticCase,
     VerifierVerdict,
 )
 
@@ -43,7 +49,7 @@ class JudgeResult(StrictModel):
     evidence_summary: dict[str, Any] = field(default_factory=dict)
     judge_name: str = "heuristic_judge"
     judge_version: str = "1.0.0"
-    cost_estimate: float = 0.00015  # Estimated cost in USD (vs ~$0.015 for frontier cloud APIs)
+    cost_estimate: float = 0.00015  # Estimated cost in USD
     evaluated_at: datetime = field(default_factory=_utcnow)
 
 
@@ -66,11 +72,7 @@ class JudgeEvaluator(ABC):
 
 
 class HeuristicJudge(JudgeEvaluator):
-    """Fast, deterministic statutory rule and citation coverage audit judge.
-
-    Runs 100% offline with zero external network or model dependencies.
-    Cost: ~$0.00005 per evaluation.
-    """
+    """Fast, deterministic statutory rule and citation coverage audit judge."""
 
     name: str = "heuristic_judge"
     version: str = "1.1.0"
@@ -150,16 +152,12 @@ class HeuristicJudge(JudgeEvaluator):
             evidence_summary={"evidence_count": len(evidence), "criteria_count": total_criteria},
             judge_name=self.name,
             judge_version=self.version,
-            cost_estimate=0.00005,  # 99.6% cost reduction vs $0.015 cloud LLM judge
+            cost_estimate=0.00005,
         )
 
 
 class LocalClassifierJudge(JudgeEvaluator):
-    """Specialized local classifier judge for deep statutory claim grounding.
-
-    Provides real-time continuous evaluation with zero external network dependencies.
-    Cost: ~$0.00018 per evaluation (~98.8% lower cost than frontier cloud APIs).
-    """
+    """Specialized local classifier judge for deep statutory claim grounding."""
 
     name: str = "local_classifier_judge"
     version: str = "1.0.0"
@@ -175,10 +173,7 @@ class LocalClassifierJudge(JudgeEvaluator):
         evidence: list[Evidence],
         jurisdiction: str,
     ) -> JudgeResult:
-        # Base evaluation through deterministic statutory rules
         base_res = self._fallback_heuristic.evaluate(assessment, verdict, evidence, jurisdiction)
-
-        # Enhanced classifier scoring
         confidence = round(min(1.0, (assessment.self_confidence * 0.4 + verdict.self_testing_score * 0.6)), 4)
         passed = base_res.passed and (confidence >= 0.5)
 
@@ -211,7 +206,6 @@ class RemoteJudge(JudgeEvaluator):
         jurisdiction: str,
     ) -> JudgeResult:
         if not self.enabled:
-            # Fall back safely to LocalClassifierJudge
             return LocalClassifierJudge().evaluate(assessment, verdict, evidence, jurisdiction)
         raise NotImplementedError("Remote judge execution is disabled by default in offline mode.")
 
@@ -221,6 +215,139 @@ def get_default_judge() -> JudgeEvaluator:
     return LocalClassifierJudge()
 
 
+# --------------------------------------------------------------------------- #
+# Governance Reward Oracle & Invariant Checks
+# --------------------------------------------------------------------------- #
+
+
+class TrajectoryRewardOracle:
+    """Governance reward oracle and invariant validator for synthetic training trajectories."""
+
+    @staticmethod
+    def oracle_check(case: SyntheticCase, outcome: ProgramOutcome) -> dict[str, Any]:
+        """Ground truth check comparing solver trajectory outcome against case ground truth.
+
+        Returns match status, correctness boolean, and error magnitude.
+        """
+        program = outcome.program
+        gt = case.ground_truth.get(program)
+        if not gt:
+            return {"match": True, "correct": True, "error_penalty": 0.0, "reason": "No ground truth labeled"}
+
+        if outcome.abstained:
+            if gt.ambiguous:
+                return {"match": True, "correct": True, "error_penalty": 0.0, "reason": "Correctly abstained on ambiguous case"}
+            return {"match": False, "correct": False, "error_penalty": -0.2, "reason": "Unnecessarily abstained on clear case"}
+
+        if outcome.assessment is None:
+            return {"match": False, "correct": False, "error_penalty": -0.5, "reason": "Missing assessment"}
+
+        predicted_label = "eligible" if outcome.assessment.status.value == "likely_eligible" else "ineligible"
+        is_correct = predicted_label == gt.label.value
+        error_penalty = 0.0 if is_correct else -1.0
+
+        return {
+            "match": is_correct,
+            "correct": is_correct,
+            "error_penalty": error_penalty,
+            "predicted": predicted_label,
+            "ground_truth": gt.label.value,
+        }
+
+    @staticmethod
+    def noop_invariance_check(trajectory: Any) -> tuple[bool, float, list[str]]:
+        """Ensures state transitions do not reward redundant, circular, or hallucinatory procedural steps.
+
+        Returns (passed, penalty_score, violation_reasons).
+        """
+        violations: list[str] = []
+        penalty = 0.0
+        seen_actions: set[str] = set()
+
+        frames = getattr(trajectory, "frames", trajectory if isinstance(trajectory, list) else [])
+
+        for idx, frame in enumerate(frames):
+            action = getattr(frame, "action", frame.get("action", "") if isinstance(frame, dict) else "")
+            state = getattr(frame, "state", frame.get("state", None) if isinstance(frame, dict) else None)
+            norm_action = str(action).strip().lower()
+
+            if norm_action in seen_actions:
+                violations.append(f"Step {idx+1}: Redundant duplicate action '{action}' executed in state '{state}'")
+                penalty += -0.15
+
+            seen_actions.add(norm_action)
+
+        passed = len(violations) == 0
+        return passed, max(-0.6, penalty), violations
+
+    @staticmethod
+    def unsolved_state_penalty(
+        outcome: ProgramOutcome,
+        environment: Any | None = None,
+        latent_facts: list[Any] | None = None,
+    ) -> tuple[float, list[str]]:
+        """Penalizes trajectories that conclude eligibility without resolving blocking hidden ambiguities.
+
+        Returns (penalty_score, reasons).
+        """
+        reasons: list[str] = []
+        penalty = 0.0
+
+        has_hidden = False
+        if environment is not None and hasattr(environment, "has_unresolved_blocking_ambiguities"):
+            has_hidden = environment.has_unresolved_blocking_ambiguities()
+        elif latent_facts:
+            has_hidden = any(not getattr(lf, "is_revealed", False) for lf in latent_facts)
+
+        if has_hidden and not outcome.abstained:
+            if outcome.assessment and outcome.assessment.is_assertion:
+                penalty = -1.0
+                reasons.append(
+                    "Severe penalty: Concluded definitive eligibility without resolving critical latent hidden ambiguities."
+                )
+
+        return penalty, reasons
+
+    @classmethod
+    def evaluate_trajectory_reward(
+        cls,
+        case: SyntheticCase,
+        outcome: ProgramOutcome,
+        trajectory: Any,
+        environment: Any | None = None,
+    ) -> dict[str, Any]:
+        """Compute holistic scalar reward score in [-1.0, 1.0] across all governance invariants."""
+        oracle_res = cls.oracle_check(case, outcome)
+        noop_passed, noop_penalty, noop_violations = cls.noop_invariance_check(trajectory)
+        unsolved_pen, unsolved_reasons = cls.unsolved_state_penalty(outcome, environment)
+
+        if unsolved_pen < 0.0:
+            base_reward = -0.5
+        elif outcome.abstained and case.ground_truth.get(outcome.program, None) and case.ground_truth[outcome.program].ambiguous:
+            base_reward = 0.95
+        elif oracle_res["correct"]:
+            base_reward = 1.0
+        else:
+            base_reward = -0.5
+
+        total_reward = base_reward + oracle_res["error_penalty"] + noop_penalty + unsolved_pen
+        total_reward = max(-1.0, min(1.0, round(total_reward, 4)))
+
+        all_violations = list(noop_violations) + list(unsolved_reasons)
+        if not oracle_res["correct"]:
+            all_violations.append(f"Oracle mismatch: {oracle_res['reason']}")
+
+        return {
+            "scalar_reward": total_reward,
+            "oracle_check": oracle_res,
+            "noop_invariance_passed": noop_passed,
+            "noop_penalty": noop_penalty,
+            "unsolved_state_penalty": unsolved_pen,
+            "violations": all_violations,
+            "is_valid_trajectory": len(all_violations) == 0,
+        }
+
+
 __all__ = [
     "JudgeResult",
     "JudgeEvaluator",
@@ -228,4 +355,5 @@ __all__ = [
     "LocalClassifierJudge",
     "RemoteJudge",
     "get_default_judge",
+    "TrajectoryRewardOracle",
 ]

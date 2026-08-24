@@ -6,6 +6,12 @@ rule's predicate against the documented evidence, and let the provider synthesiz
 status, recommended action, and rationale from those cited criterion results. It
 also computes the diagnostics the calibrator needs (coverage, resolved fraction,
 margin-to-threshold, structural ambiguity signals).
+
+Features:
+- Deterministic checklist evaluations for routine triage.
+- Dynamically bound Python tool stubs scoped to target program domain.
+- Speculative drafting & ReasonMaxxer entropy gating.
+- Seamless escalation to Tier 2 frontier models when statutory ambiguity is detected.
 """
 
 from __future__ import annotations
@@ -70,7 +76,11 @@ class ProgrammaticEligibilityTools:
         return {"evidence_value": evidence_value, "threshold": statutory_threshold, "operator": operator, "met": met}
 
     @staticmethod
-    def get_tool_signatures(rule_store: RuleStore | None = None, program: ProgramId | None = None, jurisdiction: str = "EX") -> str:
+    def get_tool_signatures(
+        rule_store: RuleStore | None = None,
+        program: ProgramId | None = None,
+        jurisdiction: str = "EX",
+    ) -> str:
         """Expose dynamically bound Python tool signatures strictly scoped to the target program."""
         if rule_store is not None and program is not None:
             return rule_store.get_program_tools(program, jurisdiction)
@@ -92,11 +102,16 @@ class EligibilityProposer:
 
     @staticmethod
     def parse_visible_response(text: str) -> str:
-        """Parse only explicit, visible model text responses, strictly ignoring thinking monologues or block metadata."""
+        """Parse only explicit, visible model text responses, strictly ignoring thinking monologues."""
         if not isinstance(text, str):
             return text
         import re
-        clean = re.sub(r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(
+            r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         return clean.strip()
 
     def generate_prompt(self, program: ProgramId, jurisdiction: str) -> str:
@@ -247,3 +262,8 @@ class EligibilityProposer:
     def _summary(evidence: list[Evidence]) -> str:
         return ", ".join(f"{ev.type.value}={ev.value}" for ev in evidence[:12])
 
+
+__all__ = [
+    "EligibilityProposer",
+    "ProgrammaticEligibilityTools",
+]

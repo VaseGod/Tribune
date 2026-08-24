@@ -1,22 +1,24 @@
 """RuleStore: retrieve governing rules (with citations) for a program.
 
-``LocalRuleStore`` is the default: it indexes the in-repo rule sets and ranks them
-with the late-interaction retriever — a real ColBERT-style MaxSim search that runs
-offline. ``HostedRuleStore`` is the extension point for a hosted vector backend
-(e.g. a managed ColBERT/embedding service); it shares the same contract and falls
-back to local if no endpoint is configured.
+Integrates:
+1. ``LocalRuleStore``: In-repo rule store backed by both token-level late-interaction
+   retrieval (ColBERT MaxSim) and payload-constrained ``FilterableHNSWIndex`` with
+   explicit metadata attribute bridging edges.
+2. ``HostedRuleStore``: Extension point for hosted vector backends with seamless local fallback.
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..config import TribuneSettings, get_settings
+from ..context.graph_builder import FilterableHNSWIndex
 from ..types import Citation, ProgramId
 from . import programs as program_registry
-from .citations import LateInteractionRetriever
+from .citations import LateInteractionRetriever, embed_dense
 from .programs.base import Rule
 
 
@@ -51,15 +53,38 @@ def _doc_text(rule: Rule) -> str:
 
 
 class LocalRuleStore:
-    """In-repo rule store backed by deterministic late-interaction retrieval."""
+    """In-repo rule store backed by deterministic late-interaction retrieval and filterable HNSW indexing."""
 
     name = "local"
 
     def __init__(self) -> None:
         self._retriever = LateInteractionRetriever()
+        self._hnsw_index = FilterableHNSWIndex(dim=96)
+        self._rule_lookup: dict[str, Rule] = {}
+
         for program in program_registry.all_programs():
-            for rule in program_registry.get_ruleset(program).rules:
-                self._retriever.index(f"{program.value}:{rule.criterion_id}", _doc_text(rule))
+            ruleset = program_registry.get_ruleset(program)
+            for rule in ruleset.rules:
+                doc_key = f"{program.value}:{rule.criterion_id}"
+                text = _doc_text(rule)
+                self._rule_lookup[doc_key] = rule
+                self._retriever.index(doc_key, text)
+
+                # Index in filterable HNSW with rich statutory metadata
+                dense_vec = embed_dense(text)
+                self._hnsw_index.insert(
+                    node_id=doc_key,
+                    vector=dense_vec,
+                    metadata={
+                        "program": program.value,
+                        "benefit_program": program.value,
+                        "criterion_id": rule.criterion_id,
+                        "required": rule.required,
+                        "statutory_level": "federal" if "CFR" in rule.source or "USC" in rule.source else "state",
+                        "effective_year": 2026,
+                        "title": rule.title,
+                    },
+                )
 
     def retrieve(
         self, query: str, program: ProgramId, jurisdiction: str, k: int
@@ -78,6 +103,51 @@ class LocalRuleStore:
                     score=sd.score,
                 )
             )
+        return out
+
+    def retrieve_filtered(
+        self,
+        query: str,
+        program: ProgramId,
+        jurisdiction: str,
+        k: int = 8,
+        filter_fn: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[RetrievedRule]:
+        """Perform payload-constrained vector retrieval using FilterableHNSWIndex."""
+        query_dense = embed_dense(query)
+
+        def combined_filter(meta: dict[str, Any]) -> bool:
+            if meta.get("program") != program.value and meta.get("benefit_program") != program.value:
+                return False
+            if filter_fn is not None and not filter_fn(meta):
+                return False
+            return True
+
+        hits = self._hnsw_index.search(
+            query_vector=query_dense,
+            k=max(1, k),
+            filter_fn=combined_filter,
+        )
+
+        rules = program_registry.get_ruleset(program).rules
+        by_id = {rule.criterion_id: rule for rule in rules}
+        out: list[RetrievedRule] = []
+
+        for _node_id, score, meta in hits:
+            crit_id = meta.get("criterion_id")
+            if crit_id in by_id:
+                rule = by_id[crit_id]
+                out.append(
+                    RetrievedRule(
+                        rule=rule,
+                        citation=rule.citation(program, jurisdiction),
+                        score=score,
+                    )
+                )
+
+        # Fallback to standard retrieve if HNSW hit list is empty
+        if not out:
+            return self.retrieve(query, program, jurisdiction, k)
         return out
 
     def required_criteria(self, program: ProgramId) -> list[str]:
@@ -162,13 +232,7 @@ class LocalRuleStore:
 
 
 class HostedRuleStore(LocalRuleStore):
-    """Pluggable hosted-vector-store backend.
-
-    Subclasses ``LocalRuleStore`` so the rule metadata, citations, and required-
-    criteria contracts are always available locally. Only the *ranking* would be
-    delegated to a hosted vector/ColBERT service. With no endpoint configured it
-    transparently behaves like the local store, which keeps the system runnable.
-    """
+    """Pluggable hosted-vector-store backend with seamless local fallback."""
 
     name = "hosted"
 
@@ -181,15 +245,12 @@ class HostedRuleStore(LocalRuleStore):
         self, query: str, program: ProgramId, jurisdiction: str, k: int
     ) -> list[RetrievedRule]:
         if not self._endpoint:
-            # No hosted backend configured -> local late-interaction ranking.
             return super().retrieve(query, program, jurisdiction, k)
         return self._retrieve_hosted(query, program, jurisdiction, k)
 
     def _retrieve_hosted(
         self, query: str, program: ProgramId, jurisdiction: str, k: int
     ) -> list[RetrievedRule]:  # pragma: no cover - requires a live backend
-        # Extension point: call the configured vector service, map returned doc ids
-        # back to in-repo rules so citations and predicates stay authoritative.
         raise NotImplementedError(
             "Connect your hosted vector backend here. The local store is the working "
             "fallback; see HostedRuleStore docstring."
@@ -204,12 +265,7 @@ def make_rule_store(settings: TribuneSettings | None = None) -> RuleStore:
 
 
 def ruleset_fingerprint(program: ProgramId, jurisdiction: str) -> dict[str, str]:
-    """Stable per-criterion hash of citation source + rule text.
-
-    The canary compares this against a frozen baseline to detect rule-citation
-    drift (a program's rules changed but the system's cited logic has not been
-    updated — a live hazard for any benefits tool).
-    """
+    """Stable per-criterion hash of citation source + rule text."""
     store = LocalRuleStore()
     fp: dict[str, str] = {}
     for citation in store.all_citations(program, jurisdiction):
@@ -218,3 +274,13 @@ def ruleset_fingerprint(program: ProgramId, jurisdiction: str) -> dict[str, str]
         ).hexdigest()
         fp[citation.citation_id] = digest
     return fp
+
+
+__all__ = [
+    "RetrievedRule",
+    "RuleStore",
+    "LocalRuleStore",
+    "HostedRuleStore",
+    "make_rule_store",
+    "ruleset_fingerprint",
+]

@@ -27,6 +27,10 @@ providers:
     output_cost_per_1m: 3.75
     max_context_tokens: 1048576
     supports_tools: true
+    tier: 1
+    sla_p95_ms: 350.0
+    fallback_model: gpt-5.6-sol-ultrafast
+
   gpt-5.6-sol-ultrafast:
     provider_type: openai_compat
     model_name: gpt-5.6-sol-ultrafast
@@ -34,6 +38,10 @@ providers:
     output_cost_per_1m: 10.00
     tokens_per_second: 750
     supports_tools: true
+    tier: 2
+    sla_p95_ms: 1200.0
+    fallback_model: qwen3.8-27b
+
   qwen3.8-27b:
     provider_type: llama.cpp
     model_name: qwen3.8-27b
@@ -44,6 +52,9 @@ providers:
     spec_type: ngram-mod,draft-mtp
     spec_draft_max: 2
     kv_quant_type: q4_1
+    tier: 0
+    sla_p95_ms: 500.0
+    speculative_drafter: DFlash
 
 candidates:
   - candidate_id: qwen3.8-27b
@@ -59,6 +70,7 @@ candidates:
     serving: [llama.cpp]
     quant_formats: [gguf-q8_0, gguf-q4_k_m, gguf-q3_k_xl, q4_1]
     context_window: 131072
+    tier: 0
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -79,6 +91,7 @@ candidates:
     serving: [vllm, sglang, llama.cpp]
     quant_formats: [fp16, fp8, gguf-q8_0, gguf-q4_k_m, gguf-q2_k, gguf-iq1_s]
     context_window: 131072
+    tier: 2
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -98,6 +111,7 @@ candidates:
     serving: [vllm, sglang, llama.cpp]
     quant_formats: [fp8, gguf-q4_k_m, gguf-q2_k]
     context_window: 131072
+    tier: 1
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -116,6 +130,7 @@ candidates:
     serving: [vllm, sglang]
     quant_formats: [fp16, fp8]
     context_window: 32768
+    tier: 1
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -134,6 +149,7 @@ candidates:
     serving: [vllm, sglang, llama.cpp]
     quant_formats: [fp16, gguf-q8_0, gguf-q4_k_m]
     context_window: 32768
+    tier: 1
     measured_kappa: null
     measured_cost_per_task: null
     notes: Small sibling; verify weights exist before marking available.
@@ -150,6 +166,7 @@ candidates:
     serving: [vllm]
     quant_formats: []
     context_window: 131072
+    tier: 2
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -168,6 +185,7 @@ candidates:
     serving: [vllm, sglang]
     quant_formats: [nvfp4, fp8, fp16]
     context_window: 131072
+    tier: 1
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -187,6 +205,7 @@ candidates:
     serving: [api]
     quant_formats: []
     context_window: 200000
+    tier: 2
     measured_kappa: null
     measured_cost_per_task: null
     promo_end_date: "2026-08-31"
@@ -209,6 +228,7 @@ candidates:
     serving: [api]
     quant_formats: []
     context_window: 131072
+    tier: 2
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -228,6 +248,7 @@ candidates:
     serving: [api, vllm, sglang]
     quant_formats: [fp8, gguf-q4_k_m]
     context_window: 131072
+    tier: 1
     measured_kappa: null
     measured_cost_per_task: null
     notes: >-
@@ -259,5 +280,3 @@ qwen3_8_27b_local:
       spec_type: "ngram-mod,draft-mtp"
       spec_draft_n_max: 2
       kv_cache_type: "q4_1"
-
-

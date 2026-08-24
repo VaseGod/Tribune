@@ -1,25 +1,28 @@
-"""Privacy-preserving synthetic case generator.
+"""Privacy-preserving synthetic case generator & interactive scenario environment.
 
-Produces internally consistent applicant situations with labeled ground-truth
-eligibility and a controlled, class-imbalanced distribution (mostly clear cases,
-a minority of genuinely ambiguous ones). No real PII is used or produced. The
-situations are the source of both the evaluation data and the demo walkthrough.
-
-Each case carries:
-* the complete ``situation`` (the truth),
-* the ``documents`` TRIBUNE actually receives (a subset, ingested into evidence),
-* per-program ``ground_truth`` (label + ambiguity), computed from the corpus rules.
+Produces:
+1. Internally consistent applicant situations with labeled ground-truth eligibility.
+2. Partially observed runnable synthetic environments with hidden variables (latent facts),
+   such as hidden secondary household income, ambiguous dependent custody, undocumented
+   seasonal earnings, and unverified asset thresholds.
+3. Scenario state machine allowing agents to interactively perform legal discovery actions.
 """
 
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
+from typing import Any
 
 from ..corpus.programs.jurisdictions import get_profile
 from ..ingestion.structured import StructuredIngest
 from ..types import (
     ApplicantSituation,
+    Evidence,
+    EvidenceType,
+    IngestMethod,
     ProgramId,
+    Provenance,
     RawDocument,
     SyntheticCase,
     WaitlistStatus,
@@ -52,12 +55,146 @@ _BENEFIT_ORDER = [ProgramId.SNAP, ProgramId.UNEMPLOYMENT, ProgramId.MEDICAID, Pr
 _ALL_ORDER = _BENEFIT_ORDER + [ProgramId.APPEALS]
 
 
-def _str_value(value) -> str:
+def _str_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else f"{value:.2f}"
     return str(value)
+
+
+# --------------------------------------------------------------------------- #
+# Latent Variables & Interactive Scenario State Machine
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class LatentFact:
+    """A hidden variable in the partially observed synthetic environment."""
+
+    variable_id: str
+    name: str
+    true_value: Any
+    is_revealed: bool = False
+    discovery_action_type: str = "request_w2_wages"
+    statutory_impact: str = "Income exceeds gross threshold if unverified secondary wages exist"
+    ambiguity_type: str = "hidden_secondary_income"  # "hidden_secondary_income" | "ambiguous_custody" | "undocumented_earnings" | "unverified_assets"
+    revealed_evidence_type: EvidenceType = EvidenceType.MONTHLY_INCOME
+
+
+@dataclass(frozen=True)
+class DiscoveryAction:
+    """A legal discovery or fact-verification action an agent can take."""
+
+    action_id: str
+    action_type: str  # e.g. "request_w2_wages", "verify_custody_order", "cross_check_tax_records", "asset_audit"
+    description: str
+    target_variable: str
+    cost_usd: float = 0.005
+    latency_ms: float = 85.0
+
+
+class SyntheticEnvironment:
+    """Interactive runnable scenario state machine with hidden latent variables.
+
+    Simulates a real-world welfare intake where initial documentation is incomplete
+    or contains latent ambiguities. Agents can perform step-by-step discovery actions
+    to uncover latent facts before rendering a final eligibility determination.
+    """
+
+    def __init__(
+        self,
+        case_id: str,
+        jurisdiction: str,
+        initial_situation: ApplicantSituation,
+        initial_evidence: list[Evidence],
+        latent_facts: list[LatentFact] | None = None,
+    ) -> None:
+        self.case_id = case_id
+        self.jurisdiction = jurisdiction
+        self.situation = initial_situation
+        self.evidence = list(initial_evidence)
+        self.latent_facts: dict[str, LatentFact] = {f.variable_id: f for f in (latent_facts or [])}
+        self.action_history: list[dict[str, Any]] = []
+        self.total_discovery_cost = 0.0
+
+    def get_visible_evidence(self) -> list[Evidence]:
+        """Return currently observable evidence list."""
+        return list(self.evidence)
+
+    def get_available_actions(self) -> list[DiscoveryAction]:
+        """Return discovery actions available to reveal unobserved latent facts."""
+        actions: list[DiscoveryAction] = []
+        for lf in self.latent_facts.values():
+            if not lf.is_revealed:
+                actions.append(
+                    DiscoveryAction(
+                        action_id=f"action:{lf.variable_id}",
+                        action_type=lf.discovery_action_type,
+                        description=f"Perform discovery for {lf.name} ({lf.ambiguity_type})",
+                        target_variable=lf.variable_id,
+                        cost_usd=0.005,
+                        latency_ms=85.0,
+                    )
+                )
+        return actions
+
+    def has_unresolved_blocking_ambiguities(self) -> bool:
+        """Check if any critical latent facts remain hidden."""
+        return any(not lf.is_revealed for lf in self.latent_facts.values())
+
+    def step(self, action: DiscoveryAction | str) -> tuple[Evidence | None, float, bool, dict[str, Any]]:
+        """Execute a legal discovery action to uncover latent facts.
+
+        Returns: (newly_uncovered_evidence, action_cost, all_resolved, metadata)
+        """
+        action_type = action.action_type if isinstance(action, DiscoveryAction) else str(action)
+        target_var = action.target_variable if isinstance(action, DiscoveryAction) else None
+
+        cost = action.cost_usd if isinstance(action, DiscoveryAction) else 0.005
+        self.total_discovery_cost += cost
+
+        uncovered_ev: Evidence | None = None
+        matched_fact: LatentFact | None = None
+
+        for lf in self.latent_facts.values():
+            if not lf.is_revealed:
+                if (target_var and lf.variable_id == target_var) or (lf.discovery_action_type == action_type):
+                    matched_fact = lf
+                    lf.is_revealed = True
+                    # Create structured evidence
+                    prov = Provenance(
+                        source_doc_id=f"discovery:{action_type}:{lf.variable_id}",
+                        ingest_method=IngestMethod.STRUCTURED,
+                        anonymized=True,
+                        content_hash=f"latent_hash_{lf.variable_id}",
+                    )
+                    uncovered_ev = Evidence(
+                        evidence_id=f"ev_latent_{lf.variable_id}",
+                        type=lf.revealed_evidence_type,
+                        value=lf.true_value,
+                        provenance=prov,
+                    )
+                    self.evidence.append(uncovered_ev)
+                    break
+
+        all_resolved = not self.has_unresolved_blocking_ambiguities()
+
+        step_record = {
+            "action_type": action_type,
+            "target_variable": target_var,
+            "matched_latent_fact": matched_fact.name if matched_fact else None,
+            "cost_usd": cost,
+            "all_resolved": all_resolved,
+        }
+        self.action_history.append(step_record)
+
+        return uncovered_ev, cost, all_resolved, step_record
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic Case Generator
+# --------------------------------------------------------------------------- #
 
 
 class SyntheticCaseGenerator:
@@ -66,8 +203,6 @@ class SyntheticCaseGenerator:
 
     def __init__(self, seed: int = 7) -> None:
         self.seed = seed
-
-    # -- public API --------------------------------------------------------- #
 
     def build_case(
         self,
@@ -94,6 +229,71 @@ class SyntheticCaseGenerator:
             ground_truth=ground_truth,
             target_programs=target_programs,
         )
+
+    def build_scenario_environment(
+        self,
+        case_id: str,
+        jurisdiction: str,
+        overrides: dict,
+        target_programs: list[ProgramId],
+        latent_ambiguities: list[str] | None = None,
+    ) -> tuple[SyntheticCase, SyntheticEnvironment]:
+        """Generate a complete runnable synthetic case paired with an interactive SyntheticEnvironment."""
+        case = self.build_case(case_id, jurisdiction, overrides, target_programs)
+        latent_facts: list[LatentFact] = []
+
+        ambiguities = latent_ambiguities or ["hidden_secondary_income", "ambiguous_custody"]
+
+        if "hidden_secondary_income" in ambiguities:
+            latent_facts.append(
+                LatentFact(
+                    variable_id=f"{case_id}:sec_income",
+                    name="Undocumented Gig Economy / Secondary Monthly Earnings",
+                    true_value=850.0,
+                    is_revealed=False,
+                    discovery_action_type="request_w2_wages",
+                    statutory_impact="Increases gross monthly income by $850, testing MAGI & SNAP limits",
+                    ambiguity_type="hidden_secondary_income",
+                    revealed_evidence_type=EvidenceType.MONTHLY_INCOME,
+                )
+            )
+
+        if "ambiguous_custody" in ambiguities:
+            latent_facts.append(
+                LatentFact(
+                    variable_id=f"{case_id}:custody",
+                    name="Court-Ordered Dependent Shared Custody Verification",
+                    true_value=True,
+                    is_revealed=False,
+                    discovery_action_type="verify_custody_order",
+                    statutory_impact="Establishes qualifying dependent child status for family Medicaid",
+                    ambiguity_type="ambiguous_custody",
+                    revealed_evidence_type=EvidenceType.HAS_DEPENDENT_CHILD,
+                )
+            )
+
+        if "unverified_assets" in ambiguities:
+            latent_facts.append(
+                LatentFact(
+                    variable_id=f"{case_id}:assets",
+                    name="Liquid Asset Bank Account Audit",
+                    true_value=1200.0,
+                    is_revealed=False,
+                    discovery_action_type="asset_audit",
+                    statutory_impact="Verifies liquid assets remain below SNAP $2,750 threshold",
+                    ambiguity_type="unverified_assets",
+                    revealed_evidence_type=EvidenceType.LIQUID_ASSETS,
+                )
+            )
+
+        env = SyntheticEnvironment(
+            case_id=case_id,
+            jurisdiction=jurisdiction,
+            initial_situation=case.situation,
+            initial_evidence=case.evidence,
+            latent_facts=latent_facts,
+        )
+        return case, env
 
     def generate_eval_set(
         self, n_per_program: int = 24, ambiguous_ratio: float = 0.25
@@ -314,3 +514,11 @@ class SyntheticCaseGenerator:
                 fields=fields,
             )
         ]
+
+
+__all__ = [
+    "LatentFact",
+    "DiscoveryAction",
+    "SyntheticEnvironment",
+    "SyntheticCaseGenerator",
+]

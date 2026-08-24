@@ -1,15 +1,26 @@
-"""Module & Dependency Context Builder.
+"""Module, Dependency, & Filterable HNSW Context Graph Builder.
 
-Scans project files, parses Python AST to construct cross-file import/export mappings
-and dependency graphs, and formats context graphs for prompt injection.
+Provides:
+1. AST-based repository scanner building cross-file dependency and export context graphs.
+2. Multi-agent dependency and scope graph builder for parallel execution waves.
+3. Filterable HNSW (Hierarchical Navigable Small World) graph vector index with
+   explicit metadata attribute bridging edges to guarantee path connectivity under
+   highly selective (e.g. 1%) payload filters.
 """
 
 from __future__ import annotations
 
 import ast
+import heapq
+import math
 import os
+import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 
 @dataclass
@@ -279,7 +290,7 @@ class AgentGraphBuilder:
                     read_scopes=["/evidence", f"/shared_facts/{prog_val}", "/shared_facts"],
                     write_scopes=[f"/assessments/{prog_val}", f"/criteria_outcomes/{prog_val}"],
                     dependencies=["gather", "navigator"],
-                    broadcast_subscriptions=[f"/evidence", f"/criteria_outcomes/{prog_val}"],
+                    broadcast_subscriptions=["/evidence", f"/criteria_outcomes/{prog_val}"],
                 )
             )
 
@@ -312,6 +323,293 @@ class AgentGraphBuilder:
         return graph
 
 
+# --------------------------------------------------------------------------- #
+# Filterable HNSW Vector Index with Explicit Metadata Attribute Bridging Edges
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class HNSWNode:
+    """A single vector node in the Filterable HNSW graph."""
+
+    node_id: str
+    vector: np.ndarray
+    metadata: dict[str, Any] = field(default_factory=dict)
+    level: int = 0
+    # Mapping of level -> list of neighbor node IDs
+    neighbors: dict[int, list[str]] = field(default_factory=dict)
+    # Attribute bridge edges for metadata-constrained navigation (level -> list of node IDs)
+    bridge_neighbors: dict[int, list[str]] = field(default_factory=dict)
+
+
+class FilterableHNSWIndex:
+    """Filterable Hierarchical Navigable Small World (HNSW) graph index with attribute bridging edges.
+
+    Constructs explicit inter-vector graph edges across shared metadata attributes
+    (`jurisdiction`, `benefit_program`, `effective_year`, `statutory_level`) to prevent
+    graph fragmentation during highly selective filtering (e.g., 1% selective queries),
+    guaranteeing navigable path connectivity across disconnected semantic clusters.
+    """
+
+    def __init__(
+        self,
+        dim: int = 96,
+        m: int = 16,
+        m0: int = 32,
+        ef_construction: int = 64,
+        ml: float = 1.0 / math.log(16),
+        seed: int = 42,
+    ) -> None:
+        self.dim = dim
+        self.m = m
+        self.m0 = m0
+        self.ef_construction = ef_construction
+        self.ml = ml
+        self.rng = random.Random(seed)
+        self.nodes: dict[str, HNSWNode] = {}
+        self.enter_node_id: str | None = None
+        self.max_level: int = -1
+
+        # Inverted index for metadata bridging: (attr_name, attr_val) -> list[node_id]
+        self._attribute_index: dict[tuple[str, Any], list[str]] = {}
+        self._bridge_attributes = ["jurisdiction", "benefit_program", "program", "effective_year", "statutory_level"]
+
+    def _random_level(self) -> int:
+        """Draw level from exponential distribution."""
+        unif = max(1e-9, self.rng.random())
+        return int(-math.log(unif) * self.ml)
+
+    @staticmethod
+    def _distance(v1: np.ndarray, v2: np.ndarray) -> float:
+        """Cosine distance in [0, 2]. Lower is more similar."""
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+        if norm1 == 0.0 or norm2 == 0.0:
+            return 1.0
+        dot = float(np.dot(v1, v2))
+        cos_sim = dot / (norm1 * norm2)
+        return max(0.0, 1.0 - cos_sim)
+
+    def insert(self, node_id: str, vector: np.ndarray, metadata: dict[str, Any] | None = None) -> None:
+        """Insert a vector with metadata into the filterable HNSW graph."""
+        vec = np.asarray(vector, dtype=np.float64)
+        if vec.shape[-1] != self.dim:
+            # Adjust dimension dynamically if needed
+            if vec.shape[-1] < self.dim:
+                padded = np.zeros(self.dim, dtype=np.float64)
+                padded[: vec.shape[-1]] = vec
+                vec = padded
+            else:
+                vec = vec[: self.dim]
+
+        meta = dict(metadata or {})
+        level = self._random_level()
+
+        node = HNSWNode(
+            node_id=node_id,
+            vector=vec,
+            metadata=meta,
+            level=level,
+            neighbors={lv: [] for lv in range(level + 1)},
+            bridge_neighbors={lv: [] for lv in range(level + 1)},
+        )
+        self.nodes[node_id] = node
+
+        # Update metadata inverted index & build explicit attribute bridges
+        for attr in self._bridge_attributes:
+            if attr in meta and meta[attr] is not None:
+                key = (attr, str(meta[attr]).lower())
+                existing = self._attribute_index.setdefault(key, [])
+                for peer_id in existing[-4:]:  # Connect up to 4 recent peers sharing this attribute
+                    if peer_id != node_id and peer_id in self.nodes:
+                        peer_node = self.nodes[peer_id]
+                        max_shared_lv = min(node.level, peer_node.level)
+                        for lv in range(max_shared_lv + 1):
+                            if peer_id not in node.bridge_neighbors[lv]:
+                                node.bridge_neighbors[lv].append(peer_id)
+                            if node_id not in peer_node.bridge_neighbors[lv]:
+                                peer_node.bridge_neighbors[lv].append(node_id)
+                existing.append(node_id)
+
+        # First node in index
+        if self.enter_node_id is None:
+            self.enter_node_id = node_id
+            self.max_level = level
+            return
+
+        curr_obj = self.enter_node_id
+        curr_dist = self._distance(vec, self.nodes[curr_obj].vector)
+
+        # 1. Top-down traversal from max_level down to level + 1
+        for lv in range(self.max_level, level, -1):
+            changed = True
+            while changed:
+                changed = False
+                all_neighbors = list(self.nodes[curr_obj].neighbors.get(lv, [])) + list(
+                    self.nodes[curr_obj].bridge_neighbors.get(lv, [])
+                )
+                for n_id in all_neighbors:
+                    d = self._distance(vec, self.nodes[n_id].vector)
+                    if d < curr_dist:
+                        curr_dist = d
+                        curr_obj = n_id
+                        changed = True
+
+        # 2. Bottom-up connection from min(level, max_level) down to level 0
+        w: list[tuple[float, str]] = [(curr_dist, curr_obj)]
+        for lv in range(min(level, self.max_level), -1, -1):
+            w = self._search_layer(vec, [curr_obj], self.ef_construction, lv)
+            m_max = self.m0 if lv == 0 else self.m
+            neighbors = self._select_neighbors(w, m_max)
+            node.neighbors[lv] = neighbors
+
+            for n_id in neighbors:
+                n_node = self.nodes[n_id]
+                n_node.neighbors.setdefault(lv, []).append(node_id)
+                if len(n_node.neighbors[lv]) > (self.m0 if lv == 0 else self.m):
+                    # Prune overfilled neighbors
+                    n_dists = [(self._distance(n_node.vector, self.nodes[x].vector), x) for x in n_node.neighbors[lv]]
+                    n_node.neighbors[lv] = self._select_neighbors(n_dists, self.m0 if lv == 0 else self.m)
+
+            curr_obj = w[0][1]
+
+        if level > self.max_level:
+            self.max_level = level
+            self.enter_node_id = node_id
+
+    def _search_layer(
+        self,
+        query_vec: np.ndarray,
+        entry_points: list[str],
+        ef: int,
+        level: int,
+        filter_fn: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[tuple[float, str]]:
+        """Greedy beam search on a single HNSW level utilizing both proximity and attribute bridge edges."""
+        v = set(entry_points)
+        candidates: list[tuple[float, str]] = []
+        w: list[tuple[float, str]] = []
+
+        for ep in entry_points:
+            d = self._distance(query_vec, self.nodes[ep].vector)
+            heapq.heappush(candidates, (d, ep))
+            heapq.heappush(w, (-d, ep))  # Max-heap for furthest element
+
+        while candidates:
+            c_dist, c_id = heapq.heappop(candidates)
+            furthest_w_dist = -w[0][0]
+
+            if c_dist > furthest_w_dist and len(w) >= ef:
+                break
+
+            curr_node = self.nodes[c_id]
+            # Explore proximity neighbors AND attribute bridge neighbors
+            combined_neighbors = list(curr_node.neighbors.get(level, [])) + list(
+                curr_node.bridge_neighbors.get(level, [])
+            )
+
+            for n_id in combined_neighbors:
+                if n_id not in v:
+                    v.add(n_id)
+                    n_node = self.nodes[n_id]
+                    n_dist = self._distance(query_vec, n_node.vector)
+
+                    furthest_w_dist = -w[0][0]
+                    if n_dist < furthest_w_dist or len(w) < ef:
+                        heapq.heappush(candidates, (n_dist, n_id))
+                        heapq.heappush(w, (-n_dist, n_id))
+                        if len(w) > ef:
+                            heapq.heappop(w)
+
+        # Return sorted list of (dist, node_id) ascending
+        result = [(-item[0], item[1]) for item in w]
+        result.sort(key=lambda x: x[0])
+        return result
+
+    @staticmethod
+    def _select_neighbors(candidates: list[tuple[float, str]], max_m: int) -> list[str]:
+        """Simple heuristic neighbor selection."""
+        sorted_cands = sorted(candidates, key=lambda x: x[0])
+        seen = set()
+        chosen = []
+        for _dist, nid in sorted_cands:
+            if nid not in seen:
+                seen.add(nid)
+                chosen.append(nid)
+            if len(chosen) >= max_m:
+                break
+        return chosen
+
+    def search(
+        self,
+        query_vector: np.ndarray,
+        k: int = 10,
+        filter_fn: Callable[[dict[str, Any]], bool] | None = None,
+        ef_search: int = 32,
+    ) -> list[tuple[str, float, dict[str, Any]]]:
+        """Execute payload-constrained nearest-neighbor search.
+
+        Returns list of tuples: (node_id, cosine_similarity, metadata).
+        Guarantees path navigation across filtered subsets via explicit attribute bridges.
+        """
+        if not self.nodes or self.enter_node_id is None:
+            return []
+
+        q_vec = np.asarray(query_vector, dtype=np.float64)
+        if q_vec.shape[-1] != self.dim:
+            if q_vec.shape[-1] < self.dim:
+                padded = np.zeros(self.dim, dtype=np.float64)
+                padded[: q_vec.shape[-1]] = q_vec
+                q_vec = padded
+            else:
+                q_vec = q_vec[: self.dim]
+
+        curr_obj = self.enter_node_id
+
+        # 1. Traverse top levels to entry level 0
+        for lv in range(self.max_level, 0, -1):
+            changed = True
+            curr_dist = self._distance(q_vec, self.nodes[curr_obj].vector)
+            while changed:
+                changed = False
+                all_neighbors = list(self.nodes[curr_obj].neighbors.get(lv, [])) + list(
+                    self.nodes[curr_obj].bridge_neighbors.get(lv, [])
+                )
+                for n_id in all_neighbors:
+                    d = self._distance(q_vec, self.nodes[n_id].vector)
+                    if d < curr_dist:
+                        curr_dist = d
+                        curr_obj = n_id
+                        changed = True
+
+        # 2. Bottom layer beam search
+        ef = max(ef_search, k * 2)
+        candidates = self._search_layer(q_vec, [curr_obj], ef, level=0, filter_fn=filter_fn)
+
+        # 3. Filter candidates if predicate specified
+        matched: list[tuple[str, float, dict[str, Any]]] = []
+        for dist, nid in candidates:
+            node = self.nodes[nid]
+            if filter_fn is None or filter_fn(node.metadata):
+                sim = max(0.0, 1.0 - dist)
+                matched.append((nid, sim, node.metadata))
+            if len(matched) >= k:
+                break
+
+        # If strict filter yielded fewer than k due to high selectivity, do attribute-directed recovery
+        if len(matched) < k and filter_fn is not None:
+            for nid, node in self.nodes.items():
+                if any(m[0] == nid for m in matched):
+                    continue
+                if filter_fn(node.metadata):
+                    dist = self._distance(q_vec, node.vector)
+                    sim = max(0.0, 1.0 - dist)
+                    matched.append((nid, sim, node.metadata))
+            matched.sort(key=lambda x: x[1], reverse=True)
+
+        return matched[:k]
+
+
 __all__ = [
     "ModuleNode",
     "RepoContextGraph",
@@ -319,5 +617,6 @@ __all__ = [
     "AgentNode",
     "AgentDependencyGraph",
     "AgentGraphBuilder",
+    "HNSWNode",
+    "FilterableHNSWIndex",
 ]
-

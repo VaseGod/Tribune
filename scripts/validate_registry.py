@@ -43,6 +43,7 @@ class Candidate(BaseModel):
     serving: list[Serving]
     quant_formats: list[str] = Field(default_factory=list)
     context_window: int
+    tier: int | None = None
     measured_kappa: float | None = None
     measured_cost_per_task: float | None = None
     promo_end_date: str | None = None
@@ -79,6 +80,10 @@ class ProviderSpec(BaseModel):
     spec_type: str | None = None
     spec_draft_max: int | None = None
     kv_quant_type: str | None = None
+    tier: int | None = None
+    sla_p95_ms: float | None = None
+    fallback_model: str | None = None
+    speculative_drafter: str | None = None
 
 
 class Registry(BaseModel):
@@ -91,7 +96,6 @@ class Registry(BaseModel):
     providers: dict[str, ProviderSpec] | None = None
     muse_glimmer_local: dict | None = None
     qwen3_8_27b_local: dict | None = None
-
 
     @model_validator(mode="after")
     def _unique_ids(self) -> Registry:

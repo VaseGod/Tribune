@@ -5,11 +5,9 @@ from __future__ import annotations
 import unittest
 
 from tribune.governance.action_gate import (
-    ActionBlocked,
     ActionGate,
     GateDecisionType,
     GateSeverity,
-    PreConditionError,
     SecurityViolationError,
     SupervisorSignature,
 )
