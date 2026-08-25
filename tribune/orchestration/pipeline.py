@@ -478,6 +478,9 @@ class CasePipeline:
             recorder=self.recorder,
         )
 
+        # Failure telemetry buffer for continual harness evolution
+        self.failure_telemetry: list[dict[str, Any]] = []
+
         # Plugins
         self._plugins: list[PipelinePlugin] = []
         if plugins is not None:
@@ -489,9 +492,22 @@ class CasePipeline:
             self._plugins.append(ToolCachePlugin(self.tool_cache))
             self._plugins.append(GovernanceJudgePlugin(self.audit))
 
+    def record_failure_trace(self, trace: dict[str, Any]) -> None:
+        """Record an execution failure or governance violation trace."""
+        self.failure_telemetry.append(trace)
+
+    def get_failure_telemetry(self) -> list[dict[str, Any]]:
+        """Retrieve all recorded failure telemetry traces."""
+        return list(self.failure_telemetry)
+
+    def clear_failure_telemetry(self) -> None:
+        """Clear recorded failure telemetry traces."""
+        self.failure_telemetry.clear()
+
     def register_plugin(self, plugin: PipelinePlugin) -> None:
         """Register a custom pipeline plugin."""
         self._plugins.append(plugin)
+
 
     def _save_milestone_checkpoint(
         self,
@@ -621,6 +637,14 @@ class CasePipeline:
                     result.citation_latency_ms = max(result.citation_latency_ms, outcome.citation_latency_ms)
                     result.llm_latency_ms += outcome.llm_latency_ms
 
+                    # Capture verifier failure telemetry if uncertified or has discrepancies
+                    if outcome.verdict and outcome.assessment:
+                        fail_payload = self.verifier.extract_failure_payload(outcome.assessment, outcome.verdict)
+                        if fail_payload:
+                            fail_payload["task_id"] = task.task_id
+                            self.record_failure_trace(fail_payload)
+                            result.failure_traces.append(fail_payload)
+
                     trajectory = trajectory.append(
                         outcome.final_state,
                         "state_machine",
@@ -629,6 +653,17 @@ class CasePipeline:
                     )
                     self.partitions.merge_subagent(subagent_partition, partition)
                 except Exception as exc:
+                    fail_payload = {
+                        "case_id": case.case_id,
+                        "program": program.value,
+                        "agent_id": "state_machine",
+                        "category": "governance_violation" if "ActionBlocked" in type(exc).__name__ or "Security" in type(exc).__name__ else "general_failure",
+                        "error_message": str(exc),
+                        "task_id": task.task_id,
+                    }
+                    self.record_failure_trace(fail_payload)
+                    result.failure_traces.append(fail_payload)
+
                     self.audit.append(
                         case.case_id,
                         SMState.ABSTAIN,
@@ -645,6 +680,13 @@ class CasePipeline:
                     outcome = ProgramOutcome(
                         program=program, abstained=True, final_state=SMState.ABSTAIN
                     )
+
+                # Capture any ActionGate failure payloads
+                if hasattr(self.preparer, "action_gate"):
+                    for gate_fail in self.preparer.action_gate.get_failure_payloads():
+                        if gate_fail not in result.failure_traces:
+                            self.record_failure_trace(gate_fail)
+                            result.failure_traces.append(gate_fail)
 
                 outcome.usage = self.recorder.finish_task()
                 result.outcomes.append(outcome)
@@ -663,6 +705,7 @@ class CasePipeline:
             self.runner.run(dag, executor)
             result.total_latency_ms = (time.perf_counter() - start_t) * 1000.0
             result.audit = self.audit.records(case.case_id)
+
 
             if self.workspace:
                 result.workspace_version = self.workspace.version
@@ -784,6 +827,14 @@ class CasePipeline:
                     result.citation_latency_ms = max(result.citation_latency_ms, outcome.citation_latency_ms)
                     result.llm_latency_ms += outcome.llm_latency_ms
 
+                    # Capture verifier failure telemetry if uncertified or has discrepancies
+                    if outcome.verdict and outcome.assessment:
+                        fail_payload = self.verifier.extract_failure_payload(outcome.assessment, outcome.verdict)
+                        if fail_payload:
+                            fail_payload["task_id"] = task.task_id
+                            self.record_failure_trace(fail_payload)
+                            result.failure_traces.append(fail_payload)
+
                     trajectory = trajectory.append(
                         outcome.final_state,
                         "state_machine",
@@ -792,6 +843,17 @@ class CasePipeline:
                     )
                     self.partitions.merge_subagent(subagent_partition, partition)
                 except Exception as exc:
+                    fail_payload = {
+                        "case_id": case.case_id,
+                        "program": program.value,
+                        "agent_id": "state_machine",
+                        "category": "governance_violation" if "ActionBlocked" in type(exc).__name__ or "Security" in type(exc).__name__ else "general_failure",
+                        "error_message": str(exc),
+                        "task_id": task.task_id,
+                    }
+                    self.record_failure_trace(fail_payload)
+                    result.failure_traces.append(fail_payload)
+
                     self.audit.append(
                         case.case_id,
                         SMState.ABSTAIN,
@@ -808,6 +870,14 @@ class CasePipeline:
                     outcome = ProgramOutcome(
                         program=program, abstained=True, final_state=SMState.ABSTAIN
                     )
+
+                # Capture any ActionGate failure payloads
+                if hasattr(self.preparer, "action_gate"):
+                    for gate_fail in self.preparer.action_gate.get_failure_payloads():
+                        if gate_fail not in result.failure_traces:
+                            self.record_failure_trace(gate_fail)
+                            result.failure_traces.append(gate_fail)
+
 
                 outcome.usage = self.recorder.finish_task()
                 result.outcomes.append(outcome)

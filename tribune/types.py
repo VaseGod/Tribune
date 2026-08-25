@@ -566,6 +566,7 @@ class CaseRunResult(BaseModel):
     total_latency_ms: float = 0.0
     workspace_version: int = 0
     token_reduction: TokenReductionMetric | None = None
+    failure_traces: list[dict[str, Any]] = Field(default_factory=list)
 
     def outcome_for(self, program: ProgramId) -> ProgramOutcome | None:
         for o in self.outcomes:
@@ -642,4 +643,79 @@ class TokenReductionMetric(BaseModel):
     agent_count: int
     patch_volume_bytes: int
     state_size_bytes: int
+
+
+# --------------------------------------------------------------------------- #
+# Guarded Harness Evolution & Failure Telemetry Models
+# --------------------------------------------------------------------------- #
+
+
+class FailureCategory(str, enum.Enum):
+    GOVERNANCE_VIOLATION = "governance_violation"
+    CITATION_MISMATCH = "citation_mismatch"
+    PREDICATE_ERROR = "predicate_error"
+    SCHEMA_DEVIATION = "schema_deviation"
+    BOUNDARY_CONFLICT = "boundary_conflict"
+    HALLUCINATION_MONOLOGUE = "hallucination_monologue"
+    COVERAGE_GAP = "coverage_gap"
+    GENERAL_FAILURE = "general_failure"
+
+
+class FailureTrace(StrictModel):
+    """Structured failure execution trace emitted during agent/state machine pipeline runs."""
+
+    trace_id: str
+    case_id: str
+    program: ProgramId | None = None
+    agent_id: str = "unknown"
+    category: FailureCategory = FailureCategory.GENERAL_FAILURE
+    error_message: str = ""
+    context_data: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class PatchType(str, enum.Enum):
+    PROMPT_REFINEMENT = "prompt_refinement"
+    ROUTING_ADJUSTMENT = "routing_adjustment"
+    GUARDRAIL_TUNING = "guardrail_tuning"
+    CRITERIA_CLARIFICATION = "criteria_clarification"
+
+
+class PatchStatus(str, enum.Enum):
+    PROPOSED = "proposed"
+    CANARY_TESTED = "canary_tested"
+    PROMOTED = "promoted"
+    REJECTED = "rejected"
+    ROLLED_BACK = "rolled_back"
+
+
+class AgentHarnessPatch(StrictModel):
+    """Candidate prompt modification or routing adjustment patch for target agent harnesses."""
+
+    patch_id: str
+    target_agent: str
+    target_program: ProgramId | None = None
+    patch_type: PatchType = PatchType.PROMPT_REFINEMENT
+    description: str = ""
+    original_prompt_template: str = ""
+    patched_prompt_template: str = ""
+    routing_overrides: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = ""
+    version: int = 1
+    status: PatchStatus = PatchStatus.PROPOSED
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PromotionMetrics(StrictModel):
+    """Evaluation metrics determining whether a candidate harness patch cleared promotion gating."""
+
+    baseline_parity_ratio: float = 1.0
+    canary_passed: bool = True
+    confidently_wrong_count: int = 0
+    citation_accuracy: float = 1.0
+    abstention_recall: float = 1.0
+    governance_regressions: int = 0
+    approved: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
 

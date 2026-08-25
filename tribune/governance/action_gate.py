@@ -211,6 +211,43 @@ class ActionGate:
             "statutory_evaluator",
             "rule_lookup",
         ]
+        self.violations_log: list[GateDecision] = []
+        self.failure_payloads: list[dict[str, Any]] = []
+
+    def record_violation_telemetry(
+        self,
+        decision: GateDecision,
+        case_id: str = "global",
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record structured failure telemetry from a security or precondition violation."""
+        self.violations_log.append(decision)
+        payload = {
+            "case_id": case_id,
+            "agent_id": decision.agent_id,
+            "action_type": decision.action_type,
+            "decision": decision.decision.value,
+            "severity": decision.severity.value,
+            "matched_rules": list(decision.matched_rules),
+            "reasons": list(decision.reasons),
+            "evidence_spans": list(decision.evidence_spans),
+            "remediation_hint": decision.remediation_hint,
+            "details": details or {},
+            "timestamp": decision.timestamp.isoformat() if hasattr(decision.timestamp, "isoformat") else str(decision.timestamp),
+        }
+        self.failure_payloads.append(payload)
+        return payload
+
+    def get_recent_violations(self) -> list[GateDecision]:
+        return list(self.violations_log)
+
+    def get_failure_payloads(self) -> list[dict[str, Any]]:
+        return list(self.failure_payloads)
+
+    def clear_violations(self) -> None:
+        self.violations_log.clear()
+        self.failure_payloads.clear()
+
 
     def evaluate_text_patterns(
         self,

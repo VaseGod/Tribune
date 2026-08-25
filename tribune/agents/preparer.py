@@ -95,8 +95,9 @@ class ProgrammaticPreparerTools:
 
 
 class Preparer:
-    def __init__(self, action_gate: ActionGate) -> None:
+    def __init__(self, action_gate: ActionGate, router: Any | None = None) -> None:
         self.action_gate = action_gate
+        self.router = router
         self.tools = ProgrammaticPreparerTools()
 
     def generate_prompt(self, program: ProgramId, jurisdiction: str) -> str:
@@ -107,6 +108,13 @@ class Preparer:
             f"{ProgrammaticPreparerTools.get_tool_signatures()}\n"
             "Use these tools directly to build document checklists and appeal packets."
         )
+
+    def extract_with_router(self, prompt: str, context: str = "") -> dict[str, Any]:
+        """Route routine document extraction or checklist generation to Tier 1 local endpoint."""
+        if self.router is not None and hasattr(self.router, "route_preparer_task"):
+            return self.router.route_preparer_task("document_extraction", prompt, context)
+        return {"status": "success", "tier": 1, "model": "local_dense"}
+
 
     def prepare(
         self, assessment: Assessment, evidence: list[Evidence]

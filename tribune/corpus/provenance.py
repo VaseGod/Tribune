@@ -56,3 +56,63 @@ def make_provenance(
         content_hash=content_hash(text),
         notes=notes,
     )
+
+
+from datetime import datetime, timezone
+from typing import Any
+from pydantic import Field
+from ..types import StrictModel
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class FactInjectionRecord(StrictModel):
+    """Provenance-tracked deterministic statutory fact injected dynamically from Engram RAM into agent workspace."""
+
+    fact_key: str
+    exact_value: Any
+    citation_id: str
+    statute_source: str
+    content_hash: str
+    provenance: Provenance
+    notes: str = ""
+    injected_at: datetime = Field(default_factory=_utcnow)
+
+
+def make_injected_fact(
+    fact_key: str,
+    exact_value: Any,
+    citation_id: str,
+    statute_source: str,
+    notes: str = "",
+) -> FactInjectionRecord:
+    """Create a provenance-tracked fact injection record for Engram RAM lookups."""
+    raw_repr = f"{fact_key}:{exact_value}:{citation_id}:{statute_source}"
+    prov = make_provenance(
+        source_doc_id=f"engram_ram::{statute_source.replace(' ', '_')}",
+        ingest_method=IngestMethod.STRUCTURED,
+        text=raw_repr,
+        anonymized=False,
+        notes=f"Injected from Engram RAM table for {fact_key}",
+    )
+    return FactInjectionRecord(
+        fact_key=fact_key,
+        exact_value=exact_value,
+        citation_id=citation_id,
+        statute_source=statute_source,
+        content_hash=content_hash(raw_repr),
+        provenance=prov,
+        notes=notes,
+    )
+
+
+__all__ = [
+    "anonymize",
+    "content_hash",
+    "make_provenance",
+    "FactInjectionRecord",
+    "make_injected_fact",
+]
+

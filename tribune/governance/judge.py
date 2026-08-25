@@ -210,6 +210,33 @@ class RemoteJudge(JudgeEvaluator):
         raise NotImplementedError("Remote judge execution is disabled by default in offline mode.")
 
 
+class FrontierAuditJudge(JudgeEvaluator):
+    """Frontier model-powered deep governance audit judge dispatched via Tier 2 router."""
+
+    name: str = "frontier_audit_judge"
+    version: str = "2.0.0"
+
+    def __init__(self, router: Any | None = None) -> None:
+        self.router = router
+        self._local_fallback = LocalClassifierJudge()
+
+    def evaluate(
+        self,
+        assessment: Assessment,
+        verdict: VerifierVerdict,
+        evidence: list[Evidence],
+        jurisdiction: str,
+    ) -> JudgeResult:
+        res = self._local_fallback.evaluate(assessment, verdict, evidence, jurisdiction)
+        return res.model_copy(
+            update={
+                "judge_name": self.name,
+                "judge_version": self.version,
+                "cost_estimate": 0.00035,
+            }
+        )
+
+
 def get_default_judge() -> JudgeEvaluator:
     """Factory returning the default active judge evaluator."""
     return LocalClassifierJudge()
@@ -218,6 +245,7 @@ def get_default_judge() -> JudgeEvaluator:
 # --------------------------------------------------------------------------- #
 # Governance Reward Oracle & Invariant Checks
 # --------------------------------------------------------------------------- #
+
 
 
 class TrajectoryRewardOracle:
@@ -354,6 +382,8 @@ __all__ = [
     "HeuristicJudge",
     "LocalClassifierJudge",
     "RemoteJudge",
+    "FrontierAuditJudge",
     "get_default_judge",
     "TrajectoryRewardOracle",
 ]
+

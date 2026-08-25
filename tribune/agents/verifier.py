@@ -109,11 +109,20 @@ class Verifier:
         provider: ModelProvider,
         rule_store: RuleStore,
         target_engine: str = "gpt-5.6-sol-ultrafast",
+        router: Any | None = None,
     ) -> None:
         self.provider = provider
         self.rule_store = rule_store
         self.target_engine = target_engine
+        self.router = router
         self.tools = ProgrammaticVerifierTools()
+
+    def review_with_router(self, req: ReviewRequest) -> ReviewResult:
+        """Route verifier review request to Tier 2 frontier endpoint if router configured."""
+        if self.router is not None and hasattr(self.router, "route_verifier_task"):
+            return self.router.route_verifier_task(req)
+        return self.provider.review_assessment(req)
+
 
     @staticmethod
     def parse_visible_response(text: str) -> str:
@@ -488,6 +497,46 @@ class Verifier:
             trajectory_steps=report.milestone_steps,
         )
 
+    def extract_failure_payload(
+        self,
+        assessment: Assessment,
+        verdict: VerifierVerdict,
+        report: VerificationReport | None = None,
+    ) -> dict[str, Any] | None:
+        """Extract structured failure telemetry payload from uncertified verdict or report."""
+        if verdict.approved and (report is None or report.is_certified):
+            return None
+
+        missing = list(verdict.missing_citations)
+        unsupported = list(verdict.unsupported_claims)
+        incomplete = list(verdict.incomplete_coverage)
+        reasons = list(verdict.reasons)
+        violated_rules = list(report.violated_rule_ids) if report else []
+
+        category = "general_failure"
+        if missing:
+            category = "citation_mismatch"
+        elif unsupported or violated_rules:
+            category = "predicate_error"
+        elif incomplete:
+            category = "coverage_gap"
+
+        return {
+            "case_id": assessment.case_id,
+            "assessment_id": assessment.assessment_id,
+            "program": assessment.program.value,
+            "agent_id": "verifier",
+            "category": category,
+            "asserted_status": assessment.status.value,
+            "recomputed_status": verdict.recomputed_status.value,
+            "missing_citations": missing,
+            "unsupported_claims": unsupported,
+            "incomplete_coverage": incomplete,
+            "violated_rule_ids": violated_rules,
+            "self_testing_score": verdict.self_testing_score,
+            "reasons": reasons,
+        }
+
 
 __all__ = [
     "VerificationReport",
@@ -495,3 +544,4 @@ __all__ = [
     "Verifier",
     "ProgrammaticVerifierTools",
 ]
+

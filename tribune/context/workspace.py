@@ -15,6 +15,7 @@ import copy
 import gzip
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -434,6 +435,96 @@ class WorkspaceContext:
                 state_size_bytes=state_bytes,
             )
 
+    def gist_statutory_context(self, program: str, rules_summary: list[dict[str, Any]] | None = None) -> str:
+        """Compress static statutory rules into a dense semantic digest before model injection."""
+        with self._lock:
+            self._touch()
+            gister = StatutoryContextGister()
+            return gister.gist_program_rules(program, self.jurisdiction, rules_summary or [])
+
+    def compress_prompt_preamble(self, text: str, target_ratio: float = 0.45) -> str:
+        """Compress static statutory preambles into dense gist representations."""
+        with self._lock:
+            self._touch()
+            gister = StatutoryContextGister()
+            return gister.compress_preamble(text, target_ratio)
+
+
+# --------------------------------------------------------------------------- #
+# Prompt Gisting & Statutory Context Compressor
+# --------------------------------------------------------------------------- #
+
+
+class StatutoryContextGister:
+    """Compresses lengthy statutory rules into structured semantic digests to eliminate prompt bloat.
+
+    Preserves exact numeric matrices, boolean predicates, and statutory citation anchors
+    while stripping legal boilerplate, preambles, and bureaucratic language.
+    """
+
+    _BOILERPLATE_PATTERNS = [
+        re.compile(r"pursuant\s+to\s+(?:the\s+provisions\s+of\s+)?(?:section|title|part|\d+)", re.IGNORECASE),
+        re.compile(r"notwithstanding\s+(?:any\s+other\s+provision\s+of\s+law|anything\s+to\s+the\s+contrary)", re.IGNORECASE),
+        re.compile(r"it\s+is\s+hereby\s+(?:enacted|provided|ordered)\s+that", re.IGNORECASE),
+        re.compile(r"for\s+the\s+purposes\s+of\s+this\s+(?:subpart|section|regulation)", re.IGNORECASE),
+        re.compile(r"in\s+accordance\s+with\s+(?:federal|state)\s+guidelines", re.IGNORECASE),
+    ]
+
+    def compress_preamble(self, text: str, target_ratio: float = 0.45) -> str:
+        """Remove legal filler while keeping core thresholds, citations, and predicates."""
+        if not text:
+            return ""
+
+        cleaned = text
+        for pat in self._BOILERPLATE_PATTERNS:
+            cleaned = pat.sub("", cleaned)
+
+        # Collapse excess whitespace
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        # Extract sentences with quantitative/statutory anchors
+        sentences = [s.strip() for s in re.split(r"[.\n]", cleaned) if s.strip()]
+        retained = []
+        for s in sentences:
+            # Retain sentences containing numbers, percentages, CFR/USC citations, or key status keywords
+            if (
+                re.search(r"\b(?:\d+|%|\$|CFR|USC|FPL|AMI|SNAP|Medicaid|Housing|Unemployment)\b", s, re.IGNORECASE)
+                or any(k in s.lower() for k in ("eligible", "ineligible", "limit", "asset", "gross", "income", "window"))
+            ):
+                retained.append(s)
+
+        if not retained:
+            retained = sentences[:max(1, int(len(sentences) * target_ratio))]
+
+        return ". ".join(retained) + ("." if retained else "")
+
+    def gist_program_rules(self, program: str, jurisdiction: str, rules_list: list[dict[str, Any]]) -> str:
+        """Formulate a dense structured semantic digest for program rules."""
+        lines = [f"[STATUTORY-GIST: {program.upper()} | JURISDICTION={jurisdiction}]"]
+        for r in rules_list:
+            cid = r.get("criterion_id", "rule")
+            title = r.get("title", "")
+            req = "REQ" if r.get("required", True) else "OPT"
+            cit = r.get("citation", "")
+            desc = r.get("description", "")
+            # Dense single-line format
+            lines.append(f"• {cid} [{req}] {title}: {desc} ({cit})".strip())
+        return "\n".join(lines)
+
+    def calculate_compression_metrics(self, raw_text: str, gisted_text: str) -> dict[str, Any]:
+        """Calculate token volume reduction and compression ratio."""
+        raw_tokens = max(1, len(raw_text) // 4)
+        gist_tokens = max(1, len(gisted_text) // 4)
+        saved = max(0, raw_tokens - gist_tokens)
+        ratio = round(gist_tokens / raw_tokens, 4)
+        return {
+            "raw_tokens": raw_tokens,
+            "gisted_tokens": gist_tokens,
+            "tokens_saved": saved,
+            "compression_ratio": ratio,
+            "reduction_percentage": round((1.0 - ratio) * 100.0, 2),
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Automated Session State Offloader (DiskBackedSessionManager)
@@ -443,6 +534,7 @@ class WorkspaceContext:
 @dataclass
 class SessionStub:
     """Lightweight in-memory reference to an offloaded/spilled session."""
+
 
     case_id: str
     jurisdiction: str
@@ -602,6 +694,7 @@ class DiskBackedSessionManager:
 __all__ = [
     "WorkspaceState",
     "WorkspaceContext",
+    "StatutoryContextGister",
     "PatchValidationError",
     "VersionConflictError",
     "SessionStub",

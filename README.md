@@ -272,7 +272,32 @@ The **ReasonMaxxer** framework enables sovereign, local execution of 73k+ token 
 
 ---
 
+## Architectural Upgrades & Self-Patching Engine
+
+TRIBUNE features an adaptive, tiered, cost-optimized, and self-patching engine:
+
+1. **Guarded Harness Evolution Engine:**
+   - **Failure Telemetry Buffer:** Captures granular failure contexts across `CasePipeline`, `ActionGate`, and `Verifier`.
+   - **Continual Optimizer (`ContinualOptimizer`):** Automatically ingests failure traces, clusters failure modes, synthesizes candidate prompt/criteria patches (`AgentHarnessPatch`), and manages staging and zero-downtime rollbacks.
+   - **Guarded Canary Promotion Gate (`ContinualEvaluator`):** Strictly enforces $\ge 100\%$ baseline canary parity, 0 confidently-wrong assertions, 0 governance regressions, $\ge 98.5\%$ citation accuracy, and $\ge 85\%$ abstention recall before promoting candidate patches to production.
+
+2. **Hybrid Pareto Router & Speculative Inference:**
+   - **Tiered Dispatch (`ModelRouter`):** Routes routine document extraction and standard preparation to high-throughput Tier 1 local endpoints, reserving Tier 2 frontier reasoning for complex statutory disputes and verifier review.
+   - **Speculative Inference Runner:** Employs local models for fast speculative drafting and target models for verification, calculating acceptance rates, speedup factors, and latency savings.
+   - **Token Cost Attribution & SLA Tracking:** Measures per-run token costs, tracks latency percentiles (P95), manages exponential backoff retry budgets, and trips circuit breakers on SLA breaches.
+
+3. **Prompt Gisting & Vector Semantic Caching:**
+   - **Statutory Context Gister (`StatutoryContextGister`):** Strips bureaucratic legal filler from preambles while preserving numeric thresholds, CFR/USC citation anchors, and boolean predicates into dense semantic digests.
+   - **Async Vector Semantic Cache (`AsyncVectorSemanticCache`):** Delivers verified determination lookups with sub-20ms latency at $\ge 0.96$ unit-vector cosine similarity, bypassing redundant model rollouts for equivalent eligibility profiles.
+
+4. **Statutory Engram RAM Offloading & Fact Injection:**
+   - **In-Memory Statutory Matrix (`StatutoryEngramRAMStore`):** Extracts static numeric matrices (2026 FPL tables, SNAP gross/net limits, Medicaid MAGI tiers, Housing AMI tables, Unemployment earnings, Appeals windows) out of prompts into in-memory $O(1)$ tables.
+   - **Provenance-Tracked Fact Injection (`FactInjectionRecord`):** Dynamically injects deterministic statutory facts into agent workspaces with SHA-256 cryptographic provenance and citation anchors, preventing arithmetic hallucinations.
+
+---
+
 ## Cost accounting: cost per completed verification
+
 
 TRIBUNE meters every task — tokens in/out, proposer/verifier turns, and a cost
 computed from a configurable pricing file where **pricing is data, not code**

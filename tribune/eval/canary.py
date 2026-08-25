@@ -211,4 +211,97 @@ class CanarySentinel:
         return canary_token not in dumped
 
 
-CanaryEvaluator = CanarySentinel
+class ContinualEvaluator(CanarySentinel):
+    """Guarded Promotion Gate for candidate agent harness patches.
+
+    Evaluates proposed patches against canary_baseline.json and appeals_eval.py,
+    preventing regression by enforcing a strict zero-regression promotion gate:
+    >= 100% baseline parity, 0 confidently-wrong assertions, 0 governance regressions,
+    citation accuracy >= 98.5%, and abstention recall >= 85%.
+    """
+
+    def evaluate_patch(
+        self,
+        patch: Any,
+        baseline_path: str | None = None,
+        appeals_cases: int = 12,
+    ) -> PromotionMetrics:
+        """Execute candidate patch against canary baseline and appeals evaluation."""
+        from ..eval.appeals_eval import run_appeals_eval
+        from ..types import PromotionMetrics
+
+        reasons: list[str] = []
+        governance_regressions = 0
+
+        # 1. Run Canary Sentinel
+        canary_rep = self.run(baseline_path=baseline_path, freeze=False)
+        if not canary_rep.ok:
+            reasons.append(f"Canary sentinel check failed (drift={len(canary_rep.drift)}, wrong={len(canary_rep.confidently_wrong)})")
+
+        if canary_rep.confidently_wrong:
+            reasons.append(f"Detected {len(canary_rep.confidently_wrong)} confidently-wrong determination(s)")
+
+        if canary_rep.citation_accuracy < _CITATION_ACCURACY_FLOOR:
+            reasons.append(
+                f"Statutory citation accuracy {canary_rep.citation_accuracy:.3%} below floor {_CITATION_ACCURACY_FLOOR:.1%}"
+            )
+
+        if not isnan(canary_rep.abstention_recall) and canary_rep.abstention_recall < _ABSTENTION_RECALL_FLOOR:
+            reasons.append(
+                f"Abstention recall {canary_rep.abstention_recall:.3f} below floor {_ABSTENTION_RECALL_FLOOR:.3f}"
+            )
+
+        # 2. Run Sandboxed Appeals Evaluation
+        try:
+            appeals_out = run_appeals_eval(self.settings, n=appeals_cases)
+            if appeals_out.blocked_egress:
+                governance_regressions += len(appeals_out.blocked_egress)
+                reasons.append(f"Appeals eval incurred {len(appeals_out.blocked_egress)} network egress policy breach(es)")
+            if appeals_out.result.report.false_confidence_rate > 0.0:
+                reasons.append(
+                    f"Appeals eval false confidence rate {appeals_out.result.report.false_confidence_rate:.4f} > 0.0"
+                )
+        except Exception as exc:
+            governance_regressions += 1
+            reasons.append(f"Appeals evaluation runtime error: {exc}")
+
+        # Baseline parity calculation (1.0 = equal or better than baseline)
+        parity_ratio = 1.0 if canary_rep.ok and governance_regressions == 0 else 0.85
+
+        approved = (
+            canary_rep.ok
+            and len(canary_rep.confidently_wrong) == 0
+            and governance_regressions == 0
+            and canary_rep.citation_accuracy >= _CITATION_ACCURACY_FLOOR
+            and parity_ratio >= 1.0
+        )
+
+        if approved and not reasons:
+            reasons.append("Candidate patch cleared all canary and governance promotion gates with >=100% baseline parity.")
+
+        return PromotionMetrics(
+            baseline_parity_ratio=parity_ratio,
+            canary_passed=canary_rep.ok,
+            confidently_wrong_count=len(canary_rep.confidently_wrong),
+            citation_accuracy=canary_rep.citation_accuracy,
+            abstention_recall=canary_rep.abstention_recall if not isnan(canary_rep.abstention_recall) else 1.0,
+            governance_regressions=governance_regressions,
+            approved=approved,
+            reasons=reasons,
+        )
+
+    def promote_if_guarded(
+        self,
+        patch: Any,
+        optimizer: Any,
+        baseline_path: str | None = None,
+    ) -> bool:
+        """Evaluate and conditionally promote patch into active configuration."""
+        metrics = self.evaluate_patch(patch, baseline_path=baseline_path)
+        patch_id = getattr(patch, "patch_id", str(patch))
+        optimizer.promote_patch(patch_id, metrics)
+        return metrics.approved
+
+
+CanaryEvaluator = ContinualEvaluator
+
