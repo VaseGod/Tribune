@@ -237,6 +237,156 @@ class CostModel:
         return pareto_points
 
 
+# --------------------------------------------------------------------------- #
+# Multi-Turn Trajectory Cost Model with Horizon & State Transition Multipliers
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TrajectoryParetoPoint:
+    """A point on the multi-turn trajectory cost-versus-efficiency Pareto frontier."""
+
+    label: str
+    backend_id: str
+    base_cost_per_1k: float
+    effective_cost_per_1k: float
+    turns_per_task: float
+    state_transitions: int
+    accuracy: float
+    parity_score: float
+    cost_savings_pct: float
+    is_pareto_optimal: bool
+    dominated_by: tuple[str, ...] = ()
+
+
+class TrajectoryCostModel:
+    """Multi-turn Trajectory Cost Model with turns-per-task non-linear scaling and state transition overhead.
+
+    Effective Cost = Base Cost * (Turns Per Task)^gamma + State Transition Overhead
+    """
+
+    def __init__(
+        self,
+        base_cost_model: CostModel | None = None,
+        gamma: float = 1.25,
+        state_transition_overhead_usd: float = 0.00005,
+    ) -> None:
+        self.base_cost_model = base_cost_model or default_cost_model()
+        self.gamma = gamma
+        self.state_transition_overhead_usd = state_transition_overhead_usd
+
+    def compute_effective_cost(
+        self,
+        base_cost: float,
+        turns_per_task: int | float,
+        state_transitions: int = 1,
+        gamma: float | None = None,
+        state_overhead: float | None = None,
+    ) -> float:
+        """Calculate effective multi-turn cost incorporating horizon exponent and state overhead."""
+        eff_gamma = gamma if gamma is not None else self.gamma
+        eff_overhead = state_overhead if state_overhead is not None else self.state_transition_overhead_usd
+        turns_multiplier = max(1.0, float(turns_per_task)) ** eff_gamma
+        transition_cost = max(0, state_transitions) * eff_overhead
+        return round((base_cost * turns_multiplier) + transition_cost, 8)
+
+    def cost_of_trajectory(
+        self,
+        task: TaskUsage,
+        on: date,
+        state_transitions: int = 1,
+        gamma: float | None = None,
+    ) -> tuple[float, float, str | None]:
+        """Compute (base_cost, effective_cost, backend_id) for a multi-turn task trajectory."""
+        base_cost, backend_id = self.base_cost_model.cost_of_task(task, on)
+        turns = max(1, task.turns or len(task.calls) or 1)
+        eff_cost = self.compute_effective_cost(
+            base_cost=base_cost,
+            turns_per_task=turns,
+            state_transitions=state_transitions,
+            gamma=gamma,
+        )
+        return base_cost, eff_cost, backend_id
+
+    def compute_trajectory_pareto_frontier(
+        self,
+        points_data: list[dict[str, Any]],
+        reference_label: str = "fp16",
+        gamma: float | None = None,
+    ) -> list[TrajectoryParetoPoint]:
+        """Compute the Pareto frontier under multi-turn trajectory cost modeling."""
+        if not points_data:
+            return []
+
+        eff_gamma = gamma if gamma is not None else self.gamma
+
+        # Precompute effective costs
+        computed_points = []
+        for p in points_data:
+            base_cost = float(p.get("cost_per_1k", p.get("base_cost_per_1k", 1.0)))
+            turns = float(p.get("turns_per_task", 1.0))
+            transitions = int(p.get("state_transitions", 1))
+            eff_cost = self.compute_effective_cost(
+                base_cost=base_cost,
+                turns_per_task=turns,
+                state_transitions=transitions,
+                gamma=eff_gamma,
+            )
+            acc = float(p.get("accuracy", 1.0))
+            par = float(p.get("parity_score", acc))
+            computed_points.append({
+                "label": p["label"],
+                "backend_id": p.get("backend_id", p["label"]),
+                "base_cost": base_cost,
+                "effective_cost": eff_cost,
+                "turns_per_task": turns,
+                "state_transitions": transitions,
+                "accuracy": acc,
+                "parity_score": par,
+            })
+
+        ref_point = next((p for p in computed_points if p["label"] == reference_label), None)
+        ref_cost = ref_point["effective_cost"] if ref_point else (max((p["effective_cost"] for p in computed_points), default=1.0) or 1.0)
+
+        n = len(computed_points)
+        pareto_points: list[TrajectoryParetoPoint] = []
+
+        for i in range(n):
+            p1 = computed_points[i]
+            cost1 = p1["effective_cost"]
+            par1 = p1["parity_score"]
+            savings_pct = max(0.0, (1.0 - (cost1 / ref_cost)) * 100.0) if ref_cost > 0 else 0.0
+
+            dominated_by: list[str] = []
+            for j in range(n):
+                if i == j:
+                    continue
+                p2 = computed_points[j]
+                cost2 = p2["effective_cost"]
+                par2 = p2["parity_score"]
+
+                if cost2 <= cost1 and par2 >= par1 and (cost2 < cost1 or par2 > par1):
+                    dominated_by.append(p2["label"])
+
+            pareto_points.append(
+                TrajectoryParetoPoint(
+                    label=p1["label"],
+                    backend_id=p1["backend_id"],
+                    base_cost_per_1k=round(p1["base_cost"], 6),
+                    effective_cost_per_1k=round(cost1, 6),
+                    turns_per_task=p1["turns_per_task"],
+                    state_transitions=p1["state_transitions"],
+                    accuracy=p1["accuracy"],
+                    parity_score=par1,
+                    cost_savings_pct=round(savings_pct, 2),
+                    is_pareto_optimal=len(dominated_by) == 0,
+                    dominated_by=tuple(dominated_by),
+                )
+            )
+
+        return pareto_points
+
+
 def default_cost_model() -> CostModel:
     """Return the CostModel loaded from the default packaged pricing.json or TRIBUNE_PRICING_PATH."""
     path = os.environ.get("TRIBUNE_PRICING_PATH", _PACKAGED_PRICING)
@@ -248,6 +398,9 @@ __all__ = [
     "BackendPricing",
     "ParetoPoint",
     "CostModel",
+    "TrajectoryParetoPoint",
+    "TrajectoryCostModel",
     "default_cost_model",
 ]
+
 

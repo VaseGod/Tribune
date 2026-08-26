@@ -96,6 +96,9 @@ class Registry(BaseModel):
     providers: dict[str, ProviderSpec] | None = None
     muse_glimmer_local: dict | None = None
     qwen3_8_27b_local: dict | None = None
+    local_moe_qwen_int4: dict | None = None
+    local_moe_mixtral_gguf: dict | None = None
+
 
     @model_validator(mode="after")
     def _unique_ids(self) -> Registry:

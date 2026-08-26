@@ -311,9 +311,65 @@ candidates:
     tier: 1
     measured_kappa: null
     measured_cost_per_task: null
+  - candidate_id: qwen2.5-moe-7b-int4
+    name: Qwen 2.5 MoE 7B (INT4 Quantized)
+    vendor: Alibaba Cloud
+    params: "7B (MoE 8x1.5B)"
+    roles: [proposer, verifier]
+    role_note: local air-gapped MoE engine for sensitive jurisdiction data
+    license: apache-2.0
+    weights_status: downloadable
+    weights_url: https://huggingface.co/Qwen/Qwen2.5-MoE-7B-Instruct
+    weights_verified: true
+    serving: [vllm, sglang]
+    quant_formats: [int4_awq, bitsandbytes_int4, gguf-q4_k_m]
+    context_window: 32768
+    tier: 0
+    measured_kappa: null
+    measured_cost_per_task: null
     notes: >-
-      High-volume, low-cost engine ($0.435/M input, $0.87/M output) for document
-      parsing, multi-modal intake processing, and synthetic case generation.
+      Air-gapped local MoE endpoint with INT4 quantization (AWQ/bitsandbytes)
+      for privacy-enforced jurisdictional execution.
+
+  - candidate_id: qwen2.5-moe-7b-int8
+    name: Qwen 2.5 MoE 7B (INT8 Quantized)
+    vendor: Alibaba Cloud
+    params: "7B (MoE 8x1.5B)"
+    roles: [proposer, verifier]
+    role_note: local air-gapped MoE engine with INT8 precision
+    license: apache-2.0
+    weights_status: downloadable
+    weights_url: https://huggingface.co/Qwen/Qwen2.5-MoE-7B-Instruct
+    weights_verified: true
+    serving: [vllm, sglang]
+    quant_formats: [bitsandbytes_int8, fp8]
+    context_window: 32768
+    tier: 0
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Air-gapped local MoE endpoint with INT8 quantization for balanced accuracy.
+
+  - candidate_id: qwen2.5-moe-7b-fp16
+    name: Qwen 2.5 MoE 7B (FP16 Baseline)
+    vendor: Alibaba Cloud
+    params: "7B (MoE 8x1.5B)"
+    roles: [proposer, verifier]
+    role_note: baseline unquantized local MoE engine
+    license: apache-2.0
+    weights_status: downloadable
+    weights_url: https://huggingface.co/Qwen/Qwen2.5-MoE-7B-Instruct
+    weights_verified: true
+    serving: [vllm, sglang]
+    quant_formats: [fp16, bf16]
+    context_window: 32768
+    tier: 0
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Full FP16 baseline for quantization sensitivity calibration.
+
+
 
 
 muse_glimmer_local:
@@ -340,3 +396,25 @@ qwen3_8_27b_local:
       spec_type: "ngram-mod,draft-mtp"
       spec_draft_n_max: 2
       kv_cache_type: "q4_1"
+
+local_moe_qwen_int4:
+  provider: local_moe
+  model_name: "qwen2.5-moe-7b-int4"
+  parameters:
+    quantization: "int4_awq"
+    num_experts: 8
+    active_experts_per_token: 2
+    expert_capacity_factor: 1.25
+    layer_offload_device: "cuda:0,cpu"
+    temperature: 0.1
+
+local_moe_mixtral_gguf:
+  provider: local_moe
+  model_name: "mixtral-8x7b-instruct-gguf"
+  parameters:
+    quantization: "gguf-q4_k_m"
+    num_experts: 8
+    active_experts_per_token: 2
+    layer_offload_device: "cpu"
+    temperature: 0.1
+

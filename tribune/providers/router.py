@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from ..config import TribuneSettings, get_settings
+from ..eval.costmodel import TrajectoryCostModel, default_cost_model
 from ..instrumentation.usage import UsageRecorder
 from .base import (
     ModelProvider,
@@ -43,6 +44,22 @@ from .openai_compat import OpenAICompatProvider
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class TrajectoryRoutingDecision:
+    """Routing decision incorporating multi-turn horizon efficiency and state transition overhead."""
+
+    tier: int
+    model: str
+    horizon_mode: str  # "high_horizon" | "standard" | "sovereign_local"
+    estimated_turns: int
+    effective_cost_estimate: float
+    state_transitions_planned: int
+    sovereignty_level: str
+    multi_file: bool = False
+    rationale: str = ""
+
 
 
 # --------------------------------------------------------------------------- #
@@ -405,6 +422,8 @@ class ModelRouter:
         self.cost_attributions: list[TokenCostAttribution] = []
         self.retry_budget = RetryBudget()
         self.parity_enforcer = BitwiseParityEnforcer()
+        self.trajectory_cost_model = TrajectoryCostModel()
+
 
         # Stats tracking
         self.stats = {
@@ -590,15 +609,74 @@ class ModelRouter:
         )
         return res
 
+    def route_by_trajectory_efficiency(
+        self,
+        intent: str | None = None,
+        context_length: int = 0,
+        estimated_turns: int = 1,
+        multi_file: bool = False,
+        role: str | None = None,
+        req: SynthesisRequest | ReviewRequest | None = None,
+        sovereignty_level: DataSovereigntyLevel = DataSovereigntyLevel.STANDARD_CLOUD,
+    ) -> TrajectoryRoutingDecision:
+        """Pareto trajectory routing optimizing multi-turn horizon overhead."""
+        if sovereignty_level == DataSovereigntyLevel.AIR_GAPPED_LOCAL:
+            return TrajectoryRoutingDecision(
+                tier=0,
+                model="qwen2.5-distill-legal-7b",
+                horizon_mode="sovereign_local",
+                estimated_turns=estimated_turns,
+                effective_cost_estimate=0.0,
+                state_transitions_planned=estimated_turns,
+                sovereignty_level=sovereignty_level.value,
+                multi_file=multi_file,
+                rationale="Air-gapped local execution mandated for constituent privacy.",
+            )
+
+        tier = self.classify_task(
+            intent=intent,
+            context_length=context_length,
+            role=role,
+            req=req,
+            multi_file=multi_file,
+            estimated_turns=estimated_turns,
+        )
+
+        is_high_horizon = multi_file or estimated_turns >= 3 or context_length > 4000 or tier == 2
+        model_name = self.tier2_model if tier == 2 else (self.local_model_type if tier == 0 else self.tier1_model)
+        horizon_mode = "high_horizon" if is_high_horizon else "standard"
+        state_transitions = 1 if is_high_horizon else estimated_turns
+
+        base_rate = 0.00005 if tier == 1 else (0.00020 if tier == 2 else 0.00001)
+        eff_cost = self.trajectory_cost_model.compute_effective_cost(
+            base_cost=base_rate,
+            turns_per_task=estimated_turns,
+            state_transitions=state_transitions,
+        )
+
+        return TrajectoryRoutingDecision(
+            tier=tier,
+            model=model_name,
+            horizon_mode=horizon_mode,
+            estimated_turns=estimated_turns,
+            effective_cost_estimate=eff_cost,
+            state_transitions_planned=state_transitions,
+            sovereignty_level=sovereignty_level.value,
+            multi_file=multi_file,
+            rationale=f"Selected Tier {tier} ({model_name}) under {horizon_mode} mode (multi_file={multi_file}, turns={estimated_turns}).",
+        )
+
     def classify_task(
         self,
         intent: str | None = None,
         context_length: int = 0,
         role: str | None = None,
         req: SynthesisRequest | ReviewRequest | None = None,
+        multi_file: bool = False,
+        estimated_turns: int = 1,
     ) -> int:
         """Dynamic Pareto tier classification (0, 1, or 2) with SLA circuit-breaker check."""
-        base_tier = self._classify_base_tier(intent, context_length, role, req)
+        base_tier = self._classify_base_tier(intent, context_length, role, req, multi_file=multi_file, estimated_turns=estimated_turns)
 
         tracker = self.sla_trackers.get(base_tier)
         if tracker and not tracker.is_healthy():
@@ -614,7 +692,13 @@ class ModelRouter:
         context_length: int = 0,
         role: str | None = None,
         req: SynthesisRequest | ReviewRequest | None = None,
+        multi_file: bool = False,
+        estimated_turns: int = 1,
     ) -> int:
+        if multi_file or estimated_turns >= 4:
+            # Multi-file case files and deep tool calling sequences prioritize high-horizon Tier 2 frontier model
+            return 2
+
         if not self.enable_reasonmaxxer:
             tier2_intents = {
                 "reasoning",
@@ -686,6 +770,7 @@ class ModelRouter:
             return 1
 
         return 1
+
 
     def route_document_extraction(
         self,
@@ -955,6 +1040,7 @@ class ModelRouter:
 __all__ = [
     "DataSovereigntyLevel",
     "BitwiseParityEnforcer",
+    "TrajectoryRoutingDecision",
     "SpeculativeDraftConfig",
     "TokenCostAttribution",
     "RetryBudget",
@@ -962,3 +1048,4 @@ __all__ = [
     "SLATracker",
     "ModelRouter",
 ]
+

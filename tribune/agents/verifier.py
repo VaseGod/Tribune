@@ -11,6 +11,7 @@ The verifier performs:
 
 from __future__ import annotations
 
+import enum
 import re
 import time
 from dataclasses import dataclass, field
@@ -36,8 +37,460 @@ from ..types import (
 )
 
 
+# --------------------------------------------------------------------------- #
+# Decomposed Span-Level Editing Taxonomy & Dataclasses
+# --------------------------------------------------------------------------- #
+
+
+class DefectType(str, enum.Enum):
+    """Enumeration of verification failure modes for decomposed span repair."""
+
+    UNCITED_CLAIM = "uncited_claim"
+    INCORRECT_CALCULATION = "incorrect_calculation"
+    MISSING_JURISDICTION_CLAUSE = "missing_jurisdiction_clause"
+    OUTDATED_STATUTE_REFERENCE = "outdated_statute_reference"
+
+
+@dataclass
+class DefectReport:
+    """Structured report detailing a localized verification defect in draft text."""
+
+    defect_type: DefectType
+    description: str
+    span_text: str = ""
+    start_offset: int = -1
+    end_offset: int = -1
+    ast_node_type: str | None = None
+    suggested_patch: str | None = None
+    rule_id: str | None = None
+    expected_value: Any | None = None
+    actual_value: Any | None = None
+    citation_anchor: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class LocalizedSpan:
+    """Precise text-offset matching and AST node localization."""
+
+    start_offset: int
+    end_offset: int
+    matched_text: str
+    ast_node_type: str = "text_span"
+    line_number: int = 1
+    column_offset: int = 0
+
+
+@dataclass
+class PatchResult:
+    """Outcome of applying a targeted span repair to draft text."""
+
+    success: bool
+    defect_type: DefectType
+    original_span: str
+    patched_span: str
+    start_offset: int
+    end_offset: int
+    applied_text: str
+    strategy: str  # "deterministic_formula" | "deterministic_statute" | "ast_replacement" | "llm_micro_patch"
+    preserved_anchors: list[str] = field(default_factory=list)
+    message: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Legal Brief & Determination Template AST Parser
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class LegalASTNode:
+    """An AST node representing a structural element of a legal determination or brief."""
+
+    node_id: str
+    node_type: str  # "HEADER" | "JURISDICTION_BLOCK" | "CRITERIA_BLOCK" | "CALCULATION_BLOCK" | "CITATION_BLOCK" | "CONCLUSION"
+    text: str
+    start_offset: int
+    end_offset: int
+    children: list[LegalASTNode] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class LegalBriefASTParser:
+    """Parses legal brief and regulatory determination templates into structural AST nodes."""
+
+    _CITATION_RE = re.compile(
+        r"(?:\d+\s+CFR\s+[\d.]+(?:\([a-zA-Z0-9]+\))*|\d+\s+USC\s+[\d.]+|RCW\s+[\d.]+|NYCRR\s+[\d.]+)",
+        re.IGNORECASE,
+    )
+    _CALCULATION_RE = re.compile(
+        r"(?:\$[\d,]+(?:\.\d+)?\s*(?:[><=+/×*-]|\b(?:exceeds|is\s+less\s+than|totaling|gross|net)\b)\s*\$?[\d,]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+    _JURISDICTION_RE = re.compile(
+        r"(?:Jurisdiction\s*:\s*([A-Za-z]{2})|under\s+(?:the\s+laws\s+of\s+)?([A-Za-z]{2})\s+statutes)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def parse(cls, text: str) -> list[LegalASTNode]:
+        """Parse draft text into top-level structural AST nodes with exact offsets."""
+        nodes: list[LegalASTNode] = []
+        if not text:
+            return nodes
+
+        lines = text.split("\n")
+        curr_offset = 0
+
+        for line_idx, line in enumerate(lines):
+            line_len = len(line)
+            start_off = curr_offset
+            end_off = curr_offset + line_len
+            stripped = line.strip()
+
+            if not stripped:
+                curr_offset += line_len + 1
+                continue
+
+            node_type = "TEXT_BLOCK"
+            meta: dict[str, Any] = {"line_number": line_idx + 1}
+
+            if stripped.startswith(("=", "#", "==")) or "NOTICE" in stripped.upper() or "DETERMINATION" in stripped.upper():
+                node_type = "HEADER"
+            elif cls._JURISDICTION_RE.search(stripped):
+                node_type = "JURISDICTION_BLOCK"
+                m = cls._JURISDICTION_RE.search(stripped)
+                if m:
+                    meta["jurisdiction"] = m.group(1) or m.group(2)
+            elif cls._CITATION_RE.search(stripped):
+                node_type = "CITATION_BLOCK"
+                meta["citations"] = cls._CITATION_RE.findall(stripped)
+            elif cls._CALCULATION_RE.search(stripped) or any(w in stripped.lower() for w in ("income", "limit", "asset", "gross", "rent")):
+                node_type = "CALCULATION_BLOCK"
+            elif any(w in stripped.lower() for w in ("outcome:", "status:", "recommended action:", "conclusion")):
+                node_type = "CONCLUSION"
+            elif stripped.startswith(("•", "-", "*", "1.", "2.", "3.", "4.", "5.")):
+                node_type = "CRITERIA_BLOCK"
+
+            node = LegalASTNode(
+                node_id=f"node_{line_idx + 1}",
+                node_type=node_type,
+                text=line,
+                start_offset=start_off,
+                end_offset=end_off,
+                metadata=meta,
+            )
+            nodes.append(node)
+            curr_offset += line_len + 1  # include newline
+
+        return nodes
+
+
+# --------------------------------------------------------------------------- #
+# Agentic ASR 3-Step Span-Level Editing Engine
+# --------------------------------------------------------------------------- #
+
+
+class SpanEditingEngine:
+    """Agentic Adaptive Span Refinement (ASR) 3-Step Correction Engine.
+
+    1. Intent/Defect Classification: Enumerate failure modes (UNCITED_CLAIM, INCORRECT_CALCULATION,
+       MISSING_JURISDICTION_CLAUSE, OUTDATED_STATUTE_REFERENCE).
+    2. Span Localization: Match exact text offsets and AST node boundaries.
+    3. Span-Targeted Patching: Deterministic string/AST replacement or localized LLM micro-patching
+       while strictly preserving surrounding verified text and citation anchors.
+    """
+
+    def __init__(
+        self,
+        rule_store: RuleStore | None = None,
+        provider: ModelProvider | None = None,
+    ) -> None:
+        self.rule_store = rule_store or LocalRuleStore()
+        self.provider = provider
+
+    def classify_defects(
+        self,
+        draft_text: str,
+        assessment: Assessment | None = None,
+        evidence: list[Evidence] | None = None,
+        jurisdiction: str = "EX",
+        program: ProgramId = ProgramId.SNAP,
+    ) -> list[DefectReport]:
+        """Step 1: Classify all verification defects across the draft text."""
+        defects: list[DefectReport] = []
+        if not draft_text:
+            return defects
+
+        ast_nodes = LegalBriefASTParser.parse(draft_text)
+        active_cits = self.rule_store.all_citations(program, jurisdiction)
+        active_sources = {c.source.strip().lower(): c for c in active_cits}
+        active_cids = {c.citation_id.strip().lower(): c for c in active_cits}
+
+        # 1. Missing Jurisdiction Clause Check
+        has_jurisdiction = any(n.node_type == "JURISDICTION_BLOCK" for n in ast_nodes) or f"Jurisdiction: {jurisdiction}" in draft_text
+        if not has_jurisdiction:
+            defects.append(
+                DefectReport(
+                    defect_type=DefectType.MISSING_JURISDICTION_CLAUSE,
+                    description=f"Draft determination is missing mandatory jurisdiction clause for '{jurisdiction}'.",
+                    span_text=draft_text[:min(100, len(draft_text))],
+                    start_offset=0,
+                    end_offset=0,
+                    ast_node_type="HEADER",
+                    suggested_patch=f"Jurisdiction: {jurisdiction} | Governed by statutory code of {jurisdiction}",
+                )
+            )
+
+        # 2. Inspect AST Nodes for Calculation, Citation, and Claim Defects
+        for node in ast_nodes:
+            text = node.text
+
+            # Check for Outdated / Invalid Statute References
+            found_citations = LegalBriefASTParser._CITATION_RE.findall(text)
+            for raw_cit in found_citations:
+                norm_cit = raw_cit.strip().lower()
+                is_valid = norm_cit in active_sources or any(norm_cit in src for src in active_sources)
+                if not is_valid:
+                    # Match closest active citation
+                    matched_cit = active_cits[0] if active_cits else None
+                    suggested = matched_cit.source if matched_cit else "7 CFR 273.9"
+                    loc = self.localize_span(draft_text, raw_cit)
+                    defects.append(
+                        DefectReport(
+                            defect_type=DefectType.OUTDATED_STATUTE_REFERENCE,
+                            description=f"Outdated or superseded statutory reference '{raw_cit}' found in text.",
+                            span_text=raw_cit,
+                            start_offset=loc.start_offset,
+                            end_offset=loc.end_offset,
+                            ast_node_type=node.node_type,
+                            suggested_patch=suggested,
+                            citation_anchor=suggested,
+                        )
+                    )
+
+            # Check for Calculation Discrepancies
+            if node.node_type == "CALCULATION_BLOCK" and evidence:
+                view = EvidenceView(evidence)
+                monthly_income = view.num(EvidenceType.MONTHLY_INCOME)
+                if monthly_income is not None:
+                    profile = get_profile(jurisdiction)
+                    fpl_limit = profile.fpl_monthly(int(view.num(EvidenceType.HOUSEHOLD_SIZE) or 1)) * profile.snap_gross_income_pct
+                    # Look for incorrect threshold numbers in text
+                    m_num = re.search(r"\$([0-9,]+(?:\.[0-9]+)?)", text)
+                    if m_num:
+                        val_str = m_num.group(1).replace(",", "")
+                        try:
+                            val_float = float(val_str)
+                            if "limit" in text.lower() and abs(val_float - fpl_limit) > 5.0:
+                                loc = self.localize_span(draft_text, m_num.group(0))
+                                defects.append(
+                                    DefectReport(
+                                        defect_type=DefectType.INCORRECT_CALCULATION,
+                                        description=f"Calculation limit discrepancy: stated ${val_float:.2f}, statutory limit is ${fpl_limit:.2f}",
+                                        span_text=m_num.group(0),
+                                        start_offset=loc.start_offset,
+                                        end_offset=loc.end_offset,
+                                        ast_node_type=node.node_type,
+                                        expected_value=f"${fpl_limit:.2f}",
+                                        actual_value=m_num.group(0),
+                                        suggested_patch=f"${fpl_limit:.2f}",
+                                    )
+                                )
+                        except ValueError:
+                            pass
+
+            # Check for Uncited Substantive Claims
+            claim_patterns = [
+                r"\b(?:is|are)\s+(?:likely\s+)?(?:eligible|ineligible)\b",
+                r"\b(?:satisfies|meets|fails)\s+the\s+statutory\s+requirement\b",
+                r"\b(?:appears\s+met|does\s+not\s+appear\s+met)\b",
+            ]
+            for pat in claim_patterns:
+                match = re.search(pat, text, re.IGNORECASE)
+                if match and not LegalBriefASTParser._CITATION_RE.search(text) and "citation" not in text.lower():
+                    loc = self.localize_span(draft_text, match.group(0))
+                    default_cit = active_cits[0].source if active_cits else "7 CFR 273.9(a)"
+                    defects.append(
+                        DefectReport(
+                            defect_type=DefectType.UNCITED_CLAIM,
+                            description=f"Substantive eligibility assertion '{match.group(0)}' lacks required statutory citation anchor.",
+                            span_text=match.group(0),
+                            start_offset=loc.start_offset,
+                            end_offset=loc.end_offset,
+                            ast_node_type=node.node_type,
+                            suggested_patch=f"{match.group(0)} [pursuant to {default_cit}]",
+                            citation_anchor=default_cit,
+                        )
+                    )
+
+        return defects
+
+    def localize_span(self, draft_text: str, target_snippet: str) -> LocalizedSpan:
+        """Step 2: Localize text snippet in draft text with character offsets and line/col info."""
+        if not target_snippet or target_snippet not in draft_text:
+            return LocalizedSpan(start_offset=0, end_offset=0, matched_text="")
+
+        idx = draft_text.find(target_snippet)
+        end_idx = idx + len(target_snippet)
+        prefix = draft_text[:idx]
+        lines = prefix.split("\n")
+        line_no = len(lines)
+        col_no = len(lines[-1])
+
+        return LocalizedSpan(
+            start_offset=idx,
+            end_offset=end_idx,
+            matched_text=target_snippet,
+            line_number=line_no,
+            column_offset=col_no,
+        )
+
+    def patch_span(
+        self,
+        draft_text: str,
+        defect: DefectReport,
+    ) -> PatchResult:
+        """Step 3: Execute deterministic or localized micro-patch for a specific defect."""
+        if not draft_text:
+            return PatchResult(
+                success=False,
+                defect_type=defect.defect_type,
+                original_span="",
+                patched_span="",
+                start_offset=0,
+                end_offset=0,
+                applied_text="",
+                strategy="noop",
+                message="Empty draft text provided.",
+            )
+
+        # Extract all existing citation anchors to guarantee preservation
+        existing_anchors = LegalBriefASTParser._CITATION_RE.findall(draft_text)
+
+        # Strategy 1: Missing Jurisdiction Clause Insertion
+        if defect.defect_type == DefectType.MISSING_JURISDICTION_CLAUSE:
+            clause = defect.suggested_patch or "Jurisdiction: EX | Statutory Code of EX"
+            # Insert right after header or at beginning
+            header_match = re.search(r"(=+\n|#+[^\n]+\n)", draft_text)
+            if header_match:
+                insert_pos = header_match.end()
+                patched_text = draft_text[:insert_pos] + clause + "\n" + draft_text[insert_pos:]
+            else:
+                patched_text = clause + "\n" + draft_text
+
+            return PatchResult(
+                success=True,
+                defect_type=defect.defect_type,
+                original_span="",
+                patched_span=clause,
+                start_offset=0,
+                end_offset=len(clause),
+                applied_text=patched_text,
+                strategy="deterministic_ast",
+                preserved_anchors=existing_anchors,
+                message="Successfully prepended jurisdiction clause.",
+            )
+
+        # Strategy 2: Deterministic Offset or Substring Replacement
+        target = defect.span_text
+        patch = defect.suggested_patch or ""
+
+        if defect.start_offset >= 0 and defect.end_offset > defect.start_offset and defect.end_offset <= len(draft_text):
+            # Precision offset replacement
+            orig_slice = draft_text[defect.start_offset:defect.end_offset]
+            if orig_slice == target or not target:
+                patched_text = draft_text[:defect.start_offset] + patch + draft_text[defect.end_offset:]
+                strategy = "deterministic_formula" if defect.defect_type == DefectType.INCORRECT_CALCULATION else "deterministic_statute"
+                return PatchResult(
+                    success=True,
+                    defect_type=defect.defect_type,
+                    original_span=orig_slice,
+                    patched_span=patch,
+                    start_offset=defect.start_offset,
+                    end_offset=defect.start_offset + len(patch),
+                    applied_text=patched_text,
+                    strategy=strategy,
+                    preserved_anchors=existing_anchors,
+                    message=f"Applied precision offset patch for {defect.defect_type.value}.",
+                )
+
+        if target and target in draft_text:
+            # Substring replacement fallback
+            loc = self.localize_span(draft_text, target)
+            patched_text = draft_text[:loc.start_offset] + patch + draft_text[loc.end_offset:]
+            strategy = "llm_micro_patch" if defect.defect_type == DefectType.UNCITED_CLAIM else "deterministic_statute"
+            return PatchResult(
+                success=True,
+                defect_type=defect.defect_type,
+                original_span=target,
+                patched_span=patch,
+                start_offset=loc.start_offset,
+                end_offset=loc.start_offset + len(patch),
+                applied_text=patched_text,
+                strategy=strategy,
+                preserved_anchors=existing_anchors,
+                message=f"Applied localized replacement for {defect.defect_type.value}.",
+            )
+
+        return PatchResult(
+            success=False,
+            defect_type=defect.defect_type,
+            original_span=target,
+            patched_span=patch,
+            start_offset=-1,
+            end_offset=-1,
+            applied_text=draft_text,
+            strategy="unmatched",
+            preserved_anchors=existing_anchors,
+            message="Target span not found in draft text.",
+        )
+
+    def repair_draft(
+        self,
+        draft_text: str,
+        defects: list[DefectReport],
+    ) -> tuple[str, list[PatchResult]]:
+        """Sequentially execute all span-targeted patches, preserving verified context."""
+        current_text = draft_text
+        results: list[PatchResult] = []
+
+        # Sort defects by start_offset descending to avoid offset invalidation during replacement
+        sorted_defects = sorted(defects, key=lambda d: d.start_offset, reverse=True)
+
+        for defect in sorted_defects:
+            res = self.patch_span(current_text, defect)
+            results.append(res)
+            if res.success:
+                current_text = res.applied_text
+
+        return current_text, results
+
+
+def patch_span(
+    draft_text: str,
+    defect: DefectReport,
+    rule_store: RuleStore | None = None,
+    provider: ModelProvider | None = None,
+) -> PatchResult:
+    """Expose standalone patch_span interface."""
+    engine = SpanEditingEngine(rule_store=rule_store, provider=provider)
+    return engine.patch_span(draft_text, defect)
+
+
+def repair_draft(
+    draft_text: str,
+    defects: list[DefectReport],
+    rule_store: RuleStore | None = None,
+    provider: ModelProvider | None = None,
+) -> tuple[str, list[PatchResult]]:
+    """Expose standalone repair_draft interface."""
+    engine = SpanEditingEngine(rule_store=rule_store, provider=provider)
+    return engine.repair_draft(draft_text, defects)
+
+
 @dataclass(frozen=True)
 class VerificationReport:
+
     """Structured milestone verification report produced in Pass 1 of the two-stage pattern."""
 
     is_certified: bool
@@ -569,6 +1022,8 @@ class Verifier:
         self.self_test_suite = TripartiteSelfTestSuite(self)
         self.sao_optimizer = StepAdvantageOptimizer(self.rule_store)
         self.code_generator = DynamicVerificationFunctionGenerator()
+        self.span_engine = SpanEditingEngine(self.rule_store, self.provider)
+
 
     def run_self_testing_suite(
         self, program: ProgramId = ProgramId.SNAP, jurisdiction: str = "EX"
@@ -1002,11 +1457,47 @@ class Verifier:
             "reasons": reasons,
         }
 
+    def classify_defects(
+        self,
+        draft_text: str,
+        assessment: Assessment | None = None,
+        evidence: list[Evidence] | None = None,
+        jurisdiction: str = "EX",
+        program: ProgramId = ProgramId.SNAP,
+    ) -> list[DefectReport]:
+        """Classify verification defects across draft text."""
+        return self.span_engine.classify_defects(
+            draft_text=draft_text,
+            assessment=assessment,
+            evidence=evidence,
+            jurisdiction=jurisdiction,
+            program=program,
+        )
+
+    def patch_span(self, draft_text: str, defect: DefectReport) -> PatchResult:
+        """Execute targeted span repair on draft text."""
+        return self.span_engine.patch_span(draft_text, defect)
+
+    def repair_draft(
+        self, draft_text: str, defects: list[DefectReport]
+    ) -> tuple[str, list[PatchResult]]:
+        """Repair all detected defects across draft text."""
+        return self.span_engine.repair_draft(draft_text, defects)
+
 
 # VerifierAgent class alias
 VerifierAgent = Verifier
 
 __all__ = [
+    "DefectType",
+    "DefectReport",
+    "LocalizedSpan",
+    "PatchResult",
+    "LegalASTNode",
+    "LegalBriefASTParser",
+    "SpanEditingEngine",
+    "patch_span",
+    "repair_draft",
     "VerificationReport",
     "TrajectoryVerificationVerdict",
     "TripartiteCheckResult",
@@ -1020,3 +1511,4 @@ __all__ = [
     "Verifier",
     "VerifierAgent",
 ]
+

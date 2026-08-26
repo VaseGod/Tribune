@@ -74,7 +74,9 @@ class WorkspaceState:
             "materials": {},
             "agent_metadata": {},
             "shared_facts": {},
+            "visual_layouts": {},
         }
+
         if initial_data:
             self._data.update(initial_data)
 
@@ -331,6 +333,26 @@ class WorkspaceContext:
         with self._lock:
             self._touch()
             return copy.deepcopy(self._state.get_value_at_path(path))
+
+    def store_visual_layout(self, layout: Any) -> WorkspaceSnapshot:
+        """Store visual document layout tokens and reading-order DAG in workspace state."""
+        doc_id = getattr(layout, "doc_id", layout.get("doc_id", "default_doc") if isinstance(layout, dict) else "default_doc")
+        layout_dict = layout.to_dict() if hasattr(layout, "to_dict") else dict(layout)
+        patch = DeltaPatch(
+            run_id=self.case_id,
+            agent_id="ocr_ingest",
+            operation=PatchOperationType.REPLACE,
+            path=f"/visual_layouts/{doc_id}",
+            value=layout_dict,
+        )
+        return self.apply_patch(patch)
+
+    def get_visual_layout(self, doc_id: str) -> dict[str, Any] | None:
+        """Retrieve visual document layout dictionary for a specific doc_id."""
+        with self._lock:
+            self._touch()
+            return self.read_path(f"/visual_layouts/{doc_id}")
+
 
     def snapshot(self) -> WorkspaceSnapshot:
         """Create an immutable snapshot of current workspace state."""

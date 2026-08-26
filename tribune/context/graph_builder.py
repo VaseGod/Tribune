@@ -250,25 +250,25 @@ class AgentGraphBuilder:
     ) -> AgentDependencyGraph:
         graph = AgentDependencyGraph()
 
-        # 1. Gather Agent (Ingests & consolidates evidence)
+        # 1. Gather Agent (Ingests & consolidates evidence and visual layouts)
         graph.add_node(
             AgentNode(
                 agent_id="gather",
                 role="gather",
                 read_scopes=["/documents"],
-                write_scopes=["/evidence", "/shared_facts"],
+                write_scopes=["/evidence", "/shared_facts", "/visual_layouts"],
                 dependencies=[],
                 broadcast_subscriptions=["/documents"],
             )
         )
 
-        # 2. Navigator Agent (High-level planning & coordination)
+        # 2. Navigator Agent (High-level planning, layout verification, & coordination)
         graph.add_node(
             AgentNode(
                 agent_id="navigator",
                 role="navigator",
-                read_scopes=["/evidence", "/assessments", "/materials"],
-                write_scopes=["/metadata/plan", "/agent_metadata/navigator"],
+                read_scopes=["/evidence", "/assessments", "/materials", "/visual_layouts"],
+                write_scopes=["/metadata/plan", "/agent_metadata/navigator", "/layout_verifications"],
                 dependencies=["gather"],
                 broadcast_subscriptions=["*"],
             )
@@ -287,7 +287,7 @@ class AgentGraphBuilder:
                     agent_id=prop_id,
                     role="proposer",
                     program=prog_val,
-                    read_scopes=["/evidence", f"/shared_facts/{prog_val}", "/shared_facts"],
+                    read_scopes=["/evidence", f"/shared_facts/{prog_val}", "/shared_facts", "/visual_layouts"],
                     write_scopes=[f"/assessments/{prog_val}", f"/criteria_outcomes/{prog_val}"],
                     dependencies=["gather", "navigator"],
                     broadcast_subscriptions=["/evidence", f"/criteria_outcomes/{prog_val}"],
@@ -300,7 +300,7 @@ class AgentGraphBuilder:
                     agent_id=ver_id,
                     role="verifier",
                     program=prog_val,
-                    read_scopes=["/evidence", f"/assessments/{prog_val}", f"/criteria_outcomes/{prog_val}"],
+                    read_scopes=["/evidence", f"/assessments/{prog_val}", f"/criteria_outcomes/{prog_val}", "/visual_layouts"],
                     write_scopes=[f"/verification_verdicts/{prog_val}"],
                     dependencies=[prop_id],
                     broadcast_subscriptions=[f"/assessments/{prog_val}"],
@@ -313,7 +313,7 @@ class AgentGraphBuilder:
                     agent_id=prep_id,
                     role="preparer",
                     program=prog_val,
-                    read_scopes=["/evidence", f"/assessments/{prog_val}", f"/verification_verdicts/{prog_val}"],
+                    read_scopes=["/evidence", f"/assessments/{prog_val}", f"/verification_verdicts/{prog_val}", "/visual_layouts"],
                     write_scopes=[f"/materials/{prog_val}"],
                     dependencies=[ver_id],
                     broadcast_subscriptions=[f"/verification_verdicts/{prog_val}"],
@@ -321,6 +321,46 @@ class AgentGraphBuilder:
             )
 
         return graph
+
+
+@dataclass
+class VisualLayoutGraphNode:
+    """A node in the ingested visual document layout context graph."""
+
+    token_id: str
+    doc_id: str
+    bbox: list[float]
+    token_type: str
+    text: str
+    reading_order_idx: int
+    neighbors: list[str] = field(default_factory=list)
+
+
+def build_visual_layout_subgraph(layout_dict: dict[str, Any]) -> dict[str, VisualLayoutGraphNode]:
+    """Convert visual document layout dict into an indexed graph of layout nodes and reading-order neighbors."""
+    doc_id = layout_dict.get("doc_id", "doc_1")
+    tokens = layout_dict.get("tokens", [])
+    edges = layout_dict.get("edges", [])
+
+    node_map: dict[str, VisualLayoutGraphNode] = {}
+    for tok in tokens:
+        tid = tok.get("token_id", "")
+        bbox = tok.get("bbox", [0.0, 0.0, 1.0, 1.0])
+        node_map[tid] = VisualLayoutGraphNode(
+            token_id=tid,
+            doc_id=doc_id,
+            bbox=bbox,
+            token_type=tok.get("token_type", "PARAGRAPH"),
+            text=tok.get("text", ""),
+            reading_order_idx=tok.get("reading_order_index", 0),
+        )
+
+    for u, v in edges:
+        if u in node_map and v not in node_map[u].neighbors:
+            node_map[u].neighbors.append(v)
+
+    return node_map
+
 
 
 # --------------------------------------------------------------------------- #
@@ -617,6 +657,9 @@ __all__ = [
     "AgentNode",
     "AgentDependencyGraph",
     "AgentGraphBuilder",
+    "VisualLayoutGraphNode",
+    "build_visual_layout_subgraph",
     "HNSWNode",
     "FilterableHNSWIndex",
 ]
+
