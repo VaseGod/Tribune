@@ -56,6 +56,28 @@ providers:
     sla_p95_ms: 500.0
     speculative_drafter: DFlash
 
+  qwen2.5-distill-legal-7b:
+    provider_type: llama.cpp
+    model_name: qwen2.5-distill-legal-7b
+    input_cost_per_1m: 0.00
+    output_cost_per_1m: 0.00
+    max_context_tokens: 32768
+    supports_tools: true
+    tier: 1
+    sla_p95_ms: 250.0
+    fallback_model: qwen3.8-27b
+
+  kimi-k1.5-distill-7b:
+    provider_type: llama.cpp
+    model_name: kimi-k1.5-distill-7b
+    input_cost_per_1m: 0.00
+    output_cost_per_1m: 0.00
+    max_context_tokens: 131072
+    supports_tools: true
+    tier: 1
+    sla_p95_ms: 320.0
+    fallback_model: qwen3.8-27b
+
 candidates:
   - candidate_id: qwen3.8-27b
     name: Qwen 3.8 27B
@@ -77,6 +99,44 @@ candidates:
       Primary dense local frontier model configured for ReasonMaxxer sparse reasoning
       with MTP speculative decoding (spec-type: ngram-mod,draft-mtp, spec-draft-n-max: 2)
       and q4_1 KV cache quantization to fit 73k+ token context in 16GB VRAM.
+
+  - candidate_id: qwen2.5-distill-legal-7b
+    name: Qwen 2.5 Distill Legal 7B
+    vendor: Alibaba
+    params: "7B"
+    roles: [proposer, verifier]
+    role_note: air-gapped privacy-preserving local distilled model for sovereign adjudication
+    license: open-weights
+    weights_status: downloadable
+    weights_url: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct
+    weights_verified: false
+    serving: [llama.cpp, vllm]
+    quant_formats: [gguf-q8_0, gguf-q4_k_m, fp16]
+    context_window: 32768
+    tier: 1
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Air-gapped local model for data sovereignty compliance with bitwise logprob parity reduction.
+
+  - candidate_id: kimi-k1.5-distill-7b
+    name: Kimi K1.5 Distill 7B
+    vendor: Moonshot AI
+    params: "7B"
+    roles: [proposer, verifier]
+    role_note: air-gapped privacy-preserving local distilled model with long-context legal reasoning
+    license: open-weights
+    weights_status: downloadable
+    weights_url: https://huggingface.co/moonshotai/Kimi-k1.5-distill-7b
+    weights_verified: false
+    serving: [llama.cpp, vllm, sglang]
+    quant_formats: [gguf-q8_0, gguf-q4_k_m, fp8]
+    context_window: 131072
+    tier: 1
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      Air-gapped Kimi distillation optimized for sovereign administrative appeals and deterministic rollout evaluations.
 
   - candidate_id: glm-5.2
     name: GLM-5.2

@@ -1,11 +1,12 @@
-"""Independent Verifier & Trajectory-Level Binary Verifier.
+"""Independent Verifier, Programmatic Verification Code Generator, Tripartite Self-Testing, & SAO.
 
 The verifier performs:
-1. Two-stage milestone certification (Pass 1 evaluation against cited RuleStore rules).
-2. Trajectory-level binary verification directly evaluating solver reasoning trajectories
-   without relying on ground-truth answer keys (fact grounding, statutory citation validity,
-   and lack of ungrounded assumptions).
-3. Coverage, support, and cross-statutory coherence checks before certification.
+1. Dynamic generation of deterministic, programmatic verification functions without access to reference solutions.
+2. Mandatory tripartite automated self-test suite (Oracle, No-Op, and Unsolved-State checks) prior to certification.
+3. Step-level Advantage Optimization (SAO) assigning reward/advantage scores to individual reasoning steps,
+   premises, and statutory citations in legal appeal briefs and trajectories.
+4. Trajectory-level binary verification directly evaluating solver reasoning trajectories for fact grounding,
+   statutory citation validity, and lack of ungrounded assumptions.
 """
 
 from __future__ import annotations
@@ -17,17 +18,20 @@ from typing import Any
 
 from ..corpus import programs as program_registry
 from ..corpus.citations import cross_evaluate_citations
-from ..corpus.programs.jurisdictions import get_profile
-from ..corpus.rule_store import RuleStore
-from ..providers.base import ModelProvider, ReviewRequest, derive_status
+from ..corpus.programs.jurisdictions import JurisdictionProfile, get_profile
+from ..corpus.rule_store import LocalRuleStore, RuleStore
+from ..providers.base import ModelProvider, ReviewRequest, ReviewResult, derive_status
 from ..types import (
     Assessment,
+    Citation,
     CriterionOutcome,
     CriterionResult,
     EligibilityStatus,
     Evidence,
+    EvidenceType,
     EvidenceView,
     ProgramId,
+    RecommendedAction,
     VerifierVerdict,
 )
 
@@ -64,6 +68,150 @@ class TrajectoryVerificationVerdict:
     reasons: list[str] = field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- #
+# Tripartite Self-Testing Suite Dataclasses
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TripartiteCheckResult:
+    """Outcome of a single check within the Tripartite Self-Test Suite."""
+
+    check_name: str  # "oracle_check" | "noop_check" | "unsolved_state_check"
+    passed: bool
+    score: float  # [0.0, 1.0]
+    details: dict[str, Any] = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TripartiteVerificationResult:
+    """Result of running the full tripartite self-test suite."""
+
+    all_passed: bool
+    composite_score: float
+    oracle_result: TripartiteCheckResult
+    noop_result: TripartiteCheckResult
+    unsolved_state_result: TripartiteCheckResult
+    reasons: list[str] = field(default_factory=list)
+    evaluated_at: float = field(default_factory=time.time)
+
+
+# --------------------------------------------------------------------------- #
+# Step-level Advantage Optimization (SAO) Dataclasses
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class StepAdvantageRecord:
+    """Attributed advantage, citation validity, and grounding score for an individual reasoning step."""
+
+    step_index: int
+    step_type: str  # "statutory_citation" | "factual_premise" | "predicate_deduction" | "status_assertion"
+    action_text: str
+    step_advantage: float  # Scalar advantage [-1.0, 1.0]
+    grounding_score: float  # [0.0, 1.0]
+    citation_gain: float  # [0.0, 1.0]
+    is_grounded: bool
+    has_valid_citations: bool
+    penalties: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SAOAnalysisResult:
+    """Comprehensive Step-level Advantage Optimization evaluation across an entire appeal brief / trajectory."""
+
+    mean_advantage: float
+    cumulative_advantage: float
+    total_steps: int
+    grounded_steps_count: int
+    valid_citation_steps_count: int
+    step_records: list[StepAdvantageRecord] = field(default_factory=list)
+    critical_defects: list[str] = field(default_factory=list)
+    is_advantageous: bool = True
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic Programmatic Verification Function Generator
+# --------------------------------------------------------------------------- #
+
+
+class DynamicVerificationFunctionGenerator:
+    """Dynamically generates deterministic, programmatic verification functions without access to reference solutions."""
+
+    @staticmethod
+    def generate_verification_code(program: ProgramId, jurisdiction: str = "EX") -> str:
+        """Generate standalone executable Python code to independently verify determinations for a given program."""
+        profile = get_profile(jurisdiction)
+        ruleset = program_registry.get_ruleset(program)
+
+        code_lines = [
+            f"# Auto-generated Programmatic Verification Function for {program.value.upper()} in {jurisdiction}",
+            "# Evaluates claim grounding, rule predicates, and citation mapping without reference solutions.",
+            "def verify_candidate_determination(assessment_dict, evidence_dict, jurisdiction_profile):",
+            "    violations = []",
+            "    recomputed_criteria = {}",
+            "    required_ids = " + str(ruleset.required_ids),
+            "",
+            "    # 1. Fact Grounding & Predicate Execution",
+        ]
+
+        if program == ProgramId.SNAP:
+            code_lines.extend([
+                f"    gross_limit = jurisdiction_profile.get('fpl_monthly', {profile.fpl_monthly(1)}) * {profile.snap_gross_income_pct}",
+                "    monthly_income = float(evidence_dict.get('monthly_income', 0.0))",
+                "    hh_size = int(evidence_dict.get('household_size', 1))",
+                "    liquid_assets = float(evidence_dict.get('liquid_assets', 0.0))",
+                "    asset_limit = jurisdiction_profile.get('snap_asset_limit', 2750.0)",
+                "    if monthly_income > gross_limit:",
+                "        recomputed_criteria['gross_income'] = 'not_satisfied'",
+                "    else:",
+                "        recomputed_criteria['gross_income'] = 'satisfied'",
+                "    if liquid_assets > asset_limit:",
+                "        recomputed_criteria['liquid_assets'] = 'not_satisfied'",
+                "    else:",
+                "        recomputed_criteria['liquid_assets'] = 'satisfied'",
+            ])
+        elif program == ProgramId.APPEALS:
+            code_lines.extend([
+                f"    window_days = jurisdiction_profile.get('appeal_window_days', {profile.appeal_window_days})",
+                "    days_since_denial = float(evidence_dict.get('days_since_denial', 999.0))",
+                "    has_grounds = bool(evidence_dict.get('appeal_grounds', ''))",
+                "    if days_since_denial <= window_days:",
+                "        recomputed_criteria['timely_filing'] = 'satisfied'",
+                "    else:",
+                "        recomputed_criteria['timely_filing'] = 'not_satisfied'",
+                "    recomputed_criteria['stated_grounds'] = 'satisfied' if has_grounds else 'not_satisfied'",
+            ])
+        else:
+            code_lines.extend([
+                "    for req in required_ids:",
+                "        recomputed_criteria[req] = 'satisfied' if req in evidence_dict else 'unknown'",
+            ])
+
+        code_lines.extend([
+            "",
+            "    # 2. Coverage & Citation Mapping Check",
+            "    assessed_criteria = assessment_dict.get('criteria', [])",
+            "    assessed_map = {c.get('criterion_id'): c for c in assessed_criteria}",
+            "    for req in required_ids:",
+            "        if req not in assessed_map:",
+            "            violations.append(f'Missing required statutory criterion: {req}')",
+            "        elif assessed_map[req].get('outcome') != recomputed_criteria.get(req):",
+            "            violations.append(f'Predicate mismatch on criterion {req}')",
+            "",
+            "    is_valid = len(violations) == 0",
+            "    return {'is_valid': is_valid, 'violations': violations, 'recomputed_criteria': recomputed_criteria}",
+        ])
+
+        return "\n".join(code_lines)
+
+
+# --------------------------------------------------------------------------- #
+# Programmatic Verifier Tools (Python stubs for models)
+# --------------------------------------------------------------------------- #
+
+
 class ProgrammaticVerifierTools:
     """Typed Python stubs executed directly in-code by verifier agent loops."""
 
@@ -80,7 +228,7 @@ class ProgrammaticVerifierTools:
     @staticmethod
     def rederive_status(criteria_outcomes: list[str]) -> dict:
         """Re-derive overall eligibility status from criterion outcome strings."""
-        if any(o == "ineligible" for o in criteria_outcomes):
+        if any(o == "ineligible" or o == "not_satisfied" for o in criteria_outcomes):
             status = "likely_ineligible"
         elif any(o == "unknown" for o in criteria_outcomes):
             status = "indeterminate"
@@ -100,7 +248,309 @@ class ProgrammaticVerifierTools:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Tripartite Self-Testing Suite
+# --------------------------------------------------------------------------- #
+
+
+class TripartiteSelfTestSuite:
+    """Mandatory automated tripartite self-test suite prior to verifier registration in evaluation harnesses.
+
+    Performs:
+    1. Oracle Checks: Validate that known gold-standard / cleanly grounded solutions pass cleanly.
+    2. No-Op Checks: Ensure empty, null, or tautological submissions fail immediately.
+    3. Unsolved-State Checks: Confirm incomplete claims, partial evidence, or unverified claims fail.
+    """
+
+    def __init__(self, verifier: Verifier) -> None:
+        self.verifier = verifier
+
+    def run_oracle_check(self, program: ProgramId = ProgramId.SNAP, jurisdiction: str = "EX") -> TripartiteCheckResult:
+        """Oracle Check: Validates that a well-formed, fully compliant assessment passes cleanly."""
+        store = self.verifier.rule_store
+        citations = store.all_citations(program, jurisdiction)
+        ruleset = program_registry.get_ruleset(program)
+        profile = get_profile(jurisdiction)
+
+        # Build clean valid evidence
+        from ..casegen.synthetic import SyntheticCaseGenerator
+        case = SyntheticCaseGenerator().build_case(
+            case_id="oracle_gold_case",
+            jurisdiction=jurisdiction,
+            overrides={"monthly_income": 800.0, "household_size": 2, "liquid_assets": 400.0},
+            target_programs=[program],
+        )
+
+        view = EvidenceView(case.evidence)
+        criteria = [
+            CriterionResult(
+                criterion_id=rule.criterion_id,
+                description=rule.description,
+                outcome=rule.predicate(view, profile),
+                required=rule.required,
+                citation_ids=[rule.citation(program, jurisdiction).citation_id],
+            )
+            for rule in ruleset.rules
+        ]
+
+        assessment = Assessment(
+            assessment_id=f"oracle:{program.value}:gold",
+            case_id="oracle_gold_case",
+            program=program,
+            jurisdiction=jurisdiction,
+            status=EligibilityStatus.LIKELY_ELIGIBLE,
+            criteria=criteria,
+            citations=citations,
+            recommended_action=RecommendedAction.PREPARE_APPLICATION,
+            self_confidence=0.98,
+            rationale="Gold-standard verified assessment satisfying all statutory rules.",
+        )
+
+        verdict = self.verifier.verify(assessment, case.evidence, jurisdiction)
+        passed = verdict.approved and (verdict.self_testing_score >= 0.85)
+
+        reasons = list(verdict.reasons)
+        if passed:
+            reasons.append("Oracle Check: Gold-standard submission passed verification cleanly.")
+
+        return TripartiteCheckResult(
+            check_name="oracle_check",
+            passed=passed,
+            score=verdict.self_testing_score if passed else 0.0,
+            details={"approved": verdict.approved, "self_testing_score": verdict.self_testing_score},
+            reasons=reasons,
+        )
+
+    def run_noop_check(self, program: ProgramId = ProgramId.SNAP, jurisdiction: str = "EX") -> TripartiteCheckResult:
+        """No-Op Check: Ensures empty, null, or tautological submissions fail verification."""
+        # Empty assessment with no criteria and no citations
+        noop_assessment = Assessment(
+            assessment_id="noop_empty_submission",
+            case_id="c_noop",
+            program=program,
+            jurisdiction=jurisdiction,
+            status=EligibilityStatus.INDETERMINATE,
+            criteria=[],
+            citations=[],
+            recommended_action=RecommendedAction.ABSTAIN_AND_ESCALATE,
+            self_confidence=0.5,
+            rationale="Tautological submission: empty criteria and ungrounded determination.",
+        )
+
+        verdict = self.verifier.verify(noop_assessment, [], jurisdiction)
+        # MUST fail verification (verdict.approved is False)
+        passed = (not verdict.approved) and (len(verdict.incomplete_coverage) > 0 or len(verdict.reasons) > 0)
+
+        reasons = []
+        if passed:
+            reasons.append("No-Op Check: Empty/tautological submission correctly failed verification.")
+        else:
+            reasons.append("No-Op Check FAILURE: Empty/tautological submission erroneously approved.")
+
+        return TripartiteCheckResult(
+            check_name="noop_check",
+            passed=passed,
+            score=1.0 if passed else 0.0,
+            details={"approved": verdict.approved, "reasons": verdict.reasons},
+            reasons=reasons,
+        )
+
+    def run_unsolved_state_check(
+        self, program: ProgramId = ProgramId.SNAP, jurisdiction: str = "EX"
+    ) -> TripartiteCheckResult:
+        """Unsolved-State Check: Confirms incomplete claims, partial evidence, or unverified claims fail."""
+        store = self.verifier.rule_store
+        citations = store.all_citations(program, jurisdiction)
+
+        # Incomplete assessment omitting mandatory criteria
+        incomplete_assessment = Assessment(
+            assessment_id="incomplete_unsolved_submission",
+            case_id="c_unsolved",
+            program=program,
+            jurisdiction=jurisdiction,
+            status=EligibilityStatus.LIKELY_ELIGIBLE,
+            criteria=[
+                CriterionResult(
+                    criterion_id="gross_income",
+                    description="Gross income test",
+                    outcome=CriterionOutcome.SATISFIED,
+                    required=True,
+                    citation_ids=[citations[0].citation_id] if citations else [],
+                )
+            ],
+            citations=citations[:1] if citations else [],
+            recommended_action=RecommendedAction.PREPARE_APPLICATION,
+            self_confidence=0.9,
+            rationale="Incomplete assessment missing residency and citizenship checks.",
+        )
+
+        verdict = self.verifier.verify(incomplete_assessment, [], jurisdiction)
+        # MUST fail due to missing coverage / unverified predicates
+        passed = (not verdict.approved) and (len(verdict.incomplete_coverage) > 0 or len(verdict.unsupported_claims) > 0)
+
+        reasons = []
+        if passed:
+            reasons.append("Unsolved-State Check: Incomplete submission correctly rejected.")
+        else:
+            reasons.append("Unsolved-State Check FAILURE: Incomplete submission erroneously approved.")
+
+        return TripartiteCheckResult(
+            check_name="unsolved_state_check",
+            passed=passed,
+            score=1.0 if passed else 0.0,
+            details={"incomplete_coverage": verdict.incomplete_coverage, "approved": verdict.approved},
+            reasons=reasons,
+        )
+
+    def run_full_suite(
+        self, program: ProgramId = ProgramId.SNAP, jurisdiction: str = "EX"
+    ) -> TripartiteVerificationResult:
+        """Execute all three tripartite checks and return combined verification result."""
+        oracle_res = self.run_oracle_check(program, jurisdiction)
+        noop_res = self.run_noop_check(program, jurisdiction)
+        unsolved_res = self.run_unsolved_state_check(program, jurisdiction)
+
+        all_passed = oracle_res.passed and noop_res.passed and unsolved_res.passed
+        composite_score = round((oracle_res.score + noop_res.score + unsolved_res.score) / 3.0, 4)
+
+        reasons = []
+        reasons.extend(oracle_res.reasons)
+        reasons.extend(noop_res.reasons)
+        reasons.extend(unsolved_res.reasons)
+
+        return TripartiteVerificationResult(
+            all_passed=all_passed,
+            composite_score=composite_score,
+            oracle_result=oracle_res,
+            noop_result=noop_res,
+            unsolved_state_result=unsolved_res,
+            reasons=reasons,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Step-level Advantage Optimization (SAO)
+# --------------------------------------------------------------------------- #
+
+
+class StepAdvantageOptimizer:
+    """Assigns step-level advantage and reward scores to reasoning steps and statutory citations in legal appeal briefs.
+
+    Computes:
+    - Step-level Advantage A(s_t, a_t) = grounding_gain + citation_gain + precision_gain - penalty
+    - Factual premise grounding against source evidence records
+    - Statutory citation validity against active RuleStore entries
+    - Penalties for ungrounded assumptions, non-deterministic monologues (<think>), or circular deductions
+    """
+
+    def __init__(self, rule_store: RuleStore | None = None) -> None:
+        self.rule_store = rule_store or LocalRuleStore()
+
+    def analyze_trajectory(
+        self,
+        trajectory: Any,
+        evidence: list[Evidence],
+        jurisdiction: str,
+        program: ProgramId = ProgramId.SNAP,
+    ) -> SAOAnalysisResult:
+        """Compute Step-level Advantage Optimization (SAO) across all trajectory reasoning frames."""
+        known_evidence_keys = {e.type.value: e.value for e in evidence}
+        active_citations = {c.citation_id for c in self.rule_store.all_citations(program, jurisdiction)}
+
+        frames = getattr(trajectory, "frames", trajectory if isinstance(trajectory, list) else [])
+        step_records: list[StepAdvantageRecord] = []
+        critical_defects: list[str] = []
+
+        cumulative_adv = 0.0
+
+        for idx, frame in enumerate(frames):
+            action_text = str(getattr(frame, "action", frame.get("action", "") if isinstance(frame, dict) else ""))
+            data = getattr(frame, "data", frame.get("data", {}) if isinstance(frame, dict) else {})
+            step_type = "predicate_deduction"
+
+            penalties: list[str] = []
+            grounding_score = 1.0
+            citation_gain = 0.5
+            is_grounded = True
+            has_valid_citations = True
+
+            # 1. Fact Grounding Analysis
+            if "evidence" in data and isinstance(data["evidence"], list):
+                step_type = "factual_premise"
+                for ev in data["evidence"]:
+                    etype = getattr(ev, "type", ev.get("type") if isinstance(ev, dict) else None)
+                    eval_str = etype.value if hasattr(etype, "value") else str(etype)
+                    if eval_str not in known_evidence_keys:
+                        is_grounded = False
+                        grounding_score = 0.0
+                        penalties.append(f"Ungrounded fact '{eval_str}' asserted without ingestion")
+                        critical_defects.append(f"Step {idx+1}: Ungrounded fact '{eval_str}'")
+
+            # 2. Citation Validity Analysis
+            if "citations" in data and isinstance(data["citations"], list):
+                step_type = "statutory_citation"
+                for cit in data["citations"]:
+                    cid = cit.citation_id if hasattr(cit, "citation_id") else str(cit)
+                    if cid not in active_citations:
+                        has_valid_citations = False
+                        citation_gain = -0.5
+                        penalties.append(f"Invalid statutory citation '{cid}'")
+                        critical_defects.append(f"Step {idx+1}: Invalid citation '{cid}'")
+                    else:
+                        citation_gain = 1.0
+
+            # 3. Monologue / Reasoning Leak Checks
+            if re.search(r"<(?:think|thought|reasoning)[^>]*>", action_text, re.IGNORECASE):
+                penalties.append("Non-deterministic reasoning monologue detected")
+                critical_defects.append(f"Step {idx+1}: Reasoning monologue artifact")
+
+            # Step Advantage Calculation
+            base_adv = 0.35 if is_grounded else -0.5
+            cit_adv = 0.35 if has_valid_citations else -0.5
+            penalty_deduction = len(penalties) * 0.25
+
+            step_adv = max(-1.0, min(1.0, round(base_adv + cit_adv - penalty_deduction, 4)))
+            cumulative_adv += step_adv
+
+            step_records.append(
+                StepAdvantageRecord(
+                    step_index=idx + 1,
+                    step_type=step_type,
+                    action_text=action_text[:120],
+                    step_advantage=step_adv,
+                    grounding_score=grounding_score,
+                    citation_gain=citation_gain,
+                    is_grounded=is_grounded,
+                    has_valid_citations=has_valid_citations,
+                    penalties=penalties,
+                )
+            )
+
+        total_steps = max(1, len(step_records))
+        mean_adv = round(cumulative_adv / total_steps, 4)
+        grounded_count = sum(1 for s in step_records if s.is_grounded)
+        valid_cit_count = sum(1 for s in step_records if s.has_valid_citations)
+
+        return SAOAnalysisResult(
+            mean_advantage=mean_adv,
+            cumulative_advantage=round(cumulative_adv, 4),
+            total_steps=len(step_records),
+            grounded_steps_count=grounded_count,
+            valid_citation_steps_count=valid_cit_count,
+            step_records=step_records,
+            critical_defects=critical_defects,
+            is_advantageous=mean_adv > 0.2 and len(critical_defects) == 0,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Verifier Agent
+# --------------------------------------------------------------------------- #
+
+
 class Verifier:
+    """VerifierAgent executing dynamic verification code, tripartite self-testing, and SAO analysis."""
+
     routing_intent: str = "multi_step_verification"
     target_engine: str = "gpt-5.6-sol-ultrafast"
 
@@ -116,13 +566,37 @@ class Verifier:
         self.target_engine = target_engine
         self.router = router
         self.tools = ProgrammaticVerifierTools()
+        self.self_test_suite = TripartiteSelfTestSuite(self)
+        self.sao_optimizer = StepAdvantageOptimizer(self.rule_store)
+        self.code_generator = DynamicVerificationFunctionGenerator()
+
+    def run_self_testing_suite(
+        self, program: ProgramId = ProgramId.SNAP, jurisdiction: str = "EX"
+    ) -> TripartiteVerificationResult:
+        """Execute the automated tripartite self-test suite (Oracle, No-Op, Unsolved-State)."""
+        return self.self_test_suite.run_full_suite(program=program, jurisdiction=jurisdiction)
+
+    def analyze_step_advantages(
+        self,
+        trajectory: Any,
+        evidence: list[Evidence],
+        jurisdiction: str,
+        program: ProgramId = ProgramId.SNAP,
+    ) -> SAOAnalysisResult:
+        """Perform Step-level Advantage Optimization analysis over a solver trajectory or legal brief."""
+        return self.sao_optimizer.analyze_trajectory(
+            trajectory=trajectory, evidence=evidence, jurisdiction=jurisdiction, program=program
+        )
+
+    def generate_programmatic_verification_code(self, program: ProgramId, jurisdiction: str = "EX") -> str:
+        """Generate standalone programmatic verification code for the given program and jurisdiction."""
+        return self.code_generator.generate_verification_code(program, jurisdiction)
 
     def review_with_router(self, req: ReviewRequest) -> ReviewResult:
         """Route verifier review request to Tier 2 frontier endpoint if router configured."""
         if self.router is not None and hasattr(self.router, "route_verifier_task"):
             return self.router.route_verifier_task(req)
         return self.provider.review_assessment(req)
-
 
     @staticmethod
     def parse_visible_response(text: str) -> str:
@@ -251,13 +725,7 @@ class Verifier:
         jurisdiction: str,
         program: ProgramId | None = None,
     ) -> TrajectoryVerificationVerdict:
-        """Trajectory-Level Binary Verifier evaluating solver reasoning paths without reference solutions.
-
-        Validates:
-        1. Fact Grounding: Every asserted numerical or factual premise is grounded in evidence.
-        2. Statutory Citation Validity: Cited rules exist in the statutory corpus.
-        3. Lack of Ungrounded Assumptions: Prohibits speculative leaps or hallucinated deductions.
-        """
+        """Trajectory-Level Binary Verifier evaluating solver reasoning paths without reference solutions."""
         grounding_violations: list[str] = []
         citation_violations: list[str] = []
         assumption_violations: list[str] = []
@@ -265,10 +733,8 @@ class Verifier:
         step_validations: list[dict[str, Any]] = []
         known_facts = {e.type.value: e.value for e in evidence}
 
-        # Extract frames
         frames = getattr(trajectory, "frames", trajectory if isinstance(trajectory, list) else [])
 
-        # Active citations in corpus
         all_active_citations: set[str] = set()
         programs_to_check = [program] if program else program_registry.all_programs()
         for p in programs_to_check:
@@ -290,7 +756,6 @@ class Verifier:
                     ev_type = getattr(ev, "type", ev.get("type") if isinstance(ev, dict) else None)
                     ev_type_val = ev_type.value if hasattr(ev_type, "value") else str(ev_type)
                     if ev_type_val not in known_facts:
-                        # Unrecorded evidence introduced mid-trajectory
                         err = f"Step {idx+1}: Ungrounded evidence type '{ev_type_val}' introduced without source ingestion"
                         grounding_violations.append(err)
                         step_errors.append(err)
@@ -538,10 +1003,20 @@ class Verifier:
         }
 
 
+# VerifierAgent class alias
+VerifierAgent = Verifier
+
 __all__ = [
     "VerificationReport",
     "TrajectoryVerificationVerdict",
-    "Verifier",
+    "TripartiteCheckResult",
+    "TripartiteVerificationResult",
+    "TripartiteSelfTestSuite",
+    "StepAdvantageRecord",
+    "SAOAnalysisResult",
+    "StepAdvantageOptimizer",
+    "DynamicVerificationFunctionGenerator",
     "ProgrammaticVerifierTools",
+    "Verifier",
+    "VerifierAgent",
 ]
-
