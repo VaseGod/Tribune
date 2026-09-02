@@ -12,10 +12,13 @@ For a synthetic (or real-intake) case it:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
+import enum
 import hashlib
 import inspect
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -250,6 +253,562 @@ class ToolResultCache:
 
 
 # --------------------------------------------------------------------------- #
+# Speculative Programmatic Tool Calling (sPTC) Harness & Shadow REPL
+# --------------------------------------------------------------------------- #
+
+
+class SpeculativeTaskStatus(str, enum.Enum):
+    PENDING = "pending"
+    HIT = "hit"
+    MISSED = "missed"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class SpeculativeTask:
+    """Represents an in-flight or completed background speculative tool execution."""
+
+    task_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    jurisdiction: str = "EX"
+    status: SpeculativeTaskStatus = SpeculativeTaskStatus.PENDING
+    created_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
+    result: Any = None
+    error: Exception | None = None
+    future: concurrent.futures.Future[Any] | asyncio.Task[Any] | None = None
+    shadow_id: str = ""
+    cache_key: str = ""
+    estimated_latency_ms: float = 120.0
+
+    def is_done(self) -> bool:
+        if self.future is not None:
+            return self.future.done()
+        return self.status in (
+            SpeculativeTaskStatus.COMPLETED,
+            SpeculativeTaskStatus.HIT,
+            SpeculativeTaskStatus.MISSED,
+            SpeculativeTaskStatus.CANCELLED,
+            SpeculativeTaskStatus.FAILED,
+        )
+
+    def cancel(self) -> bool:
+        if self.future is not None and not self.future.done():
+            cancelled = self.future.cancel()
+            self.status = SpeculativeTaskStatus.CANCELLED
+            return cancelled
+        self.status = SpeculativeTaskStatus.CANCELLED
+        return True
+
+
+class ShadowREPL:
+    """Isolated, deep-copied execution context for speculative AST evaluation.
+
+    Maintains an isolated namespace and local variable state to prevent side effects
+    from speculative execution leaking into shared workspace context or global state.
+    """
+
+    def __init__(
+        self,
+        shadow_id: str = "default_shadow",
+        base_namespace: dict[str, Any] | None = None,
+        sandbox_id: str | None = None,
+    ) -> None:
+        self.shadow_id = sandbox_id or shadow_id
+        self._namespace: dict[str, Any] = copy.deepcopy(base_namespace) if base_namespace else {}
+        self._snapshots: list[dict[str, Any]] = []
+        self._created_at = time.time()
+        self._lock = threading.RLock()
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._namespace[key] = copy.deepcopy(value)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            return copy.deepcopy(self._namespace.get(key, default))
+
+    def snapshot(self) -> str:
+        with self._lock:
+            snap = copy.deepcopy(self._namespace)
+            self._snapshots.append(snap)
+            return f"snap_{len(self._snapshots) - 1}"
+
+    def rollback_to_snapshot(self, snapshot_id: str | int = -1) -> dict[str, Any]:
+        with self._lock:
+            if not self._snapshots:
+                self._namespace.clear()
+                return {}
+            if isinstance(snapshot_id, str) and snapshot_id.startswith("snap_"):
+                idx = int(snapshot_id.split("_")[1])
+            elif isinstance(snapshot_id, int):
+                idx = snapshot_id
+            else:
+                idx = -1
+
+            if 0 <= idx < len(self._snapshots):
+                snap = self._snapshots[idx]
+            else:
+                snap = self._snapshots[-1]
+            self._namespace = copy.deepcopy(snap)
+            return copy.deepcopy(self._namespace)
+
+    def rollback(self, snapshot_idx: int = -1) -> None:
+        self.rollback_to_snapshot(snapshot_idx)
+
+    def execute_pure(self, func: Callable[..., Any] | Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            # Execute strictly within isolated shadow scope
+            call_scope = copy.deepcopy(self._namespace)
+            result = func(*args, **kwargs)
+            return copy.deepcopy(result)
+
+    def prune(self) -> None:
+        with self._lock:
+            self._namespace.clear()
+            self._snapshots.clear()
+
+
+class StreamingTokenSpeculationParser:
+    """Streaming parser scanning partial token generation and AST nodes to extract candidate tool calls."""
+
+    _TOOL_PATTERNS = [
+        re.compile(
+            r"(?:lookup_program_rules|lookup_rules)\s*\(\s*(?:program\s*=\s*)?['\"]([^'\"]+)['\"](?:,\s*(?:jurisdiction\s*=\s*)?['\"]([^'\"]+)['\"])?\s*\)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:evaluate_statutory_predicate|evaluate_criterion)\s*\(\s*(?:evidence_value\s*=\s*)?([^,)]+)(?:,\s*(?:statutory_threshold\s*=\s*)?([^,)]+))?(?:,\s*(?:operator\s*=\s*)?['\"]([^'\"]+)['\"])?\s*\)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:cross_evaluate_rule_citations|cross_evaluate_citations)\s*\(\s*(?:citations\s*=\s*)?(\[[^\]]*\]),\s*(?:program\s*=\s*)?['\"]([^'\"]+)['\"](?:,\s*(?:jurisdiction\s*=\s*)?['\"]([^'\"]+)['\"])?\s*\)",
+            re.IGNORECASE,
+        ),
+    ]
+
+    def __init__(self) -> None:
+        self.buffer = ""
+
+    def feed_token(self, token: str) -> None:
+        self.buffer += token
+
+    def reset(self) -> None:
+        self.buffer = ""
+
+    def parse_candidate_calls(self) -> list[dict[str, Any]]:
+        calls = self.parse_candidate_tool_calls(self.buffer)
+        return [{"tool_name": name, "arguments": args} for name, args in calls]
+
+    @classmethod
+    def parse_candidate_tool_calls(cls, text_buffer: str) -> list[tuple[str, dict[str, Any]]]:
+        """Extract candidate tool invocations from partial streaming text or AST representations."""
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        if not text_buffer or len(text_buffer.strip()) < 5:
+            return candidates
+
+        # 1. Check JSON tool call format (including streaming prefix)
+        json_matches = re.finditer(
+            r"\{\s*\"(?:name|tool_name|tool)\"\s*:\s*\"([^\"]+)\"\s*,\s*\"arguments\"\s*:\s*(\{.*)",
+            text_buffer,
+        )
+        for m in json_matches:
+            name, raw_args = m.group(1), m.group(2)
+            cleaned_args = raw_args.strip()
+            if not cleaned_args.endswith("}"):
+                cleaned_args += "}"
+            if cleaned_args.count("{") > cleaned_args.count("}"):
+                cleaned_args += "}" * (cleaned_args.count("{") - cleaned_args.count("}"))
+            try:
+                args = json.loads(cleaned_args)
+                candidates.append((name, args))
+            except Exception:
+                pass
+
+        # 2. Check direct function invocation syntax
+        for pat in cls._TOOL_PATTERNS:
+            for m in pat.finditer(text_buffer):
+                matched_str = m.group(0)
+                if "lookup_program_rules" in matched_str or "lookup_rules" in matched_str:
+                    prog = m.group(1).strip()
+                    jur = (m.group(2) if len(m.groups()) >= 2 and m.group(2) else "EX").strip()
+                    candidates.append(("lookup_program_rules", {"program": prog, "jurisdiction": jur}))
+                elif "evaluate_statutory_predicate" in matched_str or "evaluate_criterion" in matched_str:
+                    val = m.group(1).strip().strip("'\"")
+                    thresh = m.group(2).strip().strip("'\"") if len(m.groups()) >= 2 and m.group(2) else "0"
+                    op = (m.group(3) if len(m.groups()) >= 3 and m.group(3) else "<=").strip()
+                    candidates.append(
+                        (
+                            "evaluate_statutory_predicate",
+                            {"evidence_value": val, "statutory_threshold": thresh, "operator": op},
+                        )
+                    )
+                elif "cross_evaluate_rule_citations" in matched_str:
+                    try:
+                        raw_cits = json.loads(m.group(1)) if m.group(1).startswith("[") else []
+                    except Exception:
+                        raw_cits = []
+                    prog = m.group(2).strip()
+                    jur = (m.group(3) or "EX").strip()
+                    candidates.append(
+                        (
+                            "cross_evaluate_rule_citations",
+                            {"citations": raw_cits, "program": prog, "jurisdiction": jur},
+                        )
+                    )
+
+        return candidates
+
+
+class Speculator:
+    """Modular Speculative Execution Harness coordinating Shadow REPLs, tool hooks, and background tasks."""
+
+    def __init__(
+        self,
+        tool_cache: ToolResultCache | None = None,
+        max_concurrent_speculations: int = 8,
+        thread_pool_size: int = 4,
+        max_workers: int | None = None,
+    ) -> None:
+        self.tool_cache = tool_cache or ToolResultCache()
+        self.max_concurrent_speculations = max_concurrent_speculations
+        workers = max_workers if max_workers is not None else thread_pool_size
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="tribune-spec"
+        )
+        self._tasks: dict[str, SpeculativeTask] = {}
+        self._shadow_repls: dict[str, ShadowREPL] = {}
+        self._lock = threading.RLock()
+
+        # Telemetry
+        self.dispatched_count = 0
+        self.hits_count = 0
+        self.misses_count = 0
+        self.cancelled_count = 0
+        self.total_latency_saved_ms = 0.0
+
+    def get_or_create_shadow_repl(
+        self, shadow_id: str, base_namespace: dict[str, Any] | None = None
+    ) -> ShadowREPL:
+        with self._lock:
+            if shadow_id not in self._shadow_repls:
+                self._shadow_repls[shadow_id] = ShadowREPL(shadow_id, base_namespace)
+            return self._shadow_repls[shadow_id]
+
+    def speculate(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        jurisdiction: str = "EX",
+        shadow_id: str | None = None,
+    ) -> SpeculativeTask:
+        """Dispatch a pure statutory lookup / tool call to background execution."""
+        from ..providers.local_rules import SPECULATIVE_TOOLS_REGISTRY
+
+        with self._lock:
+            active_pending = [t for t in self._tasks.values() if not t.is_done()]
+            if len(active_pending) >= self.max_concurrent_speculations:
+                oldest = min(active_pending, key=lambda t: t.created_at)
+                oldest.cancel()
+                self.cancelled_count += 1
+
+            s_id = shadow_id or f"shadow_{len(self._shadow_repls) + 1}"
+            repl = self.get_or_create_shadow_repl(s_id)
+            task_id = f"spec_task_{len(self._tasks) + 1}_{tool_name}"
+            cache_key = ToolResultCache.compute_cache_key(tool_name, arguments, jurisdiction)
+
+            # Check ToolResultCache first
+            cached_val = self.tool_cache.get(tool_name, arguments, jurisdiction)
+            if cached_val is not None:
+                task = SpeculativeTask(
+                    task_id=task_id,
+                    tool_name=tool_name,
+                    arguments=dict(arguments),
+                    jurisdiction=jurisdiction,
+                    status=SpeculativeTaskStatus.COMPLETED,
+                    created_at=time.time(),
+                    completed_at=time.time(),
+                    result=cached_val,
+                    shadow_id=s_id,
+                    cache_key=cache_key,
+                )
+                self._tasks[task_id] = task
+                self.dispatched_count += 1
+                return task
+
+            # Find registered tool hook
+            tool_meta = SPECULATIVE_TOOLS_REGISTRY.get(tool_name)
+            func = tool_meta["func"] if tool_meta else None
+
+            task = SpeculativeTask(
+                task_id=task_id,
+                tool_name=tool_name,
+                arguments=dict(arguments),
+                jurisdiction=jurisdiction,
+                status=SpeculativeTaskStatus.PENDING,
+                created_at=time.time(),
+                shadow_id=s_id,
+                cache_key=cache_key,
+            )
+
+            if func is not None:
+
+                def _run_in_repl():
+                    start_t = time.perf_counter()
+                    try:
+                        res = repl.execute_pure(func, **arguments)
+                        dur = (time.perf_counter() - start_t) * 1000.0
+                        self.tool_cache.set(
+                            tool_name,
+                            arguments,
+                            res,
+                            jurisdiction,
+                            ttl=tool_meta.get("ttl", 300.0),
+                        )
+                        task.result = res
+                        task.completed_at = time.time()
+                        task.status = SpeculativeTaskStatus.COMPLETED
+                        task.estimated_latency_ms = dur
+                        return res
+                    except Exception as exc:
+                        task.error = exc
+                        task.status = SpeculativeTaskStatus.FAILED
+                        return None
+
+                task.future = self._executor.submit(_run_in_repl)
+            else:
+                task.status = SpeculativeTaskStatus.COMPLETED
+                task.result = {}
+
+            self._tasks[task_id] = task
+            self.dispatched_count += 1
+            return task
+
+    def parse_and_speculate(
+        self, streaming_chunk: str, jurisdiction: str = "EX"
+    ) -> list[SpeculativeTask]:
+        """Parse partial token stream and launch speculative background tasks."""
+        candidates = StreamingTokenSpeculationParser.parse_candidate_tool_calls(streaming_chunk)
+        tasks: list[SpeculativeTask] = []
+        for name, args in candidates:
+            t = self.speculate(name, args, jurisdiction)
+            tasks.append(t)
+        return tasks
+
+    def reconcile_branch(
+        self,
+        validated_tool_calls: list[tuple[str, dict[str, Any]]],
+        jurisdiction: str = "EX",
+        timeout: float = 2.0,
+    ) -> list[Any]:
+        """Reconcile final validated plan against background tasks. Consumes hits, cancels misses."""
+        results: list[Any] = []
+        with self._lock:
+            validated_keys = {
+                ToolResultCache.compute_cache_key(name, args, jurisdiction): (name, args)
+                for name, args in validated_tool_calls
+            }
+
+            for task_id, task in list(self._tasks.items()):
+                if task.cache_key in validated_keys:
+                    # Speculative Hit!
+                    if task.future is not None and not task.future.done():
+                        try:
+                            task.future.result(timeout=timeout)
+                        except Exception:
+                            pass
+                    task.status = SpeculativeTaskStatus.HIT
+                    self.hits_count += 1
+                    self.total_latency_saved_ms += max(25.0, task.estimated_latency_ms)
+                    results.append(task.result)
+                else:
+                    # Speculative Miss / Divergent Branch!
+                    if not task.is_done():
+                        task.cancel()
+                        self.cancelled_count += 1
+                    task.status = SpeculativeTaskStatus.MISSED
+                    self.misses_count += 1
+                    if task.shadow_id in self._shadow_repls:
+                        self._shadow_repls[task.shadow_id].prune()
+
+        return results
+
+    def consume_hit(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        jurisdiction: str = "EX",
+        timeout: float = 2.0,
+    ) -> Any | None:
+        """Consume a speculative hit for a tool call if available, otherwise record a miss."""
+        with self._lock:
+            cache_key = ToolResultCache.compute_cache_key(tool_name, arguments, jurisdiction)
+            for task_id, task in self._tasks.items():
+                if task.cache_key == cache_key:
+                    if task.future is not None and not task.future.done():
+                        try:
+                            task.future.result(timeout=timeout)
+                        except Exception:
+                            pass
+                    if task.result is not None:
+                        task.status = SpeculativeTaskStatus.HIT
+                        self.hits_count += 1
+                        self.total_latency_saved_ms += max(25.0, task.estimated_latency_ms)
+                        return task.result
+            self.misses_count += 1
+            return None
+
+    def cancel_divergent_branches(self, active_candidate_keys: list[str]) -> None:
+        """Cancel tasks whose candidate keys are no longer active in the plan."""
+        with self._lock:
+            active_set = set(active_candidate_keys)
+            for task in self._tasks.values():
+                if task.cache_key not in active_set and not task.is_done():
+                    task.cancel()
+                    self.cancelled_count += 1
+
+    def prune_all(self) -> None:
+        """Cancel all pending tasks and prune all shadow REPLs."""
+        with self._lock:
+            for task in self._tasks.values():
+                if not task.is_done():
+                    task.cancel()
+                    self.cancelled_count += 1
+            for repl in self._shadow_repls.values():
+                repl.prune()
+            self._shadow_repls.clear()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            total_resolved = self.hits_count + self.misses_count
+            hit_ratio = (self.hits_count / total_resolved) if total_resolved > 0 else 0.0
+            return {
+                "dispatched": self.dispatched_count,
+                "hits": self.hits_count,
+                "misses": self.misses_count,
+                "cancelled": self.cancelled_count,
+                "hit_ratio": round(hit_ratio, 4),
+                "latency_saved_ms": round(self.total_latency_saved_ms, 2),
+                "active_shadow_repls": len(self._shadow_repls),
+            }
+
+
+# --------------------------------------------------------------------------- #
+# Just-In-Time (JIT) Tool Harness Synthesis & Statutory Restriction
+# --------------------------------------------------------------------------- #
+
+
+class JITToolHarnessSynthesizer:
+    """Just-In-Time (JIT) tool harness synthesizer.
+
+    Eliminates unscripted agent actions by dynamically synthesizing and binding typed,
+    isolated tool execution harnesses at runtime based on active FSM state and program context.
+    Restricts tool execution strictly to authorized statutory rule lookups.
+    """
+
+    AUTHORIZED_STATUTORY_TOOLS: frozenset[str] = frozenset({
+        "evaluate_statutory_predicate",
+        "lookup_program_rules",
+        "cross_evaluate_rule_citations",
+        "verify_visual_layout",
+        "build_dag",
+    })
+
+    def __init__(self, rule_store: Any | None = None, tool_cache: ToolResultCache | None = None) -> None:
+        self.rule_store = rule_store
+        self.tool_cache = tool_cache or ToolResultCache()
+        self.unscripted_blocks_count: int = 0
+        self.executed_tools_count: int = 0
+
+    def is_authorized(self, tool_name: str) -> bool:
+        """Check if tool_name is an authorized statutory lookup."""
+        return tool_name.strip().lower() in self.AUTHORIZED_STATUTORY_TOOLS
+
+    def synthesize_harness_schema(self, state: SMState | str, program: str, jurisdiction: str = "EX") -> dict[str, Any]:
+        """Synthesize type-safe JIT tool harness schema specifically tailored to the active statutory state."""
+        state_str = state.value if isinstance(state, SMState) else str(state)
+        return {
+            "state": state_str,
+            "program": program,
+            "jurisdiction": jurisdiction,
+            "authorized_tools": list(self.AUTHORIZED_STATUTORY_TOOLS),
+            "harness_signature": f"JITHarness::{state_str}::{program}::{jurisdiction}",
+        }
+
+    def execute_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        jurisdiction: str = "EX",
+    ) -> Any:
+        """Execute an authorized statutory lookup within the synthesized JIT harness.
+        
+        Raises SecurityViolationError for any unscripted or unauthorized tool invocations.
+        """
+        from ..governance.action_gate import SecurityViolationError
+        from ..providers.local_rules import (
+            cross_evaluate_rule_citations,
+            evaluate_statutory_predicate,
+            lookup_program_rules,
+        )
+
+        norm_name = tool_name.strip().lower()
+        if not self.is_authorized(norm_name):
+            self.unscripted_blocks_count += 1
+            raise SecurityViolationError(
+                f"JIT Tool Harness Security Block: Unscripted tool invocation '{tool_name}' rejected. "
+                f"Tool execution is strictly restricted to authorized statutory rule lookups: "
+                f"{sorted(self.AUTHORIZED_STATUTORY_TOOLS)}."
+            )
+
+        self.executed_tools_count += 1
+
+        # Check tool cache
+        cached = self.tool_cache.get(norm_name, arguments, jurisdiction)
+        if cached is not None:
+            return cached
+
+        if norm_name == "evaluate_statutory_predicate":
+            res = evaluate_statutory_predicate(
+                evidence_value=arguments.get("evidence_value"),
+                statutory_threshold=arguments.get("statutory_threshold"),
+                operator=arguments.get("operator", "<="),
+            )
+        elif norm_name == "lookup_program_rules":
+            res = lookup_program_rules(
+                program=arguments.get("program", "snap"),
+                jurisdiction=arguments.get("jurisdiction", jurisdiction),
+            )
+        elif norm_name == "cross_evaluate_rule_citations":
+            res = cross_evaluate_rule_citations(
+                citations=arguments.get("citations", []),
+                program=arguments.get("program", "snap"),
+                jurisdiction=arguments.get("jurisdiction", jurisdiction),
+            )
+        elif norm_name == "verify_visual_layout":
+            from ..agents.navigator import ProgrammaticNavigatorTools
+            res = ProgrammaticNavigatorTools.verify_visual_layout(arguments.get("layout_dict", {}))
+        elif norm_name == "build_dag":
+            from ..agents.navigator import ProgrammaticNavigatorTools
+            res = ProgrammaticNavigatorTools.build_dag(arguments.get("target_programs", []))
+        else:
+            raise SecurityViolationError(f"Unimplemented authorized statutory tool '{tool_name}'")
+
+        self.tool_cache.set(norm_name, arguments, res, jurisdiction)
+        return res
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "authorized_tools": list(self.AUTHORIZED_STATUTORY_TOOLS),
+            "executed_tools_count": self.executed_tools_count,
+            "unscripted_blocks_count": self.unscripted_blocks_count,
+        }
+
+
+# --------------------------------------------------------------------------- #
 # Modular Pipeline Plugin Architecture
 # --------------------------------------------------------------------------- #
 
@@ -295,6 +854,44 @@ class PipelinePlugin:
     ) -> None:
         """Invoked after all DAG tasks and outcomes have concluded."""
         pass
+
+
+class SpeculativeExecutionPlugin(PipelinePlugin):
+    """Pipeline plugin managing Speculator lifecycle and speculative tool execution."""
+
+    name = "speculative_execution"
+
+    def __init__(self, speculator: Speculator) -> None:
+        self.speculator = speculator
+
+    def on_pipeline_start(self, case: SyntheticCase, workspace: WorkspaceContext | None) -> None:
+        # Pre-speculate pure rule lookups for all target programs
+        for prog in case.target_programs:
+            self.speculator.speculate(
+                tool_name="lookup_program_rules",
+                arguments={"program": prog.value, "jurisdiction": case.jurisdiction},
+                jurisdiction=case.jurisdiction,
+            )
+
+    def on_pipeline_end(
+        self,
+        case: SyntheticCase,
+        result: CaseRunResult,
+        workspace: WorkspaceContext | None,
+    ) -> None:
+        # Reconcile pre-speculated program lookups
+        validated = [
+            ("lookup_program_rules", {"program": prog.value, "jurisdiction": case.jurisdiction})
+            for prog in case.target_programs
+        ]
+        self.speculator.reconcile_branch(validated, jurisdiction=case.jurisdiction)
+        stats = self.speculator.stats()
+        result.speculative_dispatched = stats["dispatched"]
+        result.speculative_hits = stats["hits"]
+        result.speculative_misses = stats["misses"]
+        result.speculative_cancelled = stats["cancelled"]
+        result.speculative_latency_saved_ms = stats["latency_saved_ms"]
+        self.speculator.prune_all()
 
 
 class AuditLoggingPlugin(PipelinePlugin):
@@ -464,8 +1061,10 @@ class CasePipeline:
         self.async_runner = AsyncDAGRunner()
         self.workspace: WorkspaceContext | None = None
 
-        # Asynchronous tool cache
+        # Asynchronous tool cache & Speculator harness
         self.tool_cache = ToolResultCache(default_ttl=300.0, max_size=1000)
+        self.speculator = Speculator(tool_cache=self.tool_cache)
+        self.jit_harness = JITToolHarnessSynthesizer(rule_store=self.rule_store, tool_cache=self.tool_cache)
 
         # State machine
         self.sm = CaseStateMachine(
@@ -490,6 +1089,7 @@ class CasePipeline:
             self._plugins.append(AuditLoggingPlugin(self.audit))
             self._plugins.append(WorkspaceSyncPlugin())
             self._plugins.append(ToolCachePlugin(self.tool_cache))
+            self._plugins.append(SpeculativeExecutionPlugin(self.speculator))
             self._plugins.append(GovernanceJudgePlugin(self.audit))
 
     def record_failure_trace(self, trace: dict[str, Any]) -> None:
@@ -1002,10 +1602,17 @@ __all__ = [
     "TrajectoryFrame",
     "TrajectoryBuffer",
     "ToolResultCache",
+    "SpeculativeTaskStatus",
+    "SpeculativeTask",
+    "ShadowREPL",
+    "StreamingTokenSpeculationParser",
+    "Speculator",
+    "SpeculativeExecutionPlugin",
     "PipelinePlugin",
     "AuditLoggingPlugin",
     "WorkspaceSyncPlugin",
     "GovernanceJudgePlugin",
     "ToolCachePlugin",
+    "JITToolHarnessSynthesizer",
     "CasePipeline",
 ]

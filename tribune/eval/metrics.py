@@ -71,6 +71,10 @@ class EvalRecord:
     citation_latency_ms: float = 0.0
     llm_latency_ms: float = 0.0
     total_latency_ms: float = 0.0
+    step_latencies: dict[str, float] = field(default_factory=dict)
+    fold_planning_latency_ms: float = 0.0
+    json_extraction_latency_ms: float = 0.0
+    synthesis_latency_ms: float = 0.0
     # -- statutory citations & decisive criteria -- #
     citations: list[str] = field(default_factory=list)
     decisive_criteria: list[str] = field(default_factory=list)
@@ -224,6 +228,7 @@ class MetricsReport:
     mean_citation_latency_ms: float = float("nan")
     mean_llm_latency_ms: float = float("nan")
     mean_total_latency_ms: float = float("nan")
+    mean_step_latencies: dict[str, float] = field(default_factory=dict)
     perceived_error_rate: float = float("nan")
     uncited_claim_rate: float = float("nan")
     mean_judge_confidence: float = float("nan")
@@ -272,6 +277,9 @@ class MetricsReport:
             f"  pure LLM generation (mean)      : {f_ms(self.mean_llm_latency_ms)}",
             f"  total pipeline latency (mean)   : {f_ms(self.mean_total_latency_ms)}",
         ]
+        if self.mean_step_latencies:
+            for s_name, s_val in sorted(self.mean_step_latencies.items()):
+                lines.append(f"  {s_name} (mean) : {f_ms(s_val)}")
         return "\n".join(lines)
 
     def render_full(self) -> str:
@@ -340,6 +348,23 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
     mean_j_cost = (sum(judge_costs) / len(judge_costs)) if judge_costs else 0.0
     tot_j_cost = sum(judge_costs)
 
+    # Disaggregated step latencies aggregation
+    step_latency_acc: dict[str, list[float]] = defaultdict(list)
+    for r in records:
+        if r.fold_planning_latency_ms > 0:
+            step_latency_acc["fold_planning"].append(r.fold_planning_latency_ms)
+        if r.json_extraction_latency_ms > 0:
+            step_latency_acc["json_extraction"].append(r.json_extraction_latency_ms)
+        if r.synthesis_latency_ms > 0:
+            step_latency_acc["synthesis"].append(r.synthesis_latency_ms)
+        for s_k, s_v in getattr(r, "step_latencies", {}).items():
+            if s_v > 0:
+                step_latency_acc[s_k].append(s_v)
+
+    mean_step_latencies = {
+        s_k: sum(s_vals) / len(s_vals) for s_k, s_vals in step_latency_acc.items() if s_vals
+    }
+
     return MetricsReport(
         scope=scope,
         n=n,
@@ -360,6 +385,7 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
         mean_citation_latency_ms=mean_cit,
         mean_llm_latency_ms=mean_llm,
         mean_total_latency_ms=mean_tot,
+        mean_step_latencies=mean_step_latencies,
         perceived_error_rate=p_err,
         uncited_claim_rate=u_claim,
         mean_judge_confidence=j_conf,
@@ -370,6 +396,7 @@ def _compute(scope: str, records: list[EvalRecord]) -> MetricsReport:
     )
 
 
+
 def compute_metrics(records: list[EvalRecord]) -> MetricsReport:
     overall = _compute("overall", records)
     by_program: dict[str, list[EvalRecord]] = defaultdict(list)
@@ -377,3 +404,191 @@ def compute_metrics(records: list[EvalRecord]) -> MetricsReport:
         by_program[r.program.value].append(r)
     overall.per_program = {name: _compute(name, recs) for name, recs in sorted(by_program.items())}
     return overall
+
+
+# --------------------------------------------------------------------------- #
+# Skill-Lift Empirical Benchmarking Dataclasses & Math
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class SkillLiftRecord:
+    """A paired evaluation run on identical case input: baseline (unskilled) vs. skilled."""
+
+    case_id: str
+    program: ProgramId
+    ground_truth_label: str  # "eligible" | "ineligible"
+    ambiguous: bool
+    baseline_predicted_label: str | None = None
+    skilled_predicted_label: str | None = None
+    baseline_abstained: bool = False
+    skilled_abstained: bool = False
+    baseline_score: float = 0.0
+    skilled_score: float = 0.0
+    skill_lift: float = 0.0  # skilled_score - baseline_score
+    baseline_citations_count: int = 0
+    skilled_citations_count: int = 0
+    statutory_citation_accuracy: float = 1.0
+    reasoning_fidelity: float = 1.0
+    under_appeal: bool = False
+
+
+@dataclass
+class ProgramSkillLift:
+    """Skill lift breakdown for an individual statutory benefit program."""
+
+    program: str
+    n_cases: int
+    baseline_accuracy: float
+    skilled_accuracy: float
+    accuracy_lift: float
+    baseline_utility: float
+    skilled_utility: float
+    utility_lift: float
+    baseline_fcr: float
+    skilled_fcr: float
+    fcr_reduction: float
+    statutory_citation_accuracy: float
+    appeal_reasoning_fidelity: float
+    mean_skill_lift: float
+
+
+@dataclass
+class SkillLiftReport:
+    """Comprehensive Empirical Skill-Lift Report comparing baseline vs skilled pipeline runs."""
+
+    scope: str = "overall"
+    n_total_cases: int = 0
+    mean_skill_lift: float = 0.0
+    accuracy_lift: float = 0.0
+    utility_lift: float = 0.0
+    citation_accuracy_lift: float = 0.0
+    appeal_fidelity_lift: float = 0.0
+    per_program: dict[str, ProgramSkillLift] = field(default_factory=dict)
+
+    def render(self) -> str:
+        def f(x: float) -> str:
+            return "  n/a" if isnan(x) else f"{x:+6.3f}"
+
+        def fp(x: float) -> str:
+            return "  n/a" if isnan(x) else f"{x:6.3f}"
+
+        lines = [
+            f"=== TRIBUNE Empirical Skill-Lift Report — {self.scope} (n={self.n_total_cases}) ===",
+            f"  NET EMPIRICAL SKILL LIFT        : {f(self.mean_skill_lift)}   <-- (Skilled - Baseline)",
+            f"  Accuracy Lift (delta)           : {f(self.accuracy_lift)}",
+            f"  Utility Lift (delta)            : {f(self.utility_lift)}",
+            f"  Statutory Citation Accuracy Lift: {f(self.citation_accuracy_lift)}",
+            f"  Appeal Reasoning Fidelity Lift  : {f(self.appeal_fidelity_lift)}",
+            "  --- Per-Program Skill Lift Breakdown ---",
+        ]
+        for prog, lift in sorted(self.per_program.items()):
+            lines.append(
+                f"  [{prog:<12}] Lift: {f(lift.mean_skill_lift)} | "
+                f"Acc: {fp(lift.baseline_accuracy)} -> {fp(lift.skilled_accuracy)} ({f(lift.accuracy_lift)}) | "
+                f"CitAcc: {fp(lift.statutory_citation_accuracy)} | "
+                f"Fidelity: {fp(lift.appeal_reasoning_fidelity)}"
+            )
+        return "\n".join(lines)
+
+
+def _score_single_outcome(predicted: str | None, truth: str, abstained: bool, ambiguous: bool) -> float:
+    if abstained:
+        return _W_ABSTAIN_AMBIGUOUS if ambiguous else _W_ABSTAIN_CLEAR
+    if predicted == truth:
+        return _W_CORRECT
+    return _W_WRONG
+
+
+def compute_skill_lift(paired_records: list[SkillLiftRecord]) -> SkillLiftReport:
+    """Compute empirical Skill Lift delta metrics across paired baseline and skilled evaluation runs."""
+    if not paired_records:
+        return SkillLiftReport()
+
+    n_total = len(paired_records)
+    by_program: dict[str, list[SkillLiftRecord]] = defaultdict(list)
+    for r in paired_records:
+        by_program[r.program.value].append(r)
+
+    program_lifts: dict[str, ProgramSkillLift] = {}
+
+    for prog_name, recs in by_program.items():
+        n = len(recs)
+        base_correct = sum(
+            1 for r in recs if not r.baseline_abstained and r.baseline_predicted_label == r.ground_truth_label
+        )
+        base_asserted = sum(1 for r in recs if not r.baseline_abstained)
+        base_acc = (base_correct / base_asserted) if base_asserted > 0 else 0.0
+
+        skill_correct = sum(
+            1 for r in recs if not r.skilled_abstained and r.skilled_predicted_label == r.ground_truth_label
+        )
+        skill_asserted = sum(1 for r in recs if not r.skilled_abstained)
+        skill_acc = (skill_correct / skill_asserted) if skill_asserted > 0 else 0.0
+        acc_lift = skill_acc - base_acc
+
+        base_scores = [
+            _score_single_outcome(r.baseline_predicted_label, r.ground_truth_label, r.baseline_abstained, r.ambiguous)
+            for r in recs
+        ]
+        skill_scores = [
+            _score_single_outcome(r.skilled_predicted_label, r.ground_truth_label, r.skilled_abstained, r.ambiguous)
+            for r in recs
+        ]
+        base_util = sum(base_scores) / n
+        skill_util = sum(skill_scores) / n
+        util_lift = skill_util - base_util
+
+        base_wrong = sum(
+            1 for r in recs if not r.baseline_abstained and r.baseline_predicted_label != r.ground_truth_label
+        )
+        skill_wrong = sum(
+            1 for r in recs if not r.skilled_abstained and r.skilled_predicted_label != r.ground_truth_label
+        )
+        base_fcr = base_wrong / n
+        skill_fcr = skill_wrong / n
+        fcr_red = base_fcr - skill_fcr
+
+        cit_accs = [r.statutory_citation_accuracy for r in recs]
+        mean_cit_acc = sum(cit_accs) / len(cit_accs) if cit_accs else 1.0
+
+        fidelities = [r.reasoning_fidelity for r in recs]
+        mean_fidelity = sum(fidelities) / len(fidelities) if fidelities else 1.0
+
+        lifts = [r.skill_lift for r in recs]
+        mean_lift = sum(lifts) / len(lifts) if lifts else 0.0
+
+        program_lifts[prog_name] = ProgramSkillLift(
+            program=prog_name,
+            n_cases=n,
+            baseline_accuracy=round(base_acc, 4),
+            skilled_accuracy=round(skill_acc, 4),
+            accuracy_lift=round(acc_lift, 4),
+            baseline_utility=round(base_util, 4),
+            skilled_utility=round(skill_util, 4),
+            utility_lift=round(util_lift, 4),
+            baseline_fcr=round(base_fcr, 4),
+            skilled_fcr=round(skill_fcr, 4),
+            fcr_reduction=round(fcr_red, 4),
+            statutory_citation_accuracy=round(mean_cit_acc, 4),
+            appeal_reasoning_fidelity=round(mean_fidelity, 4),
+            mean_skill_lift=round(mean_lift, 4),
+        )
+
+    all_lifts = [r.skill_lift for r in paired_records]
+    overall_mean_lift = sum(all_lifts) / len(all_lifts) if all_lifts else 0.0
+    overall_acc_lift = sum(p.accuracy_lift for p in program_lifts.values()) / max(1, len(program_lifts))
+    overall_util_lift = sum(p.utility_lift for p in program_lifts.values()) / max(1, len(program_lifts))
+    overall_cit_lift = sum(p.statutory_citation_accuracy for p in program_lifts.values()) / max(1, len(program_lifts))
+    overall_fid_lift = sum(p.appeal_reasoning_fidelity for p in program_lifts.values()) / max(1, len(program_lifts))
+
+    return SkillLiftReport(
+        scope="overall",
+        n_total_cases=n_total,
+        mean_skill_lift=round(overall_mean_lift, 4),
+        accuracy_lift=round(overall_acc_lift, 4),
+        utility_lift=round(overall_util_lift, 4),
+        citation_accuracy_lift=round(overall_cit_lift, 4),
+        appeal_fidelity_lift=round(overall_fid_lift, 4),
+        per_program=program_lifts,
+    )

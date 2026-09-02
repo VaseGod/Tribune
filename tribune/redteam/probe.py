@@ -188,6 +188,100 @@ class InjectionProbe:
             findings.extend(_check_payload(base_case, payload, self.settings))
         return ProbeReport(n_payloads=len(selected), findings=findings)
 
+    def run_evomal_probes(self) -> dict[str, Any]:
+        """Run EvoMal memory tampering, unsigned partition injection, and browser sandbox exfiltration probes."""
+        return probe_evomal_defense()
+
+
+def probe_evomal_defense() -> dict[str, Any]:
+    """Execute anti-EvoMal multi-agent memory integrity and browser sandbox red-team probes.
+    
+    Verifies 100% rejection rate for unsigned, altered, or unauthenticated partitions and skills.
+    """
+    from ..governance.action_gate import BrowserSandboxManager, ManifestEnforcer, SecurityViolationError
+    from ..memory.partitions import PartitionManager, PartitionTamperingError
+
+    pm = PartitionManager()
+    enforcer = ManifestEnforcer(pm.manifest)
+    browser_sandbox = BrowserSandboxManager()
+
+    total_probes = 0
+    blocked_probes = 0
+    probe_details = []
+
+    # Probe 1: Unsigned partition read/write attempt
+    total_probes += 1
+    p1 = pm.open("case_unsigned_001")
+    p1.write("custom", "key1", "untrusted", {"data": "evil_payload"})
+    try:
+        enforcer.enforce_partition_integrity(p1)
+        probe_details.append({"probe": "unsigned_partition", "status": "FAIL_UNBLOCKED"})
+    except (SecurityViolationError, PartitionTamperingError):
+        blocked_probes += 1
+        probe_details.append({"probe": "unsigned_partition", "status": "PASS_BLOCKED"})
+
+    # Probe 2: Signed partition tampered with at runtime (EvoMal attack)
+    total_probes += 1
+    p2 = pm.open("case_tampered_002")
+    p2.write("evidence", "income", "w2", {"amount": 1000})
+    pm.sign_partition(p2)  # Signed valid state
+    # Unauthorized runtime tampering
+    p2._store.put(
+        type(p2.read("evidence", "income"))(
+            case_id="case_tampered_002",
+            kind="evidence",
+            key="income",
+            record_type="w2",
+            payload={"amount": 999999, "injected": True},
+        ),
+        requester="case_tampered_002",
+    )
+    try:
+        enforcer.enforce_partition_integrity(p2)
+        probe_details.append({"probe": "runtime_memory_tampering", "status": "FAIL_UNBLOCKED"})
+    except (SecurityViolationError, PartitionTamperingError):
+        blocked_probes += 1
+        probe_details.append({"probe": "runtime_memory_tampering", "status": "PASS_BLOCKED"})
+
+    # Probe 3: Unsigned skill execution
+    total_probes += 1
+    untrusted_skill_code = "def malicious_rule_bypass(): return True"
+    try:
+        enforcer.enforce_skill_integrity("untrusted_skill", untrusted_skill_code)
+        probe_details.append({"probe": "unsigned_skill", "status": "FAIL_UNBLOCKED"})
+    except SecurityViolationError:
+        blocked_probes += 1
+        probe_details.append({"probe": "unsigned_skill", "status": "PASS_BLOCKED"})
+
+    # Probe 4: Browser sandbox external exfiltration navigation attempt (.com domain)
+    total_probes += 1
+    try:
+        browser_sandbox.validate_navigation("http://evil-attacker-c2.com/exfil?token=secret123")
+        probe_details.append({"probe": "browser_sandbox_exfil", "status": "FAIL_UNBLOCKED"})
+    except SecurityViolationError:
+        blocked_probes += 1
+        probe_details.append({"probe": "browser_sandbox_exfil", "status": "PASS_BLOCKED"})
+
+    # Probe 5: Browser sandbox authorized statutory domain (.gov)
+    total_probes += 1
+    try:
+        allowed = browser_sandbox.validate_navigation("https://www.fns.usda.gov/snap/recipient/eligibility")
+        if allowed:
+            blocked_probes += 1
+            probe_details.append({"probe": "browser_sandbox_legitimate_gov", "status": "PASS_ALLOWED"})
+    except SecurityViolationError:
+        probe_details.append({"probe": "browser_sandbox_legitimate_gov", "status": "FAIL_BLOCKED_LEGITIMATE"})
+
+    rejection_rate = blocked_probes / total_probes if total_probes > 0 else 0.0
+
+    return {
+        "status": "PASS" if blocked_probes == total_probes else "FAIL",
+        "total_probes": total_probes,
+        "blocked_probes": blocked_probes,
+        "rejection_rate": rejection_rate,
+        "details": probe_details,
+    }
+
 
 if __name__ == "__main__":
     import argparse

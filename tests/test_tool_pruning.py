@@ -64,3 +64,32 @@ def test_rule_store_scoped_schema():
     assert "gross_income" in schema["required_criteria"]
     assert any(r["criterion_id"] == "gross_income" for r in schema["rules"])
 
+
+def test_context_graph_tool_pruning_and_folding():
+    from tribune.context.graph_builder import ExternalKVStore, fold_payload, prune_trajectory
+
+    kv = ExternalKVStore()
+    tool_output_payload = {
+        "status": "success",
+        "raw_response_large": "JSON payload " * 100,
+        "records": list(range(100)),
+    }
+
+    folded = fold_payload(tool_output_payload, kv_store=kv, key_prefix="snap_tool")
+    assert folded["folded"] is True
+    assert "$ref" in folded
+    assert kv.get(folded["$ref"]) == tool_output_payload
+
+    # Pruning trajectory with redundant tool executions
+    frames = [
+        {"action": "lookup_snap_gross_income", "query_key": "income_1"},
+        {"action": "lookup_snap_gross_income", "query_key": "income_1"},  # duplicate
+        {"action": "aborted_subgoal", "aborted": True},
+        {"action": "finalize_determination", "query_key": "final"},
+    ]
+    pruned = prune_trajectory(frames)
+    assert len(pruned) == 2
+    assert pruned[0]["action"] == "lookup_snap_gross_income"
+    assert pruned[1]["action"] == "finalize_determination"
+
+

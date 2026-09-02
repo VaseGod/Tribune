@@ -247,6 +247,23 @@ class Navigator:
         """Cross-reference visual layout elements against agency rendering rules."""
         return self.layout_cross_referencer.verify_layout(document_layout, template_name)
 
+    def cross_reference_claims(
+        self,
+        claims: list[dict[str, Any]] | list[str],
+        program: str | ProgramId,
+        jurisdiction: str = "EX",
+    ) -> dict[str, Any]:
+        """Cross-reference navigator statutory eligibility claims against local rules."""
+        from ..providers.local_rules import cross_evaluate_rule_citations
+
+        prog_str = program.value if isinstance(program, ProgramId) else str(program)
+        citations = []
+        for c in claims:
+            cid = c.get("citation_id") or c.get("citation") if isinstance(c, dict) else str(c)
+            if cid:
+                citations.append(str(cid))
+        return cross_evaluate_rule_citations(citations, program=prog_str, jurisdiction=jurisdiction)
+
     @staticmethod
     def target_programs(case: SyntheticCase) -> list[ProgramId]:
         return list(case.target_programs)

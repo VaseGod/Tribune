@@ -212,3 +212,23 @@ def test_eligibility_proposer_entropy_bifurcation():
     assert diag_b.entropy_gated
     assert provider.calls == 1  # 1 LLM rollout triggered
 
+
+def test_mandatory_0_85_factual_confidence_abstention():
+    # If confidence drops below 0.85, Calibrator must abstain unconditionally
+    cal = Calibrator(threshold=0.85)
+    # Marginal diagnostic that yields conf ~ 0.70-0.80
+    diag = AssessmentDiagnostics(
+        required_total=4,
+        evaluated_required=4,
+        unknown_required=0,
+        coverage=0.8,
+        resolved_fraction=0.8,
+        min_margin=0.05,
+        ambiguity_signals=[],
+    )
+    score = cal.score(_assessment(EligibilityStatus.LIKELY_ELIGIBLE), diag, _approved())
+    if score.calibrated_confidence < 0.85:
+        assert score.abstain is True
+        assert "fell below mandatory threshold" in score.reason
+    assert score.threshold >= 0.85
+

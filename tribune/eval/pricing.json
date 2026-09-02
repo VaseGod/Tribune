@@ -84,6 +84,22 @@
       ]
     },
     {
+      "backend_id": "zhipu:glm-5.3-flash",
+      "kind": "api",
+      "model_patterns": ["*glm-5.3-flash*", "glm-5.3-flash*", "zhipu:*glm-5.3*"],
+      "rates": [
+        {
+          "effective_from": "2026-01-01",
+          "effective_until": null,
+          "input_per_m": 0.15,
+          "output_per_m": 0.50,
+          "cache_read_per_m": 0.0375,
+          "cache_write_per_m": 0.15,
+          "note": "GLM-5.3-Flash long-context workhorse pricing"
+        }
+      ]
+    },
+    {
       "backend_id": "deepseek:chat",
       "kind": "api",
       "model_patterns": ["*deepseek-chat*", "*deepseek-reasoner*", "deepseek:*"],

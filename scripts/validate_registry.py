@@ -47,6 +47,9 @@ class Candidate(BaseModel):
     measured_kappa: float | None = None
     measured_cost_per_task: float | None = None
     promo_end_date: str | None = None
+    kernel_protocol: str | None = None
+    cordis_plugin: bool = False
+    supports_deterministic_replay: bool = False
     notes: str = ""
 
     @model_validator(mode="after")
@@ -68,7 +71,7 @@ class Candidate(BaseModel):
 
 
 class ProviderSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     provider_type: str
     model_name: str
@@ -84,10 +87,16 @@ class ProviderSpec(BaseModel):
     sla_p95_ms: float | None = None
     fallback_model: str | None = None
     speculative_drafter: str | None = None
+    kernel_protocol: str | None = None
+    cordis_plugin: bool = False
+    supports_deterministic_replay: bool = False
+    supports_sandboxing: bool = False
+    api_schema: str | None = None
 
 
 class Registry(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
 
     version: int
     seed_set: str
@@ -98,6 +107,9 @@ class Registry(BaseModel):
     qwen3_8_27b_local: dict | None = None
     local_moe_qwen_int4: dict | None = None
     local_moe_mixtral_gguf: dict | None = None
+    cordis_plugins: dict | None = None
+    deepseek_harness_config: dict | None = None
+
 
 
     @model_validator(mode="after")

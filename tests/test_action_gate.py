@@ -195,4 +195,115 @@ def test_postcondition_assertion_verifies_receipt_integrity():
         gate.assert_postconditions(receipt=bad_receipt, materials=materials)
 
 
+def test_architectural_firewall_blocks_unverified_glm_5_3_flash_direct_emission():
+    from tribune.corpus.rule_store import LocalRuleStore
+    from tribune.governance.action_gate import ActionGate, SecurityViolationError
+    from tribune.types import (
+        Assessment,
+        CriterionOutcome,
+        CriterionResult,
+        EligibilityStatus,
+        RecommendedAction,
+    )
+
+    store = LocalRuleStore()
+    citations = store.all_citations(ProgramId.SNAP, "EX")
+    valid_citation = citations[0]
+
+    assessment = Assessment(
+        assessment_id="c1:snap:a1",
+        case_id="c1",
+        program=ProgramId.SNAP,
+        jurisdiction="EX",
+        status=EligibilityStatus.LIKELY_ELIGIBLE,
+        recommended_action=RecommendedAction.PREPARE_APPLICATION,
+        self_confidence=0.95,
+        rationale="Direct determination emitted via glm-5.3-flash model without verifier pass.",
+        criteria=[
+            CriterionResult(
+                criterion_id="snap_gross_income",
+                description="Gross income test",
+                outcome=CriterionOutcome.SATISFIED,
+                required=True,
+                citation_ids=[valid_citation.citation_id],
+            )
+        ],
+        citations=[valid_citation],
+    )
+
+    gate = ActionGate()
+    # Unverified glm-5.3-flash direct determination must be rejected by the architectural firewall
+    with pytest.raises(SecurityViolationError, match="ActionGate Architectural Firewall"):
+        gate.enforce_proposer_model_firewall(assessment, source_model="glm-5.3-flash", is_verified=False)
+
+    is_valid, violations = gate.verify_citations(assessment, store, source_model="glm-5.3-flash", is_verified=False)
+    assert not is_valid
+    assert any("ActionGate Architectural Firewall" in v for v in violations)
+
+
+def test_validate_navigator_statutory_claims_pipeline():
+    from tribune.agents.verifier import IndependentVerifier
+    from tribune.corpus.rule_store import LocalRuleStore
+    from tribune.governance.action_gate import ActionGate, PreConditionError
+    from tribune.providers.local_rules import LocalRulesProvider
+
+    store = LocalRuleStore()
+    provider = LocalRulesProvider(role="verifier")
+    verifier = IndependentVerifier(provider, rule_store=store)
+    gate = ActionGate()
+
+    snap_citations = store.all_citations(ProgramId.SNAP, "EX")
+    valid_id = snap_citations[0].citation_id
+
+    # Valid claim matching local_rules.py passes
+    valid_claims = [{"claim_id": "c1", "citation_id": valid_id}]
+    res = gate.validate_navigator_statutory_claims(
+        valid_claims, program="snap", jurisdiction="EX", verifier=verifier
+    )
+    assert res["valid"] is True
+    assert res["cross_referenced_local_rules"] is True
+
+    # Invalid claim missing from local_rules.py fails
+    invalid_claims = [{"claim_id": "c2", "citation_id": "FAKE_CFR_STATUTE_999"}]
+    with pytest.raises(PreConditionError, match="claims reference unverified/missing statutory citations"):
+        gate.validate_navigator_statutory_claims(
+            invalid_claims, program="snap", jurisdiction="EX", verifier=verifier
+        )
+
+
+def test_path_containment_validation_and_tool_blocking():
+    from tribune.governance.action_gate import (
+        ActionGate,
+        SecurityViolationError,
+        SupervisorSignature,
+        validate_path_containment,
+    )
+
+    # 1. Direct path containment function checks
+    assert validate_path_containment("safe_file.json") is True
+    assert validate_path_containment("data/output/report.txt") is True
+    assert validate_path_containment("../../etc/passwd") is False
+    assert validate_path_containment("/etc/shadow") is False
+    assert validate_path_containment("~/.ssh/id_rsa") is False
+    assert validate_path_containment(".env") is False
+
+    # 2. Tool execution with out-of-bounds path raises SecurityViolationError
+    gate = ActionGate()
+
+    def dummy_reader(path: str):
+        return {"data": "content"}
+
+    sig = SupervisorSignature.issue("supervisor-alex", "read_file:c1")
+
+    with pytest.raises(SecurityViolationError, match="blocked out-of-bounds file system traversal"):
+        gate.execute_tool(
+            tool_name="read_file",
+            tool_fn=dummy_reader,
+            kwargs={"path": "../../etc/shadow", "case_id": "c1"},
+            sandbox_mode=False,
+            supervisor_signature=sig,
+        )
+
+
+
 

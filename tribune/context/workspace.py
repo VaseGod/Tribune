@@ -222,10 +222,14 @@ class WorkspaceContext:
         case_id: str = "",
         jurisdiction: str = "EX",
         storage_path: str | None = None,
+        max_context_tokens: int = 1_048_576,  # 1M token context window capacity for GLM-5.3-Flash / Gemini
     ) -> None:
         self.case_id = case_id
         self.jurisdiction = jurisdiction
         self.storage_path = storage_path
+        self.max_context_tokens = max_context_tokens
+        self.buffer_capacity_tokens = max_context_tokens
+        self.is_long_horizon_supported = True
         self._lock = threading.RLock()
         self._state = WorkspaceState(case_id=case_id, jurisdiction=jurisdiction)
         self._patch_history: list[DeltaPatch] = []
@@ -353,6 +357,32 @@ class WorkspaceContext:
             self._touch()
             return self.read_path(f"/visual_layouts/{doc_id}")
 
+
+    def get_estimated_token_count(self) -> int:
+        """Estimate total token volume of current workspace state and patch history."""
+        with self._lock:
+            state_json = json.dumps(self._state.to_dict(), default=str)
+            return (len(state_json.encode("utf-8")) + self._patch_bytes_total) // 4
+
+    def fits_in_context_window(self, token_count: int | None = None) -> bool:
+        """Check whether current state plus additional tokens fit within native 1M context window."""
+        with self._lock:
+            curr = self.get_estimated_token_count()
+            additional = token_count or 0
+            return (curr + additional) <= self.max_context_tokens
+
+    def ingest_long_horizon_records(
+        self, records: list[dict[str, Any]], namespace: str = "longitudinal_records"
+    ) -> WorkspaceSnapshot:
+        """Ingest multi-year case history records and longitudinal evidence into workspace state."""
+        patch = DeltaPatch(
+            run_id=self.case_id,
+            agent_id="preparer",
+            operation=PatchOperationType.MERGE_DICT,
+            path=f"/shared_facts/{namespace}",
+            value={"records": records, "record_count": len(records), "ingested_at": time.time()},
+        )
+        return self.apply_patch(patch)
 
     def snapshot(self) -> WorkspaceSnapshot:
         """Create an immutable snapshot of current workspace state."""

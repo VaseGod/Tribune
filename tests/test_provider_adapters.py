@@ -112,6 +112,73 @@ class TestProviderAdapters(unittest.TestCase):
         err_500 = ProviderAPIError("Internal server error", status_code=500)
         self.assertFalse(err_500.is_rate_limit)
 
+    @patch("tribune.providers.llm_client.BaseHTTPProviderAdapter._post_json")
+    def test_openai_responses_adapter(self, mock_post: MagicMock) -> None:
+        from tribune.providers.llm_client import OpenAIResponsesAdapter
+
+        mock_post.return_value = (
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "Structured Responses output"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 60,
+                    "input_tokens_details": {"cached_tokens": 10},
+                },
+            },
+            110.0,
+        )
+
+        adapter = OpenAIResponsesAdapter(self.settings, model="gpt-5.6-sol-reasoning")
+        req = LLMCompletionRequest(
+            system_prompt="You are a legal reasoning verifier.",
+            messages=[{"role": "user", "content": "Adjudicate appeal"}],
+            max_tokens=500,
+        )
+        resp = adapter.complete(req)
+
+        mock_post.assert_called_once()
+        url, payload, headers = mock_post.call_args[0]
+        self.assertTrue(url.endswith("/v1/responses"))
+        self.assertEqual(payload["model"], "gpt-5.6-sol-reasoning")
+        self.assertEqual(len(payload["input"]), 2)
+        self.assertEqual(resp.content, "Structured Responses output")
+        self.assertEqual(resp.input_tokens, 40)
+        self.assertEqual(resp.output_tokens, 60)
+        self.assertEqual(resp.cached_tokens, 10)
+
+    def test_deterministic_trace_logger_and_replay_verifier(self) -> None:
+        from tribune.providers.llm_client import DeterministicTraceLogger, ReplaySessionVerifier
+
+        logger = DeterministicTraceLogger(session_id="test_session_001")
+        logger.record_turn(
+            role="proposer",
+            input_payload={"prompt": "evaluate SNAP income"},
+            output_payload={"status": "likely_eligible", "citations": ["7_CFR_273_9"]},
+        )
+        logger.record_turn(
+            role="verifier",
+            input_payload={"assessment": "likely_eligible"},
+            output_payload={"verified": True, "score": 1.0},
+        )
+
+        trace_log = logger.to_trace_log()
+        self.assertEqual(trace_log["total_events"], 2)
+
+        verifier = ReplaySessionVerifier(trace_log)
+        self.assertTrue(verifier.verify_trace_integrity())
+
+        # Replay events
+        first_out = verifier.replay_next()
+        self.assertEqual(first_out["status"], "likely_eligible")
+        second_out = verifier.replay_next()
+        self.assertEqual(second_out["verified"], True)
+
 
 if __name__ == "__main__":
     unittest.main()
+

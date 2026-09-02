@@ -236,6 +236,26 @@ class CostModel:
 
         return pareto_points
 
+    def compute_offload_cost(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        amortized_hourly_rate: float = 0.05,
+        tokens_per_sec: float = 68.0,
+    ) -> dict[str, float]:
+        """Compute amortized local workstation hardware execution cost and latency."""
+        total_tokens = prompt_tokens + completion_tokens
+        duration_s = total_tokens / max(1.0, tokens_per_sec)
+        cost_usd = (duration_s / 3600.0) * amortized_hourly_rate
+        return {
+            "prompt_tokens": float(prompt_tokens),
+            "completion_tokens": float(completion_tokens),
+            "total_tokens": float(total_tokens),
+            "duration_s": round(duration_s, 4),
+            "cost_usd": round(cost_usd, 8),
+            "cost_per_1k": round((cost_usd / max(1, total_tokens)) * 1000.0, 6),
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Multi-Turn Trajectory Cost Model with Horizon & State Transition Multipliers

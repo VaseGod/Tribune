@@ -64,6 +64,30 @@ class TestCostTelemetry(unittest.TestCase):
         self.assertIn("anthropic:claude-3-5-sonnet", summary["by_provider"])
         self.assertIn("deepseek:v4-flash", summary["by_provider"])
 
+    def test_cost_benefit_gating_simulation(self) -> None:
+        from tribune.instrumentation.telemetry import CostBenefitGate
+
+        gate = CostBenefitGate()
+
+        # 1. Very small token savings (e.g. 10 tokens) -> planner cost exceeds savings -> should NOT execute
+        should_exec, metrics = gate.simulate_gc_cost_benefit(
+            projected_token_savings=10,
+            planner_input_tokens=1500,
+            planner_output_tokens=300,
+        )
+        self.assertFalse(should_exec)
+        self.assertLess(metrics["net_savings_usd"], 0.0)
+
+        # 2. Substantial token savings (e.g. 50,000 tokens) -> savings strictly exceed planner cost -> should execute
+        should_exec_large, metrics_large = gate.simulate_gc_cost_benefit(
+            projected_token_savings=50_000,
+            planner_input_tokens=1500,
+            planner_output_tokens=300,
+        )
+        self.assertTrue(should_exec_large)
+        self.assertGreater(metrics_large["net_savings_usd"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

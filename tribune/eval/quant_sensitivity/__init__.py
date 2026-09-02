@@ -9,10 +9,13 @@ quantization?" as a markdown report.
 """
 
 from .backends import (
+    OffloadBenchmarkMetrics,
     QuantRung,
+    benchmark_qwen3_8_flash_next_offload,
     default_mock_ladder,
     high_throughput_local_benchmark_ladder,
     moe_pruned_quant_ladder,
+    qwen3_8_flash_next_offload_ladder,
     smoke_ladder,
 )
 from .ladder import LadderResult, RungResult, run_ladder
@@ -21,9 +24,12 @@ from .seedset import SEED_WEIGHTS, build_seed_set, load_manifest, seed_set_hash,
 
 __all__ = [
     "QuantRung",
+    "OffloadBenchmarkMetrics",
     "default_mock_ladder",
     "high_throughput_local_benchmark_ladder",
     "moe_pruned_quant_ladder",
+    "qwen3_8_flash_next_offload_ladder",
+    "benchmark_qwen3_8_flash_next_offload",
     "smoke_ladder",
     "LadderResult",
     "RungResult",

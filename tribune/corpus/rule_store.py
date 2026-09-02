@@ -68,6 +68,7 @@ class LocalRuleStore:
         self._hnsw_index = FilterableHNSWIndex(dim=96)
         self._rule_lookup: dict[str, Rule] = {}
         self.engram_store = StatutoryEngramRAMStore()
+        self._cleared = False
 
         for program in program_registry.all_programs():
             ruleset = program_registry.get_ruleset(program)
@@ -93,9 +94,18 @@ class LocalRuleStore:
                     },
                 )
 
+    def clear(self) -> None:
+        """Clear all indexed rules to serve as an unskilled/empty baseline store."""
+        self._cleared = True
+        self._rule_lookup.clear()
+        self._retriever = LateInteractionRetriever()
+        self._hnsw_index = FilterableHNSWIndex(dim=96)
+
     def retrieve(
         self, query: str, program: ProgramId, jurisdiction: str, k: int
     ) -> list[RetrievedRule]:
+        if self._cleared:
+            return []
         rules = program_registry.get_ruleset(program).rules
         docs = {rule.criterion_id: _doc_text(rule) for rule in rules}
         scored = self._retriever.rank(query, docs, k=max(1, k))
@@ -158,19 +168,35 @@ class LocalRuleStore:
         return out
 
     def required_criteria(self, program: ProgramId) -> list[str]:
+        if self._cleared:
+            return []
         return program_registry.get_ruleset(program).required_ids
 
     def citation_for(
         self, program: ProgramId, jurisdiction: str, criterion_id: str
     ) -> Citation | None:
+        if self._cleared:
+            return None
         rule = program_registry.get_ruleset(program).get(criterion_id)
         return rule.citation(program, jurisdiction) if rule else None
 
     def all_citations(self, program: ProgramId, jurisdiction: str) -> list[Citation]:
-        return [r.citation(program, jurisdiction) for r in program_registry.get_ruleset(program).rules]
+        if self._cleared:
+            return []
+        return [
+            r.citation(program, jurisdiction) for r in program_registry.get_ruleset(program).rules
+        ]
 
     def get_scoped_schema(self, program: ProgramId, jurisdiction: str) -> dict:
         """Extract schema and statutory criteria specifically for the target program, pruning others."""
+        if self._cleared:
+            return {
+                "program": program.value,
+                "jurisdiction": jurisdiction,
+                "required_criteria": [],
+                "rules": [],
+                "citations": [],
+            }
         ruleset = program_registry.get_ruleset(program)
         citations = self.all_citations(program, jurisdiction)
         return {

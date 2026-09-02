@@ -165,3 +165,74 @@ class CostTelemetryMiddleware:
             role=self.role,
         )
         return resp
+
+
+class CostBenefitGate:
+    """Cost-benefit heuristic gating mechanism for Self-GC Planner evaluations.
+
+    Simulates projected token compression savings against planner invocation charges.
+    Ensures Self-GC planner evaluations execute ONLY when predicted token reduction
+    savings strictly exceed planner inference charges.
+    """
+
+    def __init__(
+        self,
+        cost_model: CostModel | None = None,
+        default_planner_model: str = "deepseek-v4-flash",
+        default_target_model: str = "gemini-3.7-flash",
+    ) -> None:
+        self.cost_model = cost_model or CostModel.load()
+        self.default_planner_model = default_planner_model
+        self.default_target_model = default_target_model
+
+    def simulate_gc_cost_benefit(
+        self,
+        projected_token_savings: int,
+        planner_input_tokens: int = 1500,
+        planner_output_tokens: int = 300,
+        planner_model: str | None = None,
+        target_model: str | None = None,
+        accounting_date: date | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Simulate whether projected token savings strictly exceed planner invocation cost."""
+        on_date = accounting_date or date.today()
+        p_model = planner_model or self.default_planner_model
+        t_model = target_model or self.default_target_model
+
+        # Calculate planner invocation cost
+        p_usage = ModelCallUsage(
+            role="gc_planner",
+            model=p_model,
+            tokenizer_id=p_model,
+            tokens_input=planner_input_tokens,
+            tokens_output=planner_output_tokens,
+            cache_read_tokens=0,
+        )
+        planner_cost_usd, _ = self.cost_model.cost_of_call(p_usage, on_date)
+
+        # Calculate projected dollar savings from token reduction on downstream target model
+        t_usage = ModelCallUsage(
+            role="general",
+            model=t_model,
+            tokenizer_id=t_model,
+            tokens_input=projected_token_savings,
+            tokens_output=0,
+            cache_read_tokens=0,
+        )
+        projected_savings_usd, _ = self.cost_model.cost_of_call(t_usage, on_date)
+
+        net_savings_usd = projected_savings_usd - planner_cost_usd
+        should_execute = net_savings_usd > 0.0
+
+        metrics = {
+            "should_execute": should_execute,
+            "projected_token_savings": projected_token_savings,
+            "planner_cost_usd": round(planner_cost_usd, 6),
+            "projected_savings_usd": round(projected_savings_usd, 6),
+            "net_savings_usd": round(net_savings_usd, 6),
+            "planner_model": p_model,
+            "target_model": t_model,
+        }
+        return should_execute, metrics
+
+

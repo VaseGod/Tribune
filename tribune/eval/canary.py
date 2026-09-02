@@ -72,6 +72,37 @@ def write_baseline(path: str, fp: dict[str, dict[str, str]]) -> None:
 
 
 @dataclass
+class SkillLiftCanaryReport:
+    """Tracks Skill Lift regression deltas across runtime updates and prompt optimizations."""
+
+    baseline_initialized: bool
+    baseline_skill_lift: float
+    current_skill_lift: float
+    skill_lift_delta: float
+    epsilon: float
+    per_program_deltas: dict[str, float] = field(default_factory=dict)
+    regressions: list[str] = field(default_factory=list)
+    ok: bool = True
+    notes: list[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        status = "PASS" if self.ok else "FAIL"
+        lines = [
+            f"=== TRIBUNE Skill-Lift Canary Sentinel — {status} ===",
+            f"  Baseline Empirical Skill Lift   : {self.baseline_skill_lift:+.4f}",
+            f"  Current Empirical Skill Lift    : {self.current_skill_lift:+.4f}",
+            f"  Skill Lift Delta (ΔSkill Lift)  : {self.skill_lift_delta:+.4f} (floor -ε = {-self.epsilon:.4f})",
+        ]
+        for prog, delta in sorted(self.per_program_deltas.items()):
+            lines.append(f"    [{prog:<12}] ΔSkill Lift: {delta:+.4f}")
+        for reg in self.regressions:
+            lines.append(f"    ! REGRESSION: {reg}")
+        for note in self.notes:
+            lines.append(f"  note: {note}")
+        return "\n".join(lines)
+
+
+@dataclass
 class CanaryReport:
     baseline_initialized: bool
     drift: list[str]
@@ -116,6 +147,87 @@ class CanaryReport:
 class CanarySentinel:
     def __init__(self, settings: TribuneSettings | None = None) -> None:
         self.settings = settings or get_settings()
+
+    def run_skill_lift_canary(
+        self,
+        baseline_path: str | None = None,
+        freeze: bool = False,
+        epsilon: float = 0.05,
+        n_per_program: int = 8,
+    ) -> SkillLiftCanaryReport:
+        """Track empirical Skill Lift regression deltas against frozen canary baseline."""
+        from .harness import SkillLiftHarness
+
+        baseline_path = baseline_path or os.path.join(
+            self.settings.data_dir, "skill_lift_canary_baseline.json"
+        )
+        harness = SkillLiftHarness(self.settings)
+        result = harness.run_skill_lift(n_per_program=n_per_program)
+
+        current_lift = result.report.mean_skill_lift
+        current_program_lifts = {
+            prog: lift.mean_skill_lift for prog, lift in result.report.per_program.items()
+        }
+
+        baseline_initialized = False
+        stored_baseline = None
+        if not freeze and os.path.exists(baseline_path):
+            try:
+                with open(baseline_path, encoding="utf-8") as fh:
+                    stored_baseline = json.load(fh)
+            except Exception:
+                stored_baseline = None
+
+        if freeze or stored_baseline is None:
+            baseline_payload = {
+                "overall_skill_lift": current_lift,
+                "per_program": current_program_lifts,
+            }
+            os.makedirs(os.path.dirname(baseline_path) or ".", exist_ok=True)
+            with open(baseline_path, "w", encoding="utf-8") as fh:
+                json.dump(baseline_payload, fh, indent=2)
+            baseline_initialized = True
+            baseline_lift = current_lift
+            baseline_program_lifts = current_program_lifts
+        else:
+            baseline_lift = float(stored_baseline.get("overall_skill_lift", current_lift))
+            baseline_program_lifts = stored_baseline.get("per_program", {})
+
+        skill_lift_delta = current_lift - baseline_lift
+        regressions: list[str] = []
+        per_program_deltas: dict[str, float] = {}
+
+        for prog, cur_p_lift in current_program_lifts.items():
+            base_p_lift = float(baseline_program_lifts.get(prog, cur_p_lift))
+            p_delta = cur_p_lift - base_p_lift
+            per_program_deltas[prog] = round(p_delta, 4)
+            if p_delta < -epsilon:
+                regressions.append(
+                    f"Program '{prog}' Skill Lift dropped by {abs(p_delta):.4f} (below -ε floor {-epsilon:.4f})"
+                )
+
+        if skill_lift_delta < -epsilon:
+            regressions.append(
+                f"Overall Skill Lift dropped by {abs(skill_lift_delta):.4f} (below -ε floor {-epsilon:.4f})"
+            )
+
+        ok = len(regressions) == 0 and current_lift >= 0.0
+
+        notes: list[str] = []
+        if baseline_initialized:
+            notes.append(f"Skill Lift baseline profile written to {baseline_path}")
+
+        return SkillLiftCanaryReport(
+            baseline_initialized=baseline_initialized,
+            baseline_skill_lift=round(baseline_lift, 4),
+            current_skill_lift=round(current_lift, 4),
+            skill_lift_delta=round(skill_lift_delta, 4),
+            epsilon=epsilon,
+            per_program_deltas=per_program_deltas,
+            regressions=regressions,
+            ok=ok,
+            notes=notes,
+        )
 
     def run(
         self,

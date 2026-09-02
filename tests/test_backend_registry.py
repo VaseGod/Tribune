@@ -38,6 +38,7 @@ def test_all_required_seed_candidates_present():
         "claude-sonnet-5",
         "grok-4.6",
         "deepseek-v4-pro",
+        "glm-5.3-flash",
     ]:
         assert required in ids
 
@@ -45,6 +46,12 @@ def test_all_required_seed_candidates_present():
 def test_status_flags_match_plan():
     registry = vr.load_registry(_REGISTRY)
     by_id = {c.candidate_id: c for c in registry.candidates}
+    # GLM-5.3-Flash is registered workhorse with 1M context
+    glm53 = by_id["glm-5.3-flash"]
+    assert glm53.weights_status == "api_only"
+    assert glm53.context_window == 1_048_576
+    assert glm53.tier == 1
+    assert "proposer" in glm53.roles
     # LongCat is announced-only and must not be deployable/verified.
     assert by_id["longcat-2.0"].weights_status == "announced_only"
     assert by_id["longcat-2.0"].weights_verified is False
@@ -178,5 +185,42 @@ def test_default_workhorse_and_providers_configuration():
     assert gpt56.output_cost_per_1m == 10.00
     assert gpt56.tokens_per_second == 750
     assert gpt56.supports_tools is True
+
+
+def test_cordis_kernel_protocol_and_deterministic_replay_spec():
+    """Verify Cordis kernel protocol and deterministic replay specs validate in registry schema."""
+    candidate = vr.Candidate(
+        candidate_id="cordis-deepseek-plugin",
+        name="Cordis DeepSeek Harness Plugin",
+        vendor="deepseek",
+        params="V4",
+        roles=["proposer", "verifier"],
+        license="apache-2.0",
+        weights_status="api_only",
+        serving=["api"],
+        context_window=128000,
+        kernel_protocol="cordis",
+        cordis_plugin=True,
+        supports_deterministic_replay=True,
+    )
+    assert candidate.kernel_protocol == "cordis"
+    assert candidate.cordis_plugin is True
+    assert candidate.supports_deterministic_replay is True
+
+    provider = vr.ProviderSpec(
+        provider_type="openai_responses",
+        model_name="deepseek-v4-pro",
+        input_cost_per_1m=0.25,
+        output_cost_per_1m=0.50,
+        kernel_protocol="cordis",
+        cordis_plugin=True,
+        supports_deterministic_replay=True,
+        supports_sandboxing=True,
+        api_schema="/v1/responses",
+    )
+    assert provider.kernel_protocol == "cordis"
+    assert provider.supports_sandboxing is True
+    assert provider.api_schema == "/v1/responses"
+
 
 

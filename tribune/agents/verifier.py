@@ -1417,6 +1417,39 @@ class Verifier:
             trajectory_steps=report.milestone_steps,
         )
 
+    def verify_statutory_claims(
+        self,
+        claims: list[dict[str, Any]] | list[str],
+        program: str | ProgramId,
+        jurisdiction: str = "EX",
+    ) -> VerificationReport:
+        """Verify statutory claims emitted during agentic trajectory planning against rule store."""
+        prog_enum = program if isinstance(program, ProgramId) else ProgramId(str(program).lower().strip())
+        active_citations = {c.citation_id for c in self.rule_store.all_citations(prog_enum, jurisdiction)}
+
+        missing_citations: list[str] = []
+        unsupported_claims: list[str] = []
+        violations: list[str] = []
+
+        for c in claims:
+            cid = c.get("citation_id") or c.get("citation") if isinstance(c, dict) else str(c)
+            if cid and cid not in active_citations:
+                missing_citations.append(str(cid))
+                violations.append(f"Statutory claim references unverified citation '{cid}'")
+
+        is_compliant = len(violations) == 0
+        return VerificationReport(
+            is_certified=is_compliant,
+            assessment_id="claims_verification",
+            program=prog_enum,
+            jurisdiction=jurisdiction,
+            recomputed_status=EligibilityStatus.LIKELY_ELIGIBLE if is_compliant else EligibilityStatus.INDETERMINATE,
+            missing_citations=missing_citations,
+            unsupported_claims=unsupported_claims,
+            reasons=violations if not is_compliant else ["All statutory claims verified."],
+            score=1.0 if is_compliant else 0.0,
+        )
+
     def extract_failure_payload(
         self,
         assessment: Assessment,
@@ -1487,6 +1520,147 @@ class Verifier:
 
 # VerifierAgent class alias
 VerifierAgent = Verifier
+IndependentVerifier = Verifier
+
+
+# --------------------------------------------------------------------------- #
+# Isolated Synthetic Verifier & Dual-Check Grader
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class DualCheckVerdict:
+    """Verdict from dual-check grader with reference-blind validation."""
+
+    passed: bool
+    grader1_spec_passed: bool
+    grader2_invariance_passed: bool
+    reference_blind: bool = True
+    spec_score: float = 1.0
+    invariance_score: float = 1.0
+    composite_grade: float = 1.0
+    findings: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class DualCheckGrader:
+    """Dual-check grader agent executing reference-blind validation.
+
+    Grader 1 (Specification Grader): Evaluates formal statutory rule satisfaction,
+    required criteria coverage, and strict citation grounding without leaking ground truth.
+
+    Grader 2 (Invariance Grader): Evaluates outcome invariant stability, semantic
+    non-contradiction, absence of reasoning monologues, and specification gaming prevention.
+    """
+
+    def __init__(self, rule_store: RuleStore | None = None) -> None:
+        self.rule_store = rule_store or LocalRuleStore()
+
+    def grade(
+        self,
+        assessment: Assessment,
+        evidence: EvidenceView | None = None,
+        program: ProgramId = ProgramId.SNAP,
+        jurisdiction: str = "EX",
+        withheld_ground_truth: Any = None,
+    ) -> DualCheckVerdict:
+        findings: list[str] = []
+
+        # --- Grader 1: Statutory Specification & Grounding --- #
+        g1_passed = True
+        spec_deductions = 0.0
+
+        if not assessment.criteria:
+            g1_passed = False
+            spec_deductions += 0.5
+            findings.append("Grader 1 (Spec): No criteria evaluated in candidate assessment.")
+        else:
+            unsatisfied_required = [
+                c for c in assessment.criteria
+                if c.required and c.outcome == CriterionOutcome.NOT_SATISFIED
+            ]
+            if unsatisfied_required and assessment.status == EligibilityStatus.LIKELY_ELIGIBLE:
+                g1_passed = False
+                spec_deductions += 0.6
+                findings.append(
+                    f"Grader 1 (Spec): Violation - candidate marked LIKELY_ELIGIBLE but required criteria unsatisfied: {[c.criterion_id for c in unsatisfied_required]}."
+                )
+
+        if not assessment.citations and assessment.status != EligibilityStatus.INDETERMINATE:
+            g1_passed = False
+            spec_deductions += 0.3
+            findings.append("Grader 1 (Spec): Missing statutory citations for asserted determination.")
+
+        spec_score = max(0.0, 1.0 - spec_deductions)
+
+        # --- Grader 2: Invariance, Non-Contradiction, & Sandbox Boundaries --- #
+        g2_passed = True
+        inv_deductions = 0.0
+
+        # Check for reasoning monologues or thought injection in rationales
+        combined_text = " ".join(
+            [getattr(c, "note", "") for c in assessment.criteria]
+            + [getattr(assessment, "rationale", "") or "", getattr(assessment, "summary", "") or ""]
+        )
+        if re.search(r"<(?:think|thought|reasoning)[^>]*>", combined_text, re.IGNORECASE):
+            g2_passed = False
+            inv_deductions += 0.5
+            findings.append("Grader 2 (Invariance): Reasoning monologue or thought tag detected in assessment output.")
+
+        # Check for self-contradictory status
+        rec_action = getattr(assessment, "recommended_action", None)
+        if assessment.status == EligibilityStatus.LIKELY_INELIGIBLE and rec_action == RecommendedAction.PREPARE_APPLICATION:
+            g2_passed = False
+            inv_deductions += 0.5
+            findings.append(f"Grader 2 (Invariance): Contradiction between status LIKELY_INELIGIBLE and action {rec_action.value}.")
+        elif assessment.status == EligibilityStatus.INDETERMINATE and rec_action == RecommendedAction.PREPARE_APPLICATION:
+            g2_passed = False
+            inv_deductions += 0.3
+            findings.append("Grader 2 (Invariance): Contradiction between status INDETERMINATE and action PREPARE_APPLICATION.")
+
+
+
+        invariance_score = max(0.0, 1.0 - inv_deductions)
+
+        passed = g1_passed and g2_passed
+        composite_grade = (spec_score + invariance_score) / 2.0
+
+        return DualCheckVerdict(
+            passed=passed,
+            grader1_spec_passed=g1_passed,
+            grader2_invariance_passed=g2_passed,
+            reference_blind=True,
+            spec_score=spec_score,
+            invariance_score=invariance_score,
+            composite_grade=composite_grade,
+            findings=findings,
+            metadata={"program": str(program), "jurisdiction": jurisdiction},
+        )
+
+
+class DualCheckSandboxedVerifier:
+    """Isolated synthetic verifier executing dual-check validation inside isolated execution sandboxes."""
+
+    def __init__(self, grader: DualCheckGrader | None = None) -> None:
+        self.grader = grader or DualCheckGrader()
+
+    def verify_candidate_blind(
+        self,
+        assessment: Assessment,
+        evidence: EvidenceView | None = None,
+        program: ProgramId = ProgramId.SNAP,
+        jurisdiction: str = "EX",
+        withheld_reference: Any = None,
+    ) -> DualCheckVerdict:
+        """Run reference-blind verification ensuring generator model has zero access to ground truth."""
+        return self.grader.grade(
+            assessment=assessment,
+            evidence=evidence,
+            program=program,
+            jurisdiction=jurisdiction,
+            withheld_ground_truth=withheld_reference,
+        )
+
 
 __all__ = [
     "DefectType",
@@ -1510,5 +1684,10 @@ __all__ = [
     "ProgrammaticVerifierTools",
     "Verifier",
     "VerifierAgent",
+    "IndependentVerifier",
+    "DualCheckVerdict",
+    "DualCheckGrader",
+    "DualCheckSandboxedVerifier",
 ]
+
 

@@ -146,11 +146,13 @@ def _sigmoid(x: float) -> float:
 class Calibrator:
     def __init__(
         self,
-        threshold: float,
+        threshold: float = 0.85,
         min_self_validation_confidence: float | None = None,
         parity_thresholds_path: str | None = None,
+        min_factual_confidence: float = 0.85,
     ) -> None:
-        self.threshold = threshold
+        self.threshold = max(threshold, 0.85) if threshold is not None else 0.85
+        self.min_factual_confidence = min_factual_confidence
         parity_thresholds = load_parity_thresholds(parity_thresholds_path)
         self.min_self_validation_confidence = (
             min_self_validation_confidence
@@ -230,17 +232,29 @@ class Calibrator:
                 features=features,
             )
 
+        # Hard override 4: mandatory factual confidence below 0.85
+        effective_threshold = max(self.threshold, self.min_factual_confidence)
+        if conf < effective_threshold:
+            return AbstentionScore(
+                calibrated_confidence=conf,
+                threshold=effective_threshold,
+                abstain=True,
+                reason=(
+                    f"factual/calibrated confidence ({conf:.3f}) fell below mandatory threshold "
+                    f"({effective_threshold:.3f}); escalated to manual administrative review"
+                ),
+                features=features,
+            )
+
         if diag.ambiguity_signals:
             reason = "case sits on a genuinely ambiguous edge: " + "; ".join(diag.ambiguity_signals)
-        elif conf < self.threshold:
-            reason = "calibrated confidence below the assertion threshold"
         else:
             reason = "calibrated confidence meets the assertion threshold"
 
         return AbstentionScore(
             calibrated_confidence=conf,
-            threshold=self.threshold,
-            abstain=conf < self.threshold,
+            threshold=effective_threshold,
+            abstain=False,
             reason=reason,
             features=features,
         )

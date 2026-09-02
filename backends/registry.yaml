@@ -78,6 +78,17 @@ providers:
     sla_p95_ms: 320.0
     fallback_model: qwen3.8-27b
 
+  glm-5.3-flash:
+    provider_type: openai_compat
+    model_name: glm-5.3-flash
+    input_cost_per_1m: 0.15
+    output_cost_per_1m: 0.50
+    max_context_tokens: 1048576
+    supports_tools: true
+    tier: 1
+    sla_p95_ms: 300.0
+    fallback_model: gemini-3.7-flash
+
 candidates:
   - candidate_id: qwen3.8-27b
     name: Qwen 3.8 27B
@@ -137,6 +148,26 @@ candidates:
     measured_cost_per_task: null
     notes: >-
       Air-gapped Kimi distillation optimized for sovereign administrative appeals and deterministic rollout evaluations.
+
+  - candidate_id: glm-5.3-flash
+    name: GLM-5.3-Flash
+    vendor: Zhipu AI
+    params: "Flash (MoE/Linear-Attention)"
+    roles: [proposer]
+    role_note: high-speed long-context ingestion and trajectory planning workhorse
+    license: open-weights
+    weights_status: api_only
+    weights_url: https://open.bigmodel.cn/
+    weights_verified: false
+    serving: [api, vllm, sglang]
+    quant_formats: [fp16, fp8, int4]
+    context_window: 1048576
+    tier: 1
+    measured_kappa: null
+    measured_cost_per_task: null
+    notes: >-
+      High-speed 1M-token context window with KDA linear attention, priced at
+      $0.15/M input and $0.50/M output for document ingestion and non-binding trajectory planning.
 
   - candidate_id: glm-5.2
     name: GLM-5.2

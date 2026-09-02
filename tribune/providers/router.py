@@ -23,7 +23,7 @@ import logging
 import math
 import os
 import time
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -151,6 +151,51 @@ class BitwiseParityEnforcer:
 # --------------------------------------------------------------------------- #
 # Speculative Inference & Cost Attribution
 # --------------------------------------------------------------------------- #
+
+
+class ExecutionTier(int, enum.Enum):
+    """Execution tier classifications for cost-normalized speculative routing."""
+
+    TIER_0_LOCAL_DENSE = 0  # Ultra-fast local dense / offline rules (e.g. Qwen 27B / local rules)
+    TIER_1_ROUTINE_FAST = 1  # High-throughput, low-cost Pareto models (e.g. Qwen 2.5 7B / small distill)
+    TIER_2_FRONTIER = 2  # High-capability frontier reasoning models (e.g. Gemini 3.7 Flash)
+
+
+@dataclass
+class SpeculativeQueueGovernor:
+    """Dynamic queue length and cost budget governor for speculative background tasks."""
+
+    max_queue_depth: int = 8
+    cost_budget_usd: float = 0.05
+    active_speculative_tasks: int = 0
+    accumulated_speculative_cost_usd: float = 0.0
+    throttled_count: int = 0
+
+    def should_throttle_speculation(self, estimated_cost: float = 0.0005) -> bool:
+        """Evaluate whether speculative background branch should be throttled."""
+        if self.active_speculative_tasks >= self.max_queue_depth:
+            self.throttled_count += 1
+            return True
+        if (self.accumulated_speculative_cost_usd + estimated_cost) > self.cost_budget_usd:
+            self.throttled_count += 1
+            return True
+        return False
+
+    def record_speculative_dispatch(self, estimated_cost: float = 0.0005) -> None:
+        self.active_speculative_tasks += 1
+        self.accumulated_speculative_cost_usd += estimated_cost
+
+    def record_speculative_complete(self, actual_cost: float = 0.0005) -> None:
+        self.active_speculative_tasks = max(0, self.active_speculative_tasks - 1)
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "max_queue_depth": self.max_queue_depth,
+            "cost_budget_usd": self.cost_budget_usd,
+            "active_speculative_tasks": self.active_speculative_tasks,
+            "accumulated_speculative_cost_usd": round(self.accumulated_speculative_cost_usd, 6),
+            "throttled_count": self.throttled_count,
+        }
 
 
 @dataclass
@@ -344,6 +389,7 @@ class ModelRouter:
             or os.getenv("TRIBUNE_DEFAULT_TIER1_MODEL")
             or self.settings.tier1_model
         )
+        self.glm_flash_model = getattr(self.settings, "glm_model", "glm-5.3-flash") or "glm-5.3-flash"
         # Tier 2 defaults
         self.tier2_model = (
             os.getenv("DEFAULT_TIER2_MODEL")
@@ -403,6 +449,20 @@ class ModelRouter:
         else:
             self.fallback_provider = LocalRulesProvider(role="local_fallback", recorder=self.recorder)
 
+        # Hybrid-Attention Local Endpoint Provider (Qwen3.8-Flash-Next / SGLang / vLLM)
+        self.hybrid_model = getattr(self.settings, "qwen_flash_model", "Qwen3.8-Flash-Next") or "Qwen3.8-Flash-Next"
+        self.confidence_fallback_threshold = float(getattr(self.settings, "confidence_fallback_threshold", 0.85))
+
+        if self.settings.tier1_provider == "openai_compat" or self.settings.provider in ("openai_compat", "vllm", "sglang"):
+            self.hybrid_provider = OpenAICompatProvider(
+                model=self.hybrid_model,
+                settings=self.settings,
+                role="hybrid_proposer",
+                recorder=self.recorder,
+            )
+        else:
+            self.hybrid_provider = LocalRulesProvider(role="hybrid_proposer", recorder=self.recorder)
+
         # SLA Trackers per tier
         self.sla_trackers = {
             0: SLATracker(tier=0, sla_target_p95_ms=600.0),
@@ -418,12 +478,17 @@ class ModelRouter:
             config=self.speculative_config,
         )
 
-        # Per-run cost attribution, bitwise parity, & retry budget
+        # Per-run cost attribution, bitwise parity, retry budget, & speculative queue governor
         self.cost_attributions: list[TokenCostAttribution] = []
         self.retry_budget = RetryBudget()
         self.parity_enforcer = BitwiseParityEnforcer()
         self.trajectory_cost_model = TrajectoryCostModel()
+        self.queue_governor = SpeculativeQueueGovernor()
 
+        # Step Router & KV Cache Affinity Monitor
+        self.step_router = StepRouter()
+        self.kv_monitor = KVMemoryMonitor()
+        self.kv_cache_router = KVCacheAffinityRouter(kv_monitor=self.kv_monitor)
 
         # Stats tracking
         self.stats = {
@@ -440,7 +505,29 @@ class ModelRouter:
             "rate_limits": 0,
             "sla_escalations": 0,
             "speculative_draft_calls": 0,
+            "step_routing_calls": 0,
+            "kv_affinity_routed_calls": 0,
         }
+
+    def route_execution_tier(
+        self,
+        task_intent: str = "general",
+        is_speculative: bool = False,
+        sovereignty: DataSovereigntyLevel | str = DataSovereigntyLevel.STANDARD_CLOUD,
+    ) -> tuple[int, ModelProvider, str]:
+        """Route execution to optimal tier: Frontier for primary reasoning, Pareto/Local for speculative branches."""
+        sov = DataSovereigntyLevel(sovereignty) if isinstance(sovereignty, str) else sovereignty
+        if sov == DataSovereigntyLevel.AIR_GAPPED_LOCAL:
+            return 0, self.air_gapped_provider, "air_gapped_local"
+
+        if is_speculative:
+            if self.queue_governor.should_throttle_speculation():
+                return 0, self.local_dense_provider, "speculative_throttled_local"
+            self.queue_governor.record_speculative_dispatch()
+            return 1, self.tier1_provider, "speculative_fast_pareto"
+
+        # Primary / Root Reasoning
+        return 2, self.tier2_provider, "primary_frontier_root"
 
     def verify_bitwise_logprob_parity(
         self,
@@ -555,7 +642,7 @@ class ModelRouter:
         context: str = "",
         use_speculative: bool = True,
     ) -> dict[str, Any]:
-        """Tier 1: Route routine document ingestion and standard eligibility preparation to local/vLLM endpoint."""
+        """Tier 1: Route routine document ingestion and standard eligibility preparation to glm-5.3-flash / local endpoint."""
         start_t = time.perf_counter()
         if use_speculative and self.speculative_config.enabled:
             return self.speculative_draft_and_verify(prompt, context)
@@ -565,7 +652,7 @@ class ModelRouter:
         self.sla_trackers[1].record_call(lat, is_error=False)
         self.record_cost_attribution(
             tier=1,
-            model=self.tier1_model,
+            model=self.glm_flash_model,
             prompt_tokens=len(prompt) // 4,
             completion_tokens=64,
             cost_usd=0.00001,
@@ -575,11 +662,126 @@ class ModelRouter:
         return {
             "status": "success",
             "tier": 1,
-            "model": self.tier1_model,
+            "model": self.glm_flash_model,
             "task_type": task_type,
-            "result": f"Completed preparer task '{task_type}' via Tier 1",
+            "result": f"Completed preparer task '{task_type}' via {self.glm_flash_model}",
             "latency_ms": lat,
         }
+
+    def route_navigator_task(
+        self,
+        task_type: str,
+        prompt: str,
+        context: str = "",
+    ) -> dict[str, Any]:
+        """Tier 1: Route non-binding trajectory planning and DAG decomposition to glm-5.3-flash."""
+        start_t = time.perf_counter()
+        self.stats["tier1_calls"] += 1
+        lat = (time.perf_counter() - start_t) * 1000.0
+        self.sla_trackers[1].record_call(lat, is_error=False)
+        self.record_cost_attribution(
+            tier=1,
+            model=self.glm_flash_model,
+            prompt_tokens=len(prompt) // 4,
+            completion_tokens=64,
+            cost_usd=0.00001,
+            latency_ms=lat,
+            task_intent=f"navigator:{task_type}",
+        )
+        return {
+            "status": "success",
+            "tier": 1,
+            "model": self.glm_flash_model,
+            "task_type": task_type,
+            "result": f"Completed trajectory planning task '{task_type}' via {self.glm_flash_model}",
+            "latency_ms": lat,
+        }
+
+    def route_document_ingestion(
+        self,
+        prompt: str,
+        context: str = "",
+        document_length: int = 0,
+    ) -> dict[str, Any]:
+        """Route long-context document ingestion to glm-5.3-flash (1M native context window)."""
+        start_t = time.perf_counter()
+        self.stats["tier1_calls"] += 1
+        lat = (time.perf_counter() - start_t) * 1000.0
+        self.sla_trackers[1].record_call(lat, is_error=False)
+        self.record_cost_attribution(
+            tier=1,
+            model=self.glm_flash_model,
+            prompt_tokens=max(1, (len(prompt) + len(context)) // 4),
+            completion_tokens=64,
+            cost_usd=0.00001,
+            latency_ms=lat,
+            task_intent="document_ingestion",
+        )
+        return {
+            "status": "success",
+            "tier": 1,
+            "model": self.glm_flash_model,
+            "context_length": document_length or (len(prompt) + len(context)),
+            "task_type": "document_ingestion",
+            "latency_ms": lat,
+        }
+
+    def route_hybrid_attention_task(
+        self,
+        req: SynthesisRequest,
+        prompt: str | None = None,
+        context: str = "",
+    ) -> SynthesisResult:
+        """Route complex legal reasoning payloads to high-throughput local hybrid endpoints (e.g. Qwen3.8-Flash-Next).
+        
+        Applies dynamic confidence scoring thresholds and automatically falls back to deterministic local
+        rule engines (tribune/providers/local_rules.py) when LLM confidence falls below calibrated levels.
+        """
+        start_t = time.perf_counter()
+        self.stats["tier0_calls"] += 1
+        if "hybrid_attention_calls" not in self.stats:
+            self.stats["hybrid_attention_calls"] = 0
+        self.stats["hybrid_attention_calls"] += 1
+
+        try:
+            res = self.hybrid_provider.synthesize_assessment(req)
+            lat = (time.perf_counter() - start_t) * 1000.0
+
+            # Dynamic calibrated confidence threshold check
+            if res.self_confidence < self.confidence_fallback_threshold:
+                logger.warning(
+                    f"Hybrid model self_confidence ({res.self_confidence:.3f}) below calibrated threshold "
+                    f"({self.confidence_fallback_threshold:.2f}). Falling back to deterministic local rules engine."
+                )
+                self.stats["fallbacks"] += 1
+                if "confidence_fallbacks" not in self.stats:
+                    self.stats["confidence_fallbacks"] = 0
+                self.stats["confidence_fallbacks"] += 1
+                fallback_res = self.fallback_provider.synthesize_assessment(req)
+                fallback_res.rationale = (
+                    f"[CALIBRATED CONFIDENCE FALLBACK to deterministic local rules (score {res.self_confidence:.2f} < {self.confidence_fallback_threshold:.2f})] "
+                    f"{fallback_res.rationale}"
+                )
+                self.sla_trackers[0].record_call(lat, is_error=False)
+                return fallback_res
+
+            self.sla_trackers[0].record_call(lat, is_error=False)
+            self.record_cost_attribution(
+                tier=0,
+                model=self.hybrid_model,
+                prompt_tokens=len(req.evidence_summary) // 4 + 64,
+                completion_tokens=64,
+                cost_usd=0.000005,
+                latency_ms=lat,
+                task_intent=f"hybrid_attention:{req.program.value}",
+            )
+            return res
+        except Exception as exc:
+            lat = (time.perf_counter() - start_t) * 1000.0
+            self.sla_trackers[0].record_call(lat, is_error=True)
+            self._record_error(exc)
+            logger.warning(f"Hybrid attention inference failed: {exc}. Executing deterministic local fallback.")
+            return self._execute_local_fallback_synthesis(req, exc)
 
     def route_verifier_task(self, req: ReviewRequest) -> ReviewResult:
         """Tier 2: Route complex statutory disputes, boundary conflicts, and appeals verification to frontier endpoints."""
@@ -643,7 +845,13 @@ class ModelRouter:
         )
 
         is_high_horizon = multi_file or estimated_turns >= 3 or context_length > 4000 or tier == 2
-        model_name = self.tier2_model if tier == 2 else (self.local_model_type if tier == 0 else self.tier1_model)
+        if role in ("preparer", "navigator") or (
+            intent and intent.lower() in ("document_ingestion", "trajectory_planning", "non_binding_trajectory_planning", "preparer", "navigator")
+        ):
+            model_name = self.glm_flash_model
+        else:
+            model_name = self.tier2_model if tier == 2 else (self.local_model_type if tier == 0 else self.tier1_model)
+
         horizon_mode = "high_horizon" if is_high_horizon else "standard"
         state_transitions = 1 if is_high_horizon else estimated_turns
 
@@ -695,6 +903,15 @@ class ModelRouter:
         multi_file: bool = False,
         estimated_turns: int = 1,
     ) -> int:
+        # Non-binding trajectory planning and routine document ingestion route to Tier 1 glm-5.3-flash
+        if role in ("preparer", "navigator"):
+            return 1
+
+        if intent:
+            norm_intent = intent.lower().strip()
+            if norm_intent in ("document_ingestion", "trajectory_planning", "non_binding_trajectory_planning"):
+                return 1
+
         if multi_file or estimated_turns >= 4:
             # Multi-file case files and deep tool calling sequences prioritize high-horizon Tier 2 frontier model
             return 2
@@ -722,13 +939,17 @@ class ModelRouter:
             "complex_document_extraction",
             "multi_step_document_extraction",
             "document_extraction",
+            "hybrid_attention",
+            "hybrid_reasoning",
+            "qwen3.8-flash-next",
+            "glm-5.3-flash-local",
         }
         if intent:
             norm_intent = intent.lower().strip()
             if norm_intent in complex_extraction_intents or (
                 "extraction" in norm_intent
                 and ("multi" in norm_intent or "complex" in norm_intent or context_length > 2000)
-            ):
+            ) or "hybrid" in norm_intent:
                 return 0
 
         tier2_intents = {
@@ -1036,16 +1257,252 @@ class ModelRouter:
                     return fn_fallback()
                 raise exc
 
+    def route_operational_step(
+        self,
+        step_type: OperationalStepType | str,
+        payload: Any = None,
+        context_tokens: int = 0,
+    ) -> StepRoutingDecision:
+        """Route granular operational step decomposed via NeMo Switchyard architecture."""
+        self.stats["step_routing_calls"] += 1
+        decision = self.step_router.route_step(step_type, payload=payload, context_tokens=context_tokens)
+        self.record_cost_attribution(
+            tier=decision.tier,
+            model=decision.target_model,
+            prompt_tokens=context_tokens,
+            completion_tokens=64,
+            cost_usd=0.00005 if decision.tier == 2 else 0.00001,
+            latency_ms=decision.estimated_latency_ms,
+            task_intent=f"step:{decision.step_type}",
+        )
+        return decision
+
+    def route_by_kv_cache_affinity(
+        self,
+        prompt_tokens: int,
+        context_tokens: int = 0,
+        is_prompt_heavy: bool = False,
+    ) -> dict[str, Any]:
+        """Route prompt-heavy and large context requests to KV-compressed attention models."""
+        self.stats["kv_affinity_routed_calls"] += 1
+        decision = self.kv_cache_router.route_by_kv_affinity(
+            prompt_tokens=prompt_tokens,
+            context_tokens=context_tokens,
+            is_prompt_heavy=is_prompt_heavy,
+        )
+        return decision
+
+
+# --------------------------------------------------------------------------- #
+# NeMo Switchyard-Style Granular Operational Step Routing
+# --------------------------------------------------------------------------- #
+
+
+class OperationalStepType(str, enum.Enum):
+    """Granular operational step types for decomposed agent workflow dispatching."""
+
+    # High-frequency, lightweight operational tasks (route to high-throughput endpoints)
+    CONTEXT_FOLD_PLANNING = "context_fold_planning"
+    JSON_EXTRACTION = "json_extraction"
+    TOOL_PARAM_FORMATTING = "tool_param_formatting"
+    TRIAGE_ROUTING = "triage_routing"
+
+    # Deep cognitive tasks (route to frontier reasoning engines)
+    ARCHITECTURAL_DESIGN = "architectural_design"
+    CODE_SYNTHESIS = "code_synthesis"
+    SECURITY_VERIFICATION = "security_verification"
+    STATUTORY_ADJUDICATION = "statutory_adjudication"
+
+
+@dataclass(frozen=True)
+class StepRoutingDecision:
+    """Routing decision for granular operational steps."""
+
+    step_type: str
+    target_model: str
+    tier: int
+    is_frontier_reasoning: bool
+    endpoint_category: str  # "high_throughput" | "frontier_reasoning"
+    estimated_latency_ms: float
+    rationale: str
+    step_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class StepRouter:
+    """NeMo Switchyard-style step router decomposing workflows into granular operational steps.
+
+    Routes lightweight operational steps (fold planning, JSON extraction, parameter formatting)
+    to high-throughput Pareto endpoints (e.g., Gemini 3.7 Flash or Cerebras Ultrafast)
+    and deep cognitive tasks (multi-file architectural design, code synthesis, boundary verification)
+    strictly to frontier reasoning engines (e.g., DeepSeek-V4-Pro max reasoning or GPT-5.6 Sol max reasoning).
+    """
+
+    def __init__(
+        self,
+        high_throughput_model: str = "gemini-3.7-flash",
+        frontier_reasoning_model: str = "deepseek-v4-pro",
+    ) -> None:
+        self.high_throughput_model = high_throughput_model
+        self.frontier_reasoning_model = frontier_reasoning_model
+        self.step_dispatch_counts: dict[str, int] = defaultdict(int)
+
+    def route_step(
+        self,
+        step_type: OperationalStepType | str,
+        payload: Any = None,
+        context_tokens: int = 0,
+    ) -> StepRoutingDecision:
+        s_type = step_type.value if isinstance(step_type, OperationalStepType) else str(step_type)
+        self.step_dispatch_counts[s_type] += 1
+
+        lightweight_steps = {
+            "context_fold_planning",
+            "json_extraction",
+            "tool_param_formatting",
+            "triage_routing",
+            "parsing",
+            "formatting",
+        }
+
+        if s_type in lightweight_steps:
+            return StepRoutingDecision(
+                step_type=s_type,
+                target_model=self.high_throughput_model,
+                tier=1,
+                is_frontier_reasoning=False,
+                endpoint_category="high_throughput",
+                estimated_latency_ms=120.0,
+                rationale=f"Lightweight operational step '{s_type}' routed to high-throughput endpoint ({self.high_throughput_model}).",
+                step_metadata={"context_tokens": context_tokens},
+            )
+        else:
+            return StepRoutingDecision(
+                step_type=s_type,
+                target_model=self.frontier_reasoning_model,
+                tier=2,
+                is_frontier_reasoning=True,
+                endpoint_category="frontier_reasoning",
+                estimated_latency_ms=850.0,
+                rationale=f"Deep cognitive step '{s_type}' routed to frontier reasoning engine ({self.frontier_reasoning_model}).",
+                step_metadata={"context_tokens": context_tokens},
+            )
+
+
+# --------------------------------------------------------------------------- #
+# KV Memory Optimization & Cache Affinity Routing
+# --------------------------------------------------------------------------- #
+
+
+class KVMemoryMonitor:
+    """Monitors Key-Value (KV) memory compression and cache affinity."""
+
+    def __init__(
+        self,
+        num_layers: int = 32,
+        hidden_dim: int = 4096,
+        num_heads: int = 32,
+    ) -> None:
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+
+    def estimate_kv_memory_bytes(
+        self,
+        token_count: int,
+        quant_type: str = "FP16",
+    ) -> int:
+        """Estimate KV cache memory in bytes for given token count and quantization format."""
+        bytes_per_elem = {
+            "FP16": 2.0,
+            "BF16": 2.0,
+            "FP8": 1.0,
+            "q8_0": 1.0,
+            "INT4": 0.5,
+        }.get(quant_type, 2.0)
+
+        total_bytes = int(2 * self.num_layers * self.hidden_dim * bytes_per_elem * token_count)
+        return total_bytes
+
+    def evaluate_kv_affinity(
+        self,
+        prompt_tokens: int,
+        context_tokens: int = 0,
+        compression_threshold_tokens: int = 4000,
+    ) -> dict[str, Any]:
+        """Evaluate whether prompt size warrants routing to KV-compressed attention layers."""
+        total_tokens = prompt_tokens + context_tokens
+        is_prompt_heavy = total_tokens >= compression_threshold_tokens
+
+        fp16_bytes = self.estimate_kv_memory_bytes(total_tokens, "FP16")
+        q8_bytes = self.estimate_kv_memory_bytes(total_tokens, "q8_0")
+        int4_bytes = self.estimate_kv_memory_bytes(total_tokens, "INT4")
+
+        return {
+            "total_tokens": total_tokens,
+            "is_prompt_heavy": is_prompt_heavy,
+            "kv_memory_fp16_mb": round(fp16_bytes / (1024 * 1024), 2),
+            "kv_memory_q8_mb": round(q8_bytes / (1024 * 1024), 2),
+            "kv_memory_int4_mb": round(int4_bytes / (1024 * 1024), 2),
+            "compression_savings_ratio": 0.5 if is_prompt_heavy else 0.0,
+            "recommended_kv_cache": "q8_0" if is_prompt_heavy else "FP16",
+        }
+
+
+class KVCacheAffinityRouter:
+    """Routes prompt-heavy requests and large document contexts to models with KV-compressed attention."""
+
+    def __init__(
+        self,
+        kv_monitor: KVMemoryMonitor | None = None,
+        kv_compressed_model: str = "Qwen3.8-Flash-Next",
+        standard_model: str = "gemini-3.7-flash",
+    ) -> None:
+        self.kv_monitor = kv_monitor or KVMemoryMonitor()
+        self.kv_compressed_model = kv_compressed_model
+        self.standard_model = standard_model
+
+    def route_by_kv_affinity(
+        self,
+        prompt_tokens: int,
+        context_tokens: int = 0,
+        is_prompt_heavy: bool = False,
+    ) -> dict[str, Any]:
+        affinity = self.kv_monitor.evaluate_kv_affinity(prompt_tokens, context_tokens)
+        should_use_kv_compression = is_prompt_heavy or affinity["is_prompt_heavy"]
+
+        selected_model = self.kv_compressed_model if should_use_kv_compression else self.standard_model
+        return {
+            "selected_model": selected_model,
+            "kv_compressed_attention": should_use_kv_compression,
+            "affinity_metrics": affinity,
+            "kv_cache_type": "q8_0" if should_use_kv_compression else "FP16",
+            "sliding_window_attention": should_use_kv_compression,
+            "rationale": (
+                f"Selected KV-compressed model '{selected_model}' with {affinity['recommended_kv_cache']} cache "
+                f"for prompt-heavy context ({affinity['total_tokens']} tokens)."
+                if should_use_kv_compression
+                else f"Selected standard endpoint '{selected_model}' ({affinity['total_tokens']} tokens)."
+            ),
+        }
+
 
 __all__ = [
     "DataSovereigntyLevel",
     "BitwiseParityEnforcer",
     "TrajectoryRoutingDecision",
+    "ExecutionTier",
+    "SpeculativeQueueGovernor",
     "SpeculativeDraftConfig",
     "TokenCostAttribution",
     "RetryBudget",
     "SpeculativeInferenceRunner",
     "SLATracker",
     "ModelRouter",
+    "OperationalStepType",
+    "StepRoutingDecision",
+    "StepRouter",
+    "KVMemoryMonitor",
+    "KVCacheAffinityRouter",
 ]
+
 

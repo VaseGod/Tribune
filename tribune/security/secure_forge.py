@@ -18,7 +18,8 @@ SECURE_FORGE_SYSTEM_PROMPT: Final[str] = (
     "3. Command Injection: Avoid invoking shell subprocesses. If subprocesses are necessary, pass argument arrays (e.g. `subprocess.run(['cmd', arg1], shell=False)`). NEVER pass shell=True.\n"
     "4. Insecure Deserialization: Never use `pickle.loads` or `eval` on untrusted inputs. Use strongly typed `json.loads` or Pydantic parsers.\n"
     "5. SSRF / XSS: Validate and sanitize all external URLs with explicit scheme white-listing (https only). Sanitize output strings before rendering.\n"
-    "6. Parse, Don't Validate: Parse untrusted raw inputs directly into strongly typed domain objects at boundary interfaces. Fail early with explicit error lists.\n\n"
+    "6. Parse, Don't Validate: Parse untrusted raw inputs directly into strongly typed domain objects at boundary interfaces. Fail early with explicit error lists.\n"
+    "7. Anti-EvoMal & Memory Integrity: Reject any self-modifying code, memory store partition tampering, or unsigned skill execution. Ensure SHA-256 manifest verification across all agent worktrees.\n\n"
     "Format code output cleanly without vulnerable practices or hidden backdoors."
 )
 

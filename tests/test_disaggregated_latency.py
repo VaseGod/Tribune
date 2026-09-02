@@ -88,3 +88,46 @@ def test_eval_harness_end_to_end_latencies():
         assert rec.total_latency_ms >= 0.0
     rendered = result.report.render()
     assert "latency breakdown (disaggregated)" in rendered
+
+
+def test_step_level_disaggregated_latencies():
+    """Verify step-level disaggregated latencies (fold planning, JSON extraction, synthesis)."""
+    rec1 = EvalRecord(
+        case_id="c1",
+        program=ProgramId.SNAP,
+        abstained=False,
+        ground_truth_label="eligible",
+        ambiguous=False,
+        predicted_label="eligible",
+        fold_planning_latency_ms=15.0,
+        json_extraction_latency_ms=25.0,
+        synthesis_latency_ms=120.0,
+        total_latency_ms=160.0,
+        step_latencies={"tool_param_formatting": 8.0},
+    )
+    rec2 = EvalRecord(
+        case_id="c2",
+        program=ProgramId.SNAP,
+        abstained=False,
+        ground_truth_label="ineligible",
+        ambiguous=False,
+        predicted_label="ineligible",
+        fold_planning_latency_ms=25.0,
+        json_extraction_latency_ms=35.0,
+        synthesis_latency_ms=140.0,
+        total_latency_ms=200.0,
+        step_latencies={"tool_param_formatting": 12.0},
+    )
+
+    report = compute_metrics([rec1, rec2])
+    assert abs(report.mean_step_latencies["fold_planning"] - 20.0) < 1e-6
+    assert abs(report.mean_step_latencies["json_extraction"] - 30.0) < 1e-6
+    assert abs(report.mean_step_latencies["synthesis"] - 130.0) < 1e-6
+    assert abs(report.mean_step_latencies["tool_param_formatting"] - 10.0) < 1e-6
+
+    rendered = report.render()
+    assert "fold_planning (mean)" in rendered
+    assert "json_extraction (mean)" in rendered
+    assert "synthesis (mean)" in rendered
+    assert "tool_param_formatting (mean)" in rendered
+

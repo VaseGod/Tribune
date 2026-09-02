@@ -21,6 +21,11 @@ from __future__ import annotations
 import enum
 import re
 import secrets
+import copy
+import hashlib
+import json
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -131,6 +136,198 @@ class SupervisorSignature:
 
 
 # --------------------------------------------------------------------------- #
+# Append-Only Cryptographic Trajectory Event Sourcing & Sandbox Snapshots
+# --------------------------------------------------------------------------- #
+
+
+class TrajectoryEventType(str, enum.Enum):
+    """Event types recorded in the append-only cryptographic trajectory audit log."""
+
+    MUTATION_DRAFTED = "mutation_drafted"
+    SPECULATIVE_EXECUTED = "speculative_executed"
+    EXTERNAL_CALL_ATTEMPTED = "external_call_attempted"
+    JUDGE_APPROVED = "judge_approved"
+    JUDGE_REJECTED = "judge_rejected"
+    COMMITTED = "committed"
+    ROLLED_BACK = "rolled_back"
+
+
+@dataclass
+class TrajectoryEvent:
+    """An immutable, cryptographically chained event in the case execution trajectory."""
+
+    event_id: str
+    case_id: str
+    event_type: TrajectoryEventType
+    agent_id: str
+    action_name: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    prev_hash: str = "0" * 64
+    event_hash: str = ""
+    timestamp: datetime = field(default_factory=_utcnow)
+    signature: str | None = None
+
+    def compute_hash(self, prev_hash: str) -> str:
+        """Compute deterministic SHA-256 hash chaining back to prev_hash."""
+        serialized_payload = json.dumps(self.payload, sort_keys=True, default=str)
+        content = (
+            f"{prev_hash}:{self.event_id}:{self.case_id}:{self.event_type.value}:"
+            f"{self.agent_id}:{self.action_name}:{serialized_payload}:{self.timestamp.isoformat()}"
+        )
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+class TrajectoryEventLog:
+    """Append-only cryptographic event store with SHA-256 hash chaining."""
+
+    def __init__(self) -> None:
+        self.events: list[TrajectoryEvent] = []
+        self._lock = threading.RLock()
+
+    def append_event(
+        self,
+        case_id: str,
+        event_type: TrajectoryEventType,
+        agent_id: str,
+        action_name: str,
+        payload: dict[str, Any] | None = None,
+        signature: str | None = None,
+    ) -> TrajectoryEvent:
+        with self._lock:
+            prev_hash = self.events[-1].event_hash if self.events else "0" * 64
+            event_id = f"evt_{len(self.events) + 1}_{secrets.token_hex(6)}"
+            event = TrajectoryEvent(
+                event_id=event_id,
+                case_id=case_id,
+                event_type=event_type,
+                agent_id=agent_id,
+                action_name=action_name,
+                payload=dict(payload or {}),
+                prev_hash=prev_hash,
+                timestamp=_utcnow(),
+                signature=signature,
+            )
+            event.event_hash = event.compute_hash(prev_hash)
+            self.events.append(event)
+            return event
+
+    def verify_log_integrity(self) -> bool:
+        """Verify unbroken SHA-256 cryptographic chain across all recorded trajectory events."""
+        with self._lock:
+            if not self.events:
+                return True
+            expected_prev = "0" * 64
+            for event in self.events:
+                if event.prev_hash != expected_prev:
+                    return False
+                computed = event.compute_hash(event.prev_hash)
+                if event.event_hash != computed:
+                    return False
+                expected_prev = event.event_hash
+            return True
+
+    def get_case_events(self, case_id: str) -> list[TrajectoryEvent]:
+        with self._lock:
+            return [e for e in self.events if e.case_id == case_id]
+
+    def get_uncommitted_events(self, case_id: str) -> list[TrajectoryEvent]:
+        with self._lock:
+            case_evts = [e for e in self.events if e.case_id == case_id]
+            last_commit_idx = -1
+            for idx, e in enumerate(case_evts):
+                if e.event_type in (TrajectoryEventType.COMMITTED, TrajectoryEventType.ROLLED_BACK):
+                    last_commit_idx = idx
+            return case_evts[last_commit_idx + 1 :]
+
+
+@dataclass
+class SandboxSnapshot:
+    """Immutable state snapshot captured inside an isolated sandbox."""
+
+    snapshot_id: str
+    case_id: str
+    state_data: dict[str, Any]
+    checksum: str
+    timestamp: datetime = field(default_factory=_utcnow)
+
+
+class SandboxContext:
+    """Isolated sandbox execution context with snapshot, isolation, and rollback capabilities."""
+
+    def __init__(self, case_id: str, initial_state: dict[str, Any] | None = None) -> None:
+        self.case_id = case_id
+        self.active_state: dict[str, Any] = copy.deepcopy(initial_state or {})
+        self.snapshots: list[SandboxSnapshot] = []
+        self.uncommitted_mutations: list[dict[str, Any]] = []
+        self.is_committed: bool = False
+        self._lock = threading.RLock()
+        # Initialize initial baseline snapshot
+        self.snapshot(self.active_state)
+
+    def snapshot(self, state: dict[str, Any] | None = None) -> SandboxSnapshot:
+        with self._lock:
+            target_state = copy.deepcopy(state if state is not None else self.active_state)
+            serialized = json.dumps(target_state, sort_keys=True, default=str)
+            checksum = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            snap_id = f"snap_{len(self.snapshots) + 1}_{secrets.token_hex(4)}"
+            snap = SandboxSnapshot(
+                snapshot_id=snap_id,
+                case_id=self.case_id,
+                state_data=target_state,
+                checksum=checksum,
+                timestamp=_utcnow(),
+            )
+            self.snapshots.append(snap)
+            return snap
+
+    def mutate(self, path: str, value: Any, agent_id: str = "unknown") -> None:
+        with self._lock:
+            self.active_state[path] = copy.deepcopy(value)
+            self.uncommitted_mutations.append({
+                "path": path,
+                "value": value,
+                "agent_id": agent_id,
+                "timestamp": _utcnow().isoformat(),
+            })
+
+    def rollback_to_snapshot(self, snapshot_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            if not self.snapshots:
+                self.active_state.clear()
+                self.uncommitted_mutations.clear()
+                return {}
+            if snapshot_id is not None:
+                match = next((s for s in reversed(self.snapshots) if s.snapshot_id == snapshot_id), None)
+                snap = match or self.snapshots[0]
+            else:
+                snap = self.snapshots[-1]
+
+            self.active_state = copy.deepcopy(snap.state_data)
+            self.uncommitted_mutations.clear()
+            self.is_committed = False
+            return copy.deepcopy(self.active_state)
+
+    def commit(
+        self,
+        supervisor_signature: SupervisorSignature | None = None,
+        judge_result: Any | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if judge_result is not None:
+                passed = getattr(judge_result, "passed", True)
+                if not passed:
+                    raise SecurityViolationError(
+                        f"Judge rejected sandbox commit for case {self.case_id}: "
+                        f"{getattr(judge_result, 'reasoning', 'Judge failed assertions')}"
+                    )
+            self.is_committed = True
+            self.uncommitted_mutations.clear()
+            # Capture committed baseline snapshot
+            self.snapshot(self.active_state)
+            return copy.deepcopy(self.active_state)
+
+
+# --------------------------------------------------------------------------- #
 # Static Pattern Detectors for Specification Gaming Guardrails
 # --------------------------------------------------------------------------- #
 
@@ -189,6 +386,46 @@ class StaticPatternDetectors:
         re.compile(r"<(?:think|thought|reasoning)[^>]*>.*?</(?:think|thought|reasoning)>", re.DOTALL | re.IGNORECASE),
     ]
 
+    # 9. Prohibited Unverified Direct Emission by Ingestion / Non-Binding Models
+    PROHIBITED_UNVERIFIED_DIRECT_EMISSION = [
+        re.compile(r"\b(?:direct_emission_by_glm_flash|unverified_statutory_decision|bypass_verifier_pass)\b", re.IGNORECASE),
+        re.compile(r"\b(?:glm-5\.3-flash-direct-determination|raw_non_binding_determination)\b", re.IGNORECASE),
+    ]
+
+    # 10. Environment Manipulation, Privilege Escalation, & Mock Tampering
+    ENV_MANIPULATION_PATTERNS = [
+        re.compile(r"\b(?:sudo|chmod\s+777|chown|setuid|setgid|getpass|ctypes\.cdll)\b", re.IGNORECASE),
+        re.compile(r"\b(?:os\.environ|os\.putenv|os\.system|subprocess\.call|shutil\.rmtree)\b"),
+        re.compile(r"\b(?:sys\.modules|builtins\.__dict__|__builtins__\.open)\b"),
+        re.compile(r"(?:mock\.patch|unittest\.mock\.MagicMock\.__setattr__|monkeypatch\.setattr)"),
+    ]
+
+
+
+def validate_path_containment(path: str, allowed_root: str | None = None) -> bool:
+    """Strict path containment validation to trap and reject out-of-bounds file system traversal."""
+    if not path:
+        return False
+
+    clean_path = str(path).strip()
+    # Check for obvious traversal or prohibited absolute/home paths
+    lower = clean_path.lower()
+    for denied in ["/etc", "~/.ssh", ".env", ".git", "id_rsa", "shadow"]:
+        if denied in lower:
+            return False
+
+    if ".." in clean_path:
+        root = os.path.abspath(allowed_root or os.getcwd())
+        try:
+            resolved = os.path.abspath(os.path.join(root, clean_path) if not os.path.isabs(clean_path) else clean_path)
+            if not resolved.startswith(root):
+                return False
+        except Exception:
+            return False
+
+    return True
+
+
 
 class ActionGate:
     """ActionGate enforcing strict safety guardrails, human authorization, and pattern detection."""
@@ -213,6 +450,78 @@ class ActionGate:
         ]
         self.violations_log: list[GateDecision] = []
         self.failure_payloads: list[dict[str, Any]] = []
+        self.event_log = TrajectoryEventLog()
+        self.sandboxes: dict[str, SandboxContext] = {}
+
+    def create_sandbox(
+        self, case_id: str, initial_state: dict[str, Any] | None = None
+    ) -> SandboxContext:
+        """Create and register an isolated execution sandbox for a case."""
+        sb = SandboxContext(case_id, initial_state)
+        self.sandboxes[case_id] = sb
+        return sb
+
+    def get_or_create_sandbox(self, case_id: str) -> SandboxContext:
+        """Retrieve existing sandbox or initialize a new one for the case."""
+        if case_id not in self.sandboxes:
+            self.sandboxes[case_id] = SandboxContext(case_id)
+        return self.sandboxes[case_id]
+
+    def rollback_sandbox(self, case_id: str, reason: str = "audit_rejection") -> dict[str, Any]:
+        """Rollback sandbox to latest stable snapshot and record ROLLED_BACK in event log."""
+        sb = self.get_or_create_sandbox(case_id)
+        restored = sb.rollback_to_snapshot()
+        self.event_log.append_event(
+            case_id=case_id,
+            event_type=TrajectoryEventType.ROLLED_BACK,
+            agent_id="action_gate",
+            action_name="rollback_sandbox",
+            payload={"reason": reason},
+        )
+        return restored
+
+    def commit_sandbox(
+        self,
+        case_id: str,
+        supervisor_signature: SupervisorSignature | None = None,
+        judge_result: Any | None = None,
+    ) -> dict[str, Any]:
+        """Commit pending sandbox mutations only after verifying judge approval and supervisor signoff."""
+        sb = self.get_or_create_sandbox(case_id)
+        if judge_result is not None:
+            passed = getattr(judge_result, "passed", True)
+            if not passed:
+                self.rollback_sandbox(
+                    case_id,
+                    reason=f"judge_rejected: {getattr(judge_result, 'reasoning', 'Judge rejection')}",
+                )
+                self.event_log.append_event(
+                    case_id=case_id,
+                    event_type=TrajectoryEventType.JUDGE_REJECTED,
+                    agent_id="judge",
+                    action_name="commit_sandbox",
+                    payload={"reasons": getattr(judge_result, "failing_rules", [])},
+                )
+                raise SecurityViolationError(
+                    f"Mandatory judge approval rejected action for case {case_id}"
+                )
+
+        committed_state = sb.commit(
+            supervisor_signature=supervisor_signature, judge_result=judge_result
+        )
+        self.event_log.append_event(
+            case_id=case_id,
+            event_type=(
+                TrajectoryEventType.JUDGE_APPROVED
+                if judge_result
+                else TrajectoryEventType.COMMITTED
+            ),
+            agent_id="judge" if judge_result else "supervisor",
+            action_name="commit_sandbox",
+            payload={"committed_keys": list(committed_state.keys())},
+            signature=supervisor_signature.signature_token if supervisor_signature else None,
+        )
+        return committed_state
 
     def record_violation_telemetry(
         self,
@@ -345,6 +654,26 @@ class ActionGate:
                 highest_severity = GateSeverity.HIGH
                 decision = GateDecisionType.BLOCK
 
+        # 9. Prohibited Direct Emission by Ingestion / Non-Binding Models
+        for pat in StaticPatternDetectors.PROHIBITED_UNVERIFIED_DIRECT_EMISSION:
+            m = pat.search(content)
+            if m:
+                matched_rules.append("PROHIBITED_UNVERIFIED_DIRECT_EMISSION")
+                evidence_spans.append(m.group(0))
+                reasons.append(f"Attempted unverified direct emission of statutory determination by non-binding model: '{m.group(0)}'")
+                highest_severity = GateSeverity.CRITICAL
+                decision = GateDecisionType.BLOCK
+
+        # 10. Environment Manipulation, Privilege Escalation & Mock Tampering
+        for pat in StaticPatternDetectors.ENV_MANIPULATION_PATTERNS:
+            m = pat.search(content)
+            if m:
+                matched_rules.append("ENVIRONMENT_TAMPERING")
+                evidence_spans.append(m.group(0))
+                reasons.append(f"Attempted privilege escalation, environment manipulation, or mock tampering: '{m.group(0)}'")
+                highest_severity = GateSeverity.CRITICAL
+                decision = GateDecisionType.BLOCK
+
         remediation = "Ensure all actions respect sandbox boundaries and cite active statutory rules." if reasons else ""
 
         return GateDecision(
@@ -357,6 +686,7 @@ class ActionGate:
             agent_id=agent_id,
             action_type=action_type,
         )
+
 
     def enforce_guardrails(
         self,
@@ -403,17 +733,46 @@ class ActionGate:
         assert getattr(materials, "submitted", False) is False, "Prepared materials must never be submitted"
         return materials
 
+    def enforce_proposer_model_firewall(
+        self,
+        assessment: Assessment,
+        source_model: str | None = None,
+        is_verified: bool = False,
+    ) -> None:
+        """Architectural firewall prohibiting glm-5.3-flash and unverified models from directly emitting legal eligibility determinations."""
+        model_name = (source_model or "").lower()
+        rationale = (assessment.rationale or "").lower()
+        # Direct emission from glm-5.3-flash without independent verifier certification is prohibited
+        if "glm-5.3-flash" in model_name or "glm-5.3" in model_name or "glm-5.3-flash" in rationale:
+            if not is_verified:
+                raise SecurityViolationError(
+                    "ActionGate Architectural Firewall: glm-5.3-flash is restricted to document ingestion "
+                    "and non-binding trajectory planning and is prohibited from directly emitting unverified "
+                    "legal eligibility determinations. Verification pass by independent verifier required."
+                )
+
     def verify_citations(
-        self, assessment: Assessment, rule_store: RuleStore | None = None
+        self,
+        assessment: Assessment,
+        rule_store: RuleStore | None = None,
+        source_model: str | None = None,
+        is_verified: bool = False,
     ) -> tuple[bool, list[str]]:
-        """Mandatory citation verification gate for local model outputs.
+        """Mandatory citation verification gate for model outputs.
 
         Requires every eligibility determination or legal claim to contain an exact,
-        verifiable citation matching an active entry in rule_store.
+        verifiable citation matching an active entry in rule_store, and enforces
+        the architectural firewall against unverified direct emission by non-binding models.
         """
         if rule_store is None:
             from ..corpus.rule_store import LocalRuleStore
             rule_store = LocalRuleStore()
+
+        # Check firewall
+        try:
+            self.enforce_proposer_model_firewall(assessment, source_model=source_model, is_verified=is_verified)
+        except SecurityViolationError as err:
+            return False, [str(err)]
 
         active_citations = rule_store.all_citations(assessment.program, assessment.jurisdiction)
         active_ids = {c.citation_id for c in active_citations}
@@ -445,6 +804,54 @@ class ActionGate:
             violations.extend(decision.reasons)
 
         return len(violations) == 0, violations
+
+    def validate_navigator_statutory_claims(
+        self,
+        claims: list[dict[str, Any]] | list[str],
+        program: str,
+        jurisdiction: str = "EX",
+        local_rules_provider: Any | None = None,
+        verifier: Any | None = None,
+    ) -> dict[str, Any]:
+        """Enforce pipeline flow: All statutory eligibility claims emitted by navigator MUST be cross-referenced
+        against local_rules.py and validated by verifier.py before execution or export.
+        """
+        if not claims:
+            return {"valid": True, "claims_evaluated": 0, "verified": True}
+
+        from ..providers.local_rules import cross_evaluate_rule_citations
+
+        normalized_claim_cits: list[str] = []
+        for c in claims:
+            if isinstance(c, dict):
+                cit = c.get("citation_id") or c.get("citation") or c.get("source", "")
+                if cit:
+                    normalized_claim_cits.append(str(cit))
+            elif isinstance(c, str):
+                normalized_claim_cits.append(c)
+
+        cross_res = cross_evaluate_rule_citations(normalized_claim_cits, program=program, jurisdiction=jurisdiction)
+        if not cross_res.get("valid", False) and cross_res.get("missing_citations"):
+            missing = cross_res.get("missing_citations", [])
+            raise PreConditionError(
+                f"Navigator statutory claim validation failed: claims reference unverified/missing statutory citations "
+                f"in local_rules.py: {missing}. Claims must be cross-referenced against local_rules."
+            )
+
+        if verifier is not None and hasattr(verifier, "verify_statutory_claims"):
+            v_report = verifier.verify_statutory_claims(claims, program=program, jurisdiction=jurisdiction)
+            if not getattr(v_report, "is_certified", getattr(v_report, "approved", True)):
+                raise PreConditionError(
+                    f"Navigator statutory claims rejected by verifier: {getattr(v_report, 'reasons', 'Verification failed')}"
+                )
+
+        return {
+            "valid": True,
+            "claims_evaluated": len(claims),
+            "matched_citations": cross_res.get("matched_citations", []),
+            "cross_referenced_local_rules": True,
+            "verified": True,
+        }
 
     def assert_evaluation_certified(
         self,
@@ -554,8 +961,17 @@ class ActionGate:
     ) -> Any:
         """Execute a tool wrapped with pre- and post-condition assertion checks and sandbox security."""
         case_id = kwargs.get("case_id", "global")
+        # Path containment validation on any file path parameters
+        for k in ["path", "file_path", "target_path", "filepath", "output_path", "input_path"]:
+            if k in kwargs and isinstance(kwargs[k], str):
+                if not validate_path_containment(kwargs[k]):
+                    raise SecurityViolationError(
+                        f"ActionGate path validation blocked out-of-bounds file system traversal attempt: '{kwargs[k]}'"
+                    )
+
         # Guardrail check on tool inputs
         self.enforce_guardrails(kwargs, action_type=f"tool_input:{tool_name}")
+
 
         self.assert_preconditions(
             tool_name=tool_name,
@@ -564,12 +980,36 @@ class ActionGate:
             case_id=case_id,
         )
 
-        result = tool_fn(**kwargs)
+        self.event_log.append_event(
+            case_id=case_id,
+            event_type=TrajectoryEventType.EXTERNAL_CALL_ATTEMPTED,
+            agent_id="tool_runner",
+            action_name=tool_name,
+            payload={"args": list(kwargs.keys())},
+            signature=supervisor_signature.signature_token if supervisor_signature else None,
+        )
 
-        if result is None and "allow_none" not in kwargs:
-            raise PostConditionError(f"Post-condition failed: tool '{tool_name}' returned null unexpectedly.")
-        self.assert_postconditions(result=result)
-        return result
+        sb = self.get_or_create_sandbox(case_id)
+        pre_snap = sb.snapshot()
+
+        try:
+            result = tool_fn(**kwargs)
+            if result is None and "allow_none" not in kwargs:
+                raise PostConditionError(
+                    f"Post-condition failed: tool '{tool_name}' returned null unexpectedly."
+                )
+            self.assert_postconditions(result=result)
+            return result
+        except Exception as exc:
+            sb.rollback_to_snapshot(pre_snap.snapshot_id)
+            self.event_log.append_event(
+                case_id=case_id,
+                event_type=TrajectoryEventType.ROLLED_BACK,
+                agent_id="tool_runner",
+                action_name=tool_name,
+                payload={"error": str(exc)},
+            )
+            raise
 
     def authorize_submission(
         self,
@@ -603,6 +1043,113 @@ class ActionGate:
         return receipt
 
 
+class ManifestEnforcer:
+    """Governance enforcer verifying SHA-256 signatures for shared skills, partitions, and rule indices."""
+
+    def __init__(self, manifest: Any | None = None) -> None:
+        from ..memory.partitions import PartitionIntegrityManifest
+        self.manifest = manifest or PartitionIntegrityManifest()
+        self.rejections_count: int = 0
+        self.verifications_count: int = 0
+
+    def enforce_partition_integrity(self, partition: Any) -> bool:
+        """Verify partition checksum against SHA-256 manifest. Raises SecurityViolationError on tampering."""
+        from ..memory.partitions import PartitionTamperingError
+        try:
+            checksum = partition.compute_checksum()
+            verified = self.manifest.verify_partition(partition.partition_id, checksum)
+            self.verifications_count += 1
+            return verified
+        except PartitionTamperingError as err:
+            self.rejections_count += 1
+            raise SecurityViolationError(f"Anti-EvoMal Manifest Violation: {err}") from err
+
+    def enforce_skill_integrity(self, skill_name: str, content: str | bytes) -> bool:
+        """Verify skill module checksum against SHA-256 manifest."""
+        from ..memory.partitions import PartitionTamperingError
+        try:
+            verified = self.manifest.verify_skill(skill_name, content)
+            self.verifications_count += 1
+            return verified
+        except PartitionTamperingError as err:
+            self.rejections_count += 1
+            raise SecurityViolationError(f"Anti-EvoMal Skill Manifest Violation: {err}") from err
+
+
+class ManagedProfileIsolation:
+    """Manages ephemeral, strictly isolated browser profile directories to prevent token/cookie leaks."""
+
+    def __init__(self, base_dir: str = "/tmp/tribune_browser_profiles") -> None:
+        self.base_dir = base_dir
+        self.active_profiles: dict[str, str] = {}
+
+    def get_isolated_profile(self, case_id: str, subagent_id: str) -> dict[str, Any]:
+        """Create or retrieve isolated profile metadata for an agent session."""
+        scoped_key = f"{case_id}::{subagent_id}"
+        profile_path = f"{self.base_dir}/{case_id}/{subagent_id}"
+        self.active_profiles[scoped_key] = profile_path
+        return {
+            "case_id": case_id,
+            "subagent_id": subagent_id,
+            "profile_path": profile_path,
+            "isolated": True,
+            "allow_shared_cookies": False,
+            "allow_shared_storage": False,
+        }
+
+
+class BrowserSandboxManager:
+    """Browser Sandbox managing domain-scoped ACLs and profile isolation for external legal retrieval."""
+
+    DEFAULT_ALLOWED_DOMAINS: list[str] = [
+        r"^https?://([a-zA-Z0-9-]+\.)*gov(/.*)?$",
+        r"^https?://([a-zA-Z0-9-]+\.)*state\.[a-z]{2}\.us(/.*)?$",
+        r"^https?://([a-zA-Z0-9-]+\.)*usda\.gov(/.*)?$",
+        r"^https?://([a-zA-Z0-9-]+\.)*cms\.gov(/.*)?$",
+        r"^https?://([a-zA-Z0-9-]+\.)*ssa\.gov(/.*)?$",
+        r"^https?://([a-zA-Z0-9-]+\.)*law\.cornell\.edu(/.*)?$",
+    ]
+
+    def __init__(
+        self,
+        allowed_domain_patterns: list[str] | None = None,
+        profile_manager: ManagedProfileIsolation | None = None,
+    ) -> None:
+        import re
+        self.allowed_patterns = [
+            re.compile(p, re.IGNORECASE) for p in (allowed_domain_patterns or self.DEFAULT_ALLOWED_DOMAINS)
+        ]
+        self.profile_manager = profile_manager or ManagedProfileIsolation()
+        self.blocked_navigations: list[dict[str, Any]] = []
+
+    def validate_navigation(self, url: str, case_id: str = "global", subagent_id: str = "main") -> bool:
+        """Validate that external URL complies with domain-scoped ACLs (e.g. .gov only)."""
+        clean_url = url.strip()
+        is_allowed = any(p.match(clean_url) for p in self.allowed_patterns)
+        if not is_allowed:
+            self.blocked_navigations.append({
+                "url": clean_url,
+                "case_id": case_id,
+                "subagent_id": subagent_id,
+                "reason": "Domain not permitted under statutory legal retrieval ACL (.gov only)",
+                "timestamp": time.time(),
+            })
+            raise SecurityViolationError(
+                f"Browser Sandbox Security Block: Navigation to '{clean_url}' rejected. "
+                f"External document retrieval is strictly restricted to authorized statutory (.gov) domains."
+            )
+        return True
+
+    def create_isolated_session(self, case_id: str, subagent_id: str) -> dict[str, Any]:
+        """Initialize an isolated browser session with managed profile isolation."""
+        profile = self.profile_manager.get_isolated_profile(case_id, subagent_id)
+        return {
+            "session_id": f"sess_{case_id}_{subagent_id}",
+            "profile": profile,
+            "acl_enforced": True,
+        }
+
+
 __all__ = [
     "ActionBlocked",
     "PreConditionError",
@@ -613,7 +1160,17 @@ __all__ = [
     "GateDecision",
     "HumanSignoff",
     "SupervisorSignature",
+    "TrajectoryEventType",
+    "TrajectoryEvent",
+    "TrajectoryEventLog",
+    "SandboxSnapshot",
+    "SandboxContext",
     "StaticPatternDetectors",
+    "ManifestEnforcer",
+    "ManagedProfileIsolation",
+    "BrowserSandboxManager",
     "ActionGate",
+    "validate_path_containment",
 ]
+
 

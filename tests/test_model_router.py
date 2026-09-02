@@ -273,3 +273,38 @@ def test_reasonmaxxer_rollback_toggle(monkeypatch):
     assert router.classify_task(intent="reasoning") == 2
 
 
+def test_glm_5_3_flash_ingestion_and_trajectory_routing():
+    router = ModelRouter()
+    # Document ingestion routes to glm-5.3-flash
+    doc_res = router.route_document_ingestion(
+        prompt="Ingest multi-year 500k token historical case records",
+        context="Case #987654",
+        document_length=500_000,
+    )
+    assert doc_res["status"] == "success"
+    assert doc_res["model"] == "glm-5.3-flash"
+    assert doc_res["context_length"] == 500_000
+
+    # Navigator trajectory planning routes to glm-5.3-flash
+    nav_res = router.route_navigator_task(
+        task_type="trajectory_planning",
+        prompt="Decompose multi-program benefit discovery plan",
+    )
+    assert nav_res["status"] == "success"
+    assert nav_res["model"] == "glm-5.3-flash"
+
+    # Preparer task routes to glm-5.3-flash
+    prep_res = router.route_preparer_task(
+        task_type="document_ingestion",
+        prompt="Ingest tax returns and utility bills",
+        use_speculative=False,
+    )
+    assert prep_res["status"] == "success"
+    assert prep_res["model"] == "glm-5.3-flash"
+
+    # Trajectory efficiency routing selects glm-5.3-flash for preparer/navigator roles
+    dec = router.route_by_trajectory_efficiency(role="preparer", estimated_turns=2)
+    assert dec.model == "glm-5.3-flash"
+    assert dec.tier == 1
+
+

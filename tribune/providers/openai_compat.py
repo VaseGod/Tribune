@@ -96,14 +96,29 @@ class OpenAICompatProvider:
         elif "deepseek" in model.lower():
             self._base = getattr(settings, "deepseek_base_url", settings.openai_base_url).rstrip("/")
             self._key = getattr(settings, "deepseek_api_key", "") or settings.openai_api_key
+        elif "glm" in model.lower() or "zhipu" in model.lower():
+            self._base = getattr(settings, "glm_base_url", settings.openai_base_url).rstrip("/")
+            self._key = getattr(settings, "glm_api_key", "") or settings.openai_api_key
         elif "gemini" in model.lower():
             self._base = getattr(settings, "gemini_base_url", settings.openai_base_url).rstrip("/")
             self._key = getattr(settings, "gemini_api_key", "") or settings.openai_api_key
+        elif "sglang" in model.lower():
+            self._base = getattr(settings, "sglang_base_url", "http://localhost:30000/v1").rstrip("/")
+            self._key = getattr(settings, "sglang_api_key", "token-sglang-local")
+        elif "qwen3.8-flash" in model.lower() or "flash-next" in model.lower():
+            self._base = getattr(settings, "vllm_base_url", settings.openai_base_url).rstrip("/")
+            self._key = getattr(settings, "vllm_api_key", "token-vllm-local")
         else:
             self._base = settings.openai_base_url.rstrip("/")
             self._key = settings.openai_api_key
         self._timeout = settings.request_timeout_s
+        self.settings = settings
         self.extra_body = extra_body or {}
+        # Apply speculative decoding MTP config if enabled in settings
+        if getattr(settings, "num_speculative_tokens", 0) > 0 and "num_speculative_tokens" not in self.extra_body:
+            self.extra_body["num_speculative_tokens"] = settings.num_speculative_tokens
+        if getattr(settings, "vllm_ple_cpu_offload", False) and "cpu_offload" not in self.extra_body:
+            self.extra_body["cpu_offload"] = 1
         self.temperature = temperature
         self.max_tokens = max_tokens
 
@@ -111,6 +126,10 @@ class OpenAICompatProvider:
     def pricing_parameters(self) -> dict[str, float]:
         """Return input and output pricing parameters per 1M tokens."""
         m = self.model.lower()
+        if "qwen3.8-flash-next" in m or "qwen3.8-flash" in m or "flash-next" in m:
+            return {"input_cost_per_1m": 0.12, "output_cost_per_1m": 0.35}
+        if "glm-5.3" in m or "glm-5.3-flash" in m:
+            return {"input_cost_per_1m": 0.15, "output_cost_per_1m": 0.50}
         if "gemini-3.7" in m or "gemini-3.7-flash" in m:
             return {"input_cost_per_1m": 0.75, "output_cost_per_1m": 3.75}
         if "gpt-5.6" in m or "gpt-5.6-sol-ultrafast" in m:

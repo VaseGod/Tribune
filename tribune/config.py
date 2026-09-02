@@ -21,11 +21,16 @@ class TribuneSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRIBUNE_", extra="ignore")
 
     # -- Model provider ----------------------------------------------------- #
-    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini"
-    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini"] = "local_rules"
+    # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini", "glm", "zhipu"
+    provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini", "glm", "zhipu"] = "local_rules"
     openai_base_url: str = "http://localhost:8000/v1"
     openai_api_key: str = "not-needed-for-local-serving"
     openai_model: str = "gemini-3.7-flash"
+
+    # GLM / Zhipu API parameters (including GLM-5.3-Flash)
+    glm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    glm_api_key: str = ""
+    glm_model: str = "glm-5.3-flash"
 
     # Gemini API parameters
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -53,6 +58,35 @@ class TribuneSettings(BaseSettings):
     vllm_api_key: str = "token-vllm-local"
     vllm_model: str = "Qwen/Qwen2.5-7B-Instruct"
 
+    # SGLang serving parameters
+    sglang_base_url: str = "http://localhost:30000/v1"
+    sglang_api_key: str = "token-sglang-local"
+    sglang_model: str = "Qwen/Qwen3.8-Flash-Next"
+
+    # Hybrid-Attention & Engram Offloading parameters
+    vllm_ple_cpu_offload: bool = Field(
+        default_factory=lambda: str(
+            os.getenv("VLLM_PLE_CPU_OFFLOAD", os.getenv("TRIBUNE_VLLM_PLE_CPU_OFFLOAD", "1"))
+        ).lower()
+        in ("true", "1", "yes")
+    )
+    num_speculative_tokens: int = Field(
+        default_factory=lambda: int(
+            os.getenv("TRIBUNE_NUM_SPECULATIVE_TOKENS", os.getenv("NUM_SPECULATIVE_TOKENS", "1"))
+        )
+    )
+    confidence_fallback_threshold: float = Field(
+        default_factory=lambda: float(
+            os.getenv("TRIBUNE_CONFIDENCE_FALLBACK_THRESHOLD", "0.85")
+        )
+    )
+    hybrid_attention_backend: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_HYBRID_ATTENTION_BACKEND", "vllm")
+    )
+    qwen_flash_model: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_QWEN_FLASH_MODEL", "Qwen3.8-Flash-Next")
+    )
+
     # Local Quantized Fallback Endpoint (3-bit MoE / local server)
     local_fallback_url: str = "http://localhost:8001/v1"
     local_fallback_model: str = "local-quant-moe-3bit"
@@ -63,7 +97,7 @@ class TribuneSettings(BaseSettings):
     static_analysis_timeout_s: float = 30.0
 
     # The verifier can run on a *stronger* model than the proposer.
-    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini"] = "local_rules"
+    verifier_provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "sglang", "grok", "xai", "gemini"] = "local_rules"
     verifier_model: str = "gpt-5.6-sol-ultrafast"
     request_timeout_s: float = 60.0
 
@@ -148,7 +182,7 @@ class TribuneSettings(BaseSettings):
 
     # -- Abstention --------------------------------------------------------- #
     # Below this calibrated confidence, TRIBUNE abstains and routes to a human.
-    abstention_threshold: float = 0.70
+    abstention_threshold: float = 0.85
 
     # -- Tracing ------------------------------------------------------------ #
     tracing: Literal["none", "weave"] = "none"

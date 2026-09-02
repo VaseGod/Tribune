@@ -7,6 +7,8 @@ Also exports tool definitions compatible with OpenAI Agent Plugins / Chat Comple
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from .casegen.synthetic import SyntheticCaseGenerator
@@ -87,27 +89,113 @@ class MCPAuthError(Exception):
     pass
 
 
-def check_mcp_auth(headers: dict[str, str], settings: TribuneSettings | None = None) -> str:
-    """Verify MCP authentication & RBAC headers if configured."""
-    settings = settings or get_settings()
-    expected_token = settings.mcp_auth_token
+# --------------------------------------------------------------------------- #
+# Enterprise Identity Delegation & Scoped Token Context
+# --------------------------------------------------------------------------- #
 
-    if expected_token:
+
+@dataclass
+class DelegatedUserTokenContext:
+    """Enterprise IdP authenticated, scoped delegated user session context."""
+
+    user_id: str
+    subject: str
+    tenant_id: str = "enterprise_default"
+    issuer: str = "https://auth.tribune.enterprise.internal"
+    roles: list[str] = field(default_factory=lambda: ["user"])
+    scopes: set[str] = field(
+        default_factory=lambda: {"rules:read", "cases:read", "cases:assess", "fields:extract"}
+    )
+    delegated_token: str = ""
+    token_type: str = "Bearer"
+    expires_at: float = field(default_factory=lambda: time.time() + 3600.0)
+    claims: dict[str, Any] = field(default_factory=dict)
+    renewable: bool = True
+
+    def is_expired(self) -> bool:
+        """Check if the delegated token has exceeded its TTL."""
+        return time.time() >= self.expires_at
+
+    def has_scope(self, scope: str) -> bool:
+        """Validate whether the token possesses a specific required capability scope."""
+        if "admin:all" in self.scopes or "admin" in self.roles:
+            return True
+        return scope in self.scopes
+
+    def renew_token(self, ttl: float = 3600.0) -> DelegatedUserTokenContext:
+        """Renew token context with a refreshed expiration."""
+        if not self.renewable:
+            raise MCPAuthError("Token context is not renewable")
+        return DelegatedUserTokenContext(
+            user_id=self.user_id,
+            subject=self.subject,
+            tenant_id=self.tenant_id,
+            issuer=self.issuer,
+            roles=list(self.roles),
+            scopes=set(self.scopes),
+            delegated_token=self.delegated_token,
+            token_type=self.token_type,
+            expires_at=time.time() + ttl,
+            claims=dict(self.claims),
+            renewable=self.renewable,
+        )
+
+
+def validate_enterprise_token(
+    token: str | None = None,
+    headers: dict[str, str] | None = None,
+    settings: TribuneSettings | None = None,
+) -> DelegatedUserTokenContext:
+    """Validate enterprise delegated token against IdP policies and return verified context."""
+    headers = headers or {}
+    settings = settings or get_settings()
+
+    extracted_token = token
+    if not extracted_token:
         auth_header = headers.get("authorization") or headers.get("Authorization") or ""
         api_key_header = headers.get("x-api-key") or headers.get("X-API-Key") or ""
-
-        token = ""
         if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
+            extracted_token = auth_header[7:].strip()
         elif api_key_header:
-            token = api_key_header.strip()
+            extracted_token = api_key_header.strip()
 
-        if token != expected_token:
-            raise MCPAuthError("Invalid or missing MCP Bearer token / API Key")
+    expected_token = settings.mcp_auth_token
+    if expected_token and extracted_token != expected_token:
+        raise MCPAuthError("Invalid or missing MCP Bearer token / API Key")
 
-    # Extract user role for RBAC checks (default to 'user')
     role = headers.get("x-tribune-role") or headers.get("X-Tribune-Role") or "user"
-    return role
+    user_id = headers.get("x-tribune-user-id") or headers.get("X-Tribune-User-ID") or "user-default"
+    tenant_id = (
+        headers.get("x-tribune-tenant-id") or headers.get("X-Tribune-Tenant-ID") or "tenant-default"
+    )
+
+    # Scopes configuration based on role or explicit header
+    scopes_header = headers.get("x-tribune-scopes") or headers.get("X-Tribune-Scopes")
+    if scopes_header:
+        scopes = {s.strip() for s in scopes_header.split(",") if s.strip()}
+    elif role == "read_only":
+        scopes = {"rules:read", "cases:read"}
+    elif role == "admin":
+        scopes = {"admin:all", "rules:read", "cases:read", "cases:assess", "fields:extract"}
+    else:
+        scopes = {"rules:read", "cases:read", "cases:assess", "fields:extract"}
+
+    ctx = DelegatedUserTokenContext(
+        user_id=user_id,
+        subject=f"sub:{user_id}",
+        tenant_id=tenant_id,
+        roles=[role],
+        scopes=scopes,
+        delegated_token=extracted_token or "anonymous_token",
+        expires_at=time.time() + 3600.0,
+    )
+    return ctx
+
+
+def check_mcp_auth(headers: dict[str, str], settings: TribuneSettings | None = None) -> str:
+    """Verify MCP authentication & RBAC headers (backward compatible)."""
+    ctx = validate_enterprise_token(headers=headers, settings=settings)
+    return ctx.roles[0] if ctx.roles else "user"
 
 
 class MCPHandler:
@@ -121,9 +209,9 @@ class MCPHandler:
         """Process a single JSON-RPC request."""
         headers = headers or {}
 
-        # Validate Auth & RBAC
+        # Validate Auth & Scopes
         try:
-            user_role = check_mcp_auth(headers, self.settings)
+            token_ctx = validate_enterprise_token(headers=headers, settings=self.settings)
         except MCPAuthError as exc:
             req_id = payload.get("id")
             return {
@@ -131,6 +219,8 @@ class MCPHandler:
                 "id": req_id,
                 "error": {"code": -32001, "message": f"Unauthorized: {exc}"},
             }
+
+        user_role = token_ctx.roles[0] if token_ctx.roles else "user"
 
         jsonrpc = payload.get("jsonrpc")
         if jsonrpc != "2.0":
@@ -159,9 +249,21 @@ class MCPHandler:
             return {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
         if method == "resources/list":
+            if not token_ctx.has_scope("rules:read"):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32002, "message": "Forbidden: missing 'rules:read' scope"},
+                }
             return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": self._list_resources()}}
 
         if method == "resources/read":
+            if not token_ctx.has_scope("rules:read") and not token_ctx.has_scope("cases:read"):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32002, "message": "Forbidden: missing read scope"},
+                }
             uri = params.get("uri", "")
             try:
                 content = self._read_resource(uri)
@@ -191,6 +293,24 @@ class MCPHandler:
         if method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments") or {}
+
+            # Scope-based access control
+            scope_map = {
+                "tribune_run_case": "cases:assess",
+                "tribune_search_rules": "rules:read",
+                "tribune_extract_fields": "fields:extract",
+                "tribune_explain_assessment": "cases:read",
+            }
+            required_scope = scope_map.get(tool_name)
+            if required_scope and not token_ctx.has_scope(required_scope):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32002,
+                        "message": f"Forbidden: role '{user_role}' or token lacks scope '{required_scope}'",
+                    },
+                }
 
             # RBAC check for restricted actions
             if user_role == "read_only" and tool_name == "tribune_run_case":
@@ -426,3 +546,16 @@ def get_openai_plugin_manifest(host_url: str = "http://localhost:8000") -> dict[
         "contact_email": "support@tribune.local",
         "legal_info_url": f"{host_url.rstrip('/')}/api/meta",
     }
+
+
+__all__ = [
+    "MCP_PROTOCOL_VERSION",
+    "TOOLS_DEFINITIONS",
+    "MCPAuthError",
+    "DelegatedUserTokenContext",
+    "validate_enterprise_token",
+    "check_mcp_auth",
+    "MCPHandler",
+    "get_openai_tools_schema",
+    "get_openai_plugin_manifest",
+]

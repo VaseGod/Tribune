@@ -104,6 +104,28 @@ class TestActionGateGuardrails(unittest.TestCase):
         )
         self.assertEqual(res["status"], "active")
 
+    def test_environment_tampering_and_privilege_escalation_guardrails(self) -> None:
+        # Test sudo / privilege escalation
+        dec_sudo = self.gate.evaluate_text_patterns("run command: sudo rm -rf /var/log")
+        self.assertEqual(dec_sudo.decision, GateDecisionType.BLOCK)
+        self.assertIn("ENVIRONMENT_TAMPERING", dec_sudo.matched_rules)
+
+        # Test os.environ tampering
+        dec_env = self.gate.evaluate_text_patterns("os.environ['OPENAI_API_KEY'] = 'tampered'")
+        self.assertEqual(dec_env.decision, GateDecisionType.BLOCK)
+        self.assertIn("ENVIRONMENT_TAMPERING", dec_env.matched_rules)
+
+        # Test sys.modules tampering
+        dec_sys = self.gate.evaluate_text_patterns("sys.modules['tribune.governance'] = None")
+        self.assertEqual(dec_sys.decision, GateDecisionType.BLOCK)
+        self.assertIn("ENVIRONMENT_TAMPERING", dec_sys.matched_rules)
+
+        # Test mock patching
+        dec_mock = self.gate.evaluate_text_patterns("with mock.patch('os.system'): pass")
+        self.assertEqual(dec_mock.decision, GateDecisionType.BLOCK)
+        self.assertIn("ENVIRONMENT_TAMPERING", dec_mock.matched_rules)
+
 
 if __name__ == "__main__":
     unittest.main()
+

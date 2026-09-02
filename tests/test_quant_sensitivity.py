@@ -220,3 +220,43 @@ def test_qwen3_8_27b_dense_ladder_benchmarks_quant_tiers():
         assert rung_res.decision_parity_score > 0.85
 
 
+def test_qwen3_8_flash_next_offload_ladder_and_benchmarks():
+    from tribune.eval.costmodel import default_cost_model
+    from tribune.eval.quant_sensitivity import (
+        benchmark_qwen3_8_flash_next_offload,
+        qwen3_8_flash_next_offload_ladder,
+    )
+
+    ladder = qwen3_8_flash_next_offload_ladder()
+    assert len(ladder) == 3
+    assert ladder[0].label == "qwen3.8-flash-next-full-vram"
+    assert ladder[1].label == "qwen3.8-flash-next-cpu-offload-mtp1"
+    assert ladder[2].label == "qwen3.8-flash-next-cpu-offload-mtp3"
+
+    # Benchmark MTP3 with CPU offload
+    mtp3_metrics = benchmark_qwen3_8_flash_next_offload(
+        prompt_tokens=1024, generate_tokens=256, speculative_mode="MTP3", cpu_offload=True
+    )
+    assert mtp3_metrics.offload_enabled is True
+    assert mtp3_metrics.speculative_mode == "MTP3"
+    assert mtp3_metrics.speculative_acceptance_rate >= 0.80
+    assert mtp3_metrics.vram_footprint_gb < 8.0  # Reduced VRAM footprint under offload
+    assert mtp3_metrics.ttft_ms > 0
+    assert mtp3_metrics.itl_ms > 0
+    assert mtp3_metrics.tokens_per_sec > 50.0
+
+    # Benchmark MTP1 with CPU offload
+    mtp1_metrics = benchmark_qwen3_8_flash_next_offload(
+        prompt_tokens=1024, generate_tokens=256, speculative_mode="MTP1", cpu_offload=True
+    )
+    assert mtp1_metrics.speculative_acceptance_rate < mtp3_metrics.speculative_acceptance_rate
+
+    # Offload hardware cost calculation
+    cm = default_cost_model()
+    cost_info = cm.compute_offload_cost(prompt_tokens=1024, completion_tokens=256, tokens_per_sec=mtp3_metrics.tokens_per_sec)
+    assert cost_info["total_tokens"] == 1280.0
+    assert cost_info["duration_s"] > 0
+    assert cost_info["cost_usd"] > 0
+    assert cost_info["cost_per_1k"] > 0
+
+

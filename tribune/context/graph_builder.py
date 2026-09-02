@@ -11,10 +11,13 @@ Provides:
 from __future__ import annotations
 
 import ast
+import copy
 import heapq
+import json
 import math
 import os
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -650,6 +653,258 @@ class FilterableHNSWIndex:
         return matched[:k]
 
 
+# --------------------------------------------------------------------------- #
+# Xiaohongshu's Self-Governing Context Architecture & Compaction Primitives
+# --------------------------------------------------------------------------- #
+
+
+class ExternalKVStore:
+    """External Key-Value persistence store for offloaded/folded context payloads."""
+
+    def __init__(self, namespace: str = "context_kv") -> None:
+        self.namespace = namespace
+        self._store: dict[str, Any] = {}
+        self._total_bytes_evicted = 0
+
+    def put(self, key: str, data: Any) -> str:
+        """Store payload in KV persistence and return an inline location pointer URI."""
+        self._store[key] = data
+        try:
+            payload_bytes = len(str(data).encode("utf-8"))
+        except Exception:
+            payload_bytes = 100
+        self._total_bytes_evicted += payload_bytes
+        return f"ref://{self.namespace}/{key}"
+
+    def get(self, key_or_uri: str) -> Any:
+        """Retrieve payload from key or URI pointer."""
+        key = key_or_uri.split("/")[-1] if key_or_uri.startswith("ref://") else key_or_uri
+        return self._store.get(key)
+
+    def has(self, key_or_uri: str) -> bool:
+        key = key_or_uri.split("/")[-1] if key_or_uri.startswith("ref://") else key_or_uri
+        return key in self._store
+
+    def delete(self, key_or_uri: str) -> bool:
+        key = key_or_uri.split("/")[-1] if key_or_uri.startswith("ref://") else key_or_uri
+        if key in self._store:
+            del self._store[key]
+            return True
+        return False
+
+    def clear(self) -> None:
+        self._store.clear()
+        self._total_bytes_evicted = 0
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "namespace": self.namespace,
+            "entry_count": len(self._store),
+            "total_bytes_evicted": self._total_bytes_evicted,
+        }
+
+
+GLOBAL_KV_STORE = ExternalKVStore()
+
+
+def fold_payload(
+    payload: Any,
+    kv_store: ExternalKVStore | None = None,
+    key_prefix: str = "payload",
+) -> dict[str, Any]:
+    """Fold primitive: Evicts oversized tool outputs, code dumps, and JSON payloads into external KV persistence.
+
+    Returns a compact inline URI/location pointer node.
+    """
+    store = kv_store or GLOBAL_KV_STORE
+    key = f"{key_prefix}_{random.randint(100000, 999999)}_{int(time.time() * 1000)}"
+    uri = store.put(key, payload)
+
+    serialized = str(payload)
+    size_bytes = len(serialized.encode("utf-8", errors="ignore"))
+    token_est = max(1, size_bytes // 4)
+
+    # Create summary preview
+    preview = serialized[:120] + "..." if len(serialized) > 120 else serialized
+
+    return {
+        "$ref": uri,
+        "folded": True,
+        "uri_pointer": uri,
+        "original_type": type(payload).__name__,
+        "size_bytes": size_bytes,
+        "estimated_tokens": token_est,
+        "summary": preview,
+    }
+
+
+def mask_stream(
+    log_text: str,
+    head_lines: int = 5,
+    tail_lines: int = 5,
+) -> str:
+    """Mask primitive: Truncates high-volume intermediate command logs, preserving header and trailer lines.
+
+    Preserves first `head_lines` and last `tail_lines` while embedding exact truncation token metrics.
+    """
+    if not log_text:
+        return ""
+
+    lines = log_text.splitlines()
+    if len(lines) <= (head_lines + tail_lines):
+        return log_text
+
+    head = lines[:head_lines]
+    tail = lines[-tail_lines:]
+    truncated_lines = len(lines) - (head_lines + tail_lines)
+    truncated_text = "\n".join(lines[head_lines:-tail_lines])
+    truncated_tokens = max(1, len(truncated_text.encode("utf-8", errors="ignore")) // 4)
+
+    delimiter = f"\n[... truncated {truncated_lines} lines / ~{truncated_tokens} tokens ...]\n"
+    return "\n".join(head) + delimiter + "\n".join(tail)
+
+
+def prune_trajectory(
+    frames: list[dict[str, Any]] | list[Any],
+    preserve_keys: set[str] | None = None,
+) -> list[Any]:
+    """Prune primitive: Cleanly excises redundant tool calls, superseded state queries, and aborted trajectories."""
+    if not frames:
+        return []
+
+    pruned: list[Any] = []
+    seen_queries: dict[str, int] = {}
+
+    for frame in frames:
+        if isinstance(frame, dict):
+            action = frame.get("action", "")
+            state = frame.get("state", "")
+            is_aborted = frame.get("aborted", False)
+            query_key = frame.get("query_key") or frame.get("tool_name")
+        else:
+            action = getattr(frame, "action", "")
+            state = getattr(frame, "state", "")
+            is_aborted = getattr(frame, "aborted", False)
+            query_key = getattr(frame, "tool_name", None) or getattr(frame, "query_key", None)
+
+        if is_aborted:
+            continue
+
+        if pruned:
+            last = pruned[-1]
+            last_action = last.get("action", "") if isinstance(last, dict) else getattr(last, "action", "")
+            if action and action == last_action:
+                pruned[-1] = frame
+                continue
+
+        if query_key and query_key not in (preserve_keys or set()):
+            if query_key in seen_queries:
+                prev_idx = seen_queries[query_key]
+                if 0 <= prev_idx < len(pruned):
+                    pruned[prev_idx] = None
+
+        seen_queries[query_key or action] = len(pruned)
+        pruned.append(frame)
+
+    return [f for f in pruned if f is not None]
+
+
+class SelfGCPlanner:
+    """Xiaohongshu's Self-Governing Context Planner service for active context memory garbage collection."""
+
+    def __init__(
+        self,
+        capacity_threshold: float = 0.30,
+        max_context_capacity_tokens: int = 1_048_576,
+        kv_store: ExternalKVStore | None = None,
+    ) -> None:
+        self.capacity_threshold = capacity_threshold
+        self.max_context_capacity_tokens = max_context_capacity_tokens
+        self.kv_store = kv_store or GLOBAL_KV_STORE
+        self.gc_invocation_count = 0
+        self.total_tokens_evicted = 0
+
+    def should_trigger_gc(
+        self,
+        current_token_count: int,
+        capacity_limit: int | None = None,
+    ) -> bool:
+        """Evaluates whether active context memory exceeds the 30% historical graph capacity threshold."""
+        limit = capacity_limit or self.max_context_capacity_tokens
+        if limit <= 0:
+            return False
+        ratio = current_token_count / limit
+        return ratio >= self.capacity_threshold
+
+    def plan_compaction(
+        self,
+        context_items: list[dict[str, Any]] | dict[str, Any],
+        current_token_count: int,
+        predicted_cost_benefit_passed: bool = True,
+    ) -> dict[str, Any]:
+        """Execute compaction plan applying Fold, Mask, and Prune primitives."""
+        if not predicted_cost_benefit_passed:
+            return {
+                "gc_executed": False,
+                "reason": "Cost-benefit gating failed: projected token savings did not exceed planner inference charges.",
+                "tokens_saved": 0,
+            }
+
+        self.gc_invocation_count += 1
+        folded_count = 0
+        masked_count = 0
+        original_tokens = current_token_count
+
+        compacted_items: list[dict[str, Any]] = []
+        items_list = context_items if isinstance(context_items, list) else [context_items]
+
+        filtered_items = prune_trajectory(items_list)
+        pruned_count = len(items_list) - len(filtered_items)
+
+        for item in filtered_items:
+            comp_item = dict(item) if isinstance(item, dict) else copy.deepcopy(item.__dict__)
+
+            if "large_payload" in comp_item or "raw_code" in comp_item or "tool_output" in comp_item:
+                target_key = "large_payload" if "large_payload" in comp_item else ("raw_code" if "raw_code" in comp_item else "tool_output")
+                raw_data = comp_item[target_key]
+                if isinstance(raw_data, (str, dict, list)) and len(str(raw_data)) > 200:
+                    comp_item[target_key] = fold_payload(raw_data, kv_store=self.kv_store, key_prefix="gc_fold")
+                    folded_count += 1
+
+            if "terminal_output" in comp_item and isinstance(comp_item["terminal_output"], str):
+                orig_log = comp_item["terminal_output"]
+                masked_log = mask_stream(orig_log, head_lines=5, tail_lines=5)
+                if masked_log != orig_log:
+                    comp_item["terminal_output"] = masked_log
+                    masked_count += 1
+
+            if "execution_logs" in comp_item and isinstance(comp_item["execution_logs"], str):
+                orig_log = comp_item["execution_logs"]
+                masked_log = mask_stream(orig_log, head_lines=5, tail_lines=5)
+                if masked_log != orig_log:
+                    comp_item["execution_logs"] = masked_log
+                    masked_count += 1
+
+            compacted_items.append(comp_item)
+
+        compacted_serialized = json.dumps(compacted_items, default=str)
+        new_token_count = max(1, len(compacted_serialized.encode("utf-8")) // 4)
+        tokens_saved = max(0, original_tokens - new_token_count)
+        self.total_tokens_evicted += tokens_saved
+
+        return {
+            "gc_executed": True,
+            "compacted_items": compacted_items,
+            "folded_count": folded_count,
+            "masked_count": masked_count,
+            "pruned_count": pruned_count,
+            "original_tokens": original_tokens,
+            "new_tokens": new_token_count,
+            "tokens_saved": tokens_saved,
+            "gc_invocation_count": self.gc_invocation_count,
+        }
+
+
 __all__ = [
     "ModuleNode",
     "RepoContextGraph",
@@ -661,5 +916,11 @@ __all__ = [
     "build_visual_layout_subgraph",
     "HNSWNode",
     "FilterableHNSWIndex",
+    "ExternalKVStore",
+    "GLOBAL_KV_STORE",
+    "fold_payload",
+    "mask_stream",
+    "prune_trajectory",
+    "SelfGCPlanner",
 ]
 

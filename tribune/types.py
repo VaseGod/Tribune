@@ -567,6 +567,11 @@ class CaseRunResult(BaseModel):
     workspace_version: int = 0
     token_reduction: TokenReductionMetric | None = None
     failure_traces: list[dict[str, Any]] = Field(default_factory=list)
+    speculative_dispatched: int = 0
+    speculative_hits: int = 0
+    speculative_misses: int = 0
+    speculative_cancelled: int = 0
+    speculative_latency_saved_ms: float = 0.0
 
     def outcome_for(self, program: ProgramId) -> ProgramOutcome | None:
         for o in self.outcomes:
