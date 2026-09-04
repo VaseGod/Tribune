@@ -190,6 +190,163 @@ def cross_evaluate_rule_citations(
     }
 
 
+@spec.tool(speculatable=True, pure=True, ttl=600.0)
+def query_filtered_program_rules(
+    query: str,
+    program: str,
+    jurisdiction: str = "EX",
+    k: int = 5,
+    required_only: bool = False,
+) -> dict[str, Any]:
+    """Retrieve statutory rules using payload-constrained FilterableHNSWIndex."""
+    from ..corpus.rule_store import LocalRuleStore
+    from ..types import ProgramId
+
+    store = LocalRuleStore()
+    try:
+        prog_id = ProgramId(program.lower().strip())
+    except Exception:
+        return {"program": program, "jurisdiction": jurisdiction, "rules": []}
+
+    filter_fn = (lambda m: m.get("required") is True) if required_only else None
+    results = store.retrieve_filtered(
+        query=query,
+        program=prog_id,
+        jurisdiction=jurisdiction,
+        k=k,
+        filter_fn=filter_fn,
+    )
+    return {
+        "program": program,
+        "jurisdiction": jurisdiction,
+        "query": query,
+        "rules": [
+            {
+                "criterion_id": r.rule.criterion_id,
+                "title": r.rule.title,
+                "description": r.rule.description,
+                "source": r.citation.source,
+                "citation_id": r.citation.citation_id,
+                "score": r.score,
+            }
+            for r in results
+        ],
+    }
+
+
+class TokenLocalNGramLookup:
+    """Token-local n-gram hash table lookup for recurring statutory boilerplate and legal definitions.
+
+    Intercepts recurring statutory definitions, multi-word legal terms, and boilerplate clauses
+    locally before model dispatch, saving token budgets and eliminating prompt bloat.
+    """
+
+    def __init__(self, max_ngram_size: int = 6) -> None:
+        self.max_ngram_size = max_ngram_size
+        self._table: dict[str, dict[str, Any]] = {}
+        self.intercept_count: int = 0
+        self.tokens_saved_total: int = 0
+        self._load_statutory_corpus()
+
+    def _load_statutory_corpus(self) -> None:
+        """Seed the n-gram table with canonical statutory definitions from the statutory wiki."""
+        try:
+            from ..corpus.wiki import get_statutory_wiki
+            wiki = get_statutory_wiki()
+            for term, defn in wiki.all_definitions().items():
+                self.register_ngram(
+                    phrase=term.replace("_", " "),
+                    canonical_text=defn,
+                    citation=None,
+                )
+        except Exception:
+            pass
+
+        # Additional canonical legal n-grams
+        canonical_phrases = [
+            ("gross income eligibility standard", "7 CFR 273.9(a)(1): Standard equal to 130 percent of the federal poverty income guidelines."),
+            ("broad based categorical eligibility", "7 CFR 273.2(j): Policy conferring categorical SNAP eligibility, waiving asset limits in participating jurisdictions."),
+            ("broad-based categorical eligibility", "7 CFR 273.2(j): Policy conferring categorical SNAP eligibility, waiving asset limits in participating jurisdictions."),
+            ("able and available", "Statutory requirement that claimant is physically capable and available for suitable work."),
+            ("base period earnings", "Claimant wages in the first 4 of the last 5 completed calendar quarters."),
+            ("quit with good cause", "Separation due to real, substantial, and compelling reasons that would cause a reasonable worker to quit."),
+            ("voluntary quit with good cause", "Separation due to real, substantial, and compelling reasons that would cause a reasonable worker to quit."),
+            ("standard deduction", "7 CFR 273.9(d)(1): Basic statutory monthly deduction subtracted from gross income."),
+            ("earned income deduction", "7 CFR 273.9(d)(2): 20 percent deduction on gross earned income."),
+            ("modified adjusted gross income", "42 CFR 435.603: MAGI standard for Medicaid and Children's Health Insurance Program."),
+            ("area median income", "HUD calculation of median household income by metropolitan area or nonmetropolitan county."),
+            ("notice of action", "Written formal agency notification detailing determination and appeal rights."),
+        ]
+        for phrase, defn in canonical_phrases:
+            self.register_ngram(phrase, defn)
+
+    def register_ngram(
+        self, phrase: str, canonical_text: str, citation: str | None = None
+    ) -> None:
+        """Register a normalized n-gram phrase and its canonical definition."""
+        key = " ".join(phrase.lower().strip().split())
+        words = key.split()
+        ngram_size = len(words)
+        self._table[key] = {
+            "phrase": key,
+            "canonical_text": canonical_text,
+            "citation": citation,
+            "ngram_size": ngram_size,
+            "estimated_tokens": max(1, int(len(canonical_text.split()) * 1.3)),
+        }
+
+    def lookup_phrase(self, phrase: str) -> dict[str, Any] | None:
+        """Exact normalized phrase lookup in n-gram table."""
+        key = " ".join(phrase.lower().strip().split())
+        return self._table.get(key)
+
+    def intercept_text(self, text: str) -> dict[str, Any]:
+        """Scan text for recurring statutory n-grams and intercept them.
+
+        Returns:
+            dict containing intercepted matches, definitions, and tokens saved.
+        """
+        words = text.split()
+        n = len(words)
+        matched_ngrams: list[dict[str, Any]] = []
+        tokens_saved = 0
+
+        # Scan sliding windows from max_ngram_size down to 1
+        i = 0
+        while i < n:
+            matched = False
+            for k in range(min(self.max_ngram_size, n - i), 0, -1):
+                window = " ".join(words[i : i + k]).lower().strip(".,;:\"'?!()")
+                if window in self._table:
+                    entry = self._table[window]
+                    matched_ngrams.append(entry)
+                    saved = entry["estimated_tokens"]
+                    tokens_saved += saved
+                    self.intercept_count += 1
+                    self.tokens_saved_total += saved
+                    i += k
+                    matched = True
+                    break
+            if not matched:
+                i += 1
+
+        return {
+            "intercepted_count": len(matched_ngrams),
+            "matched_ngrams": matched_ngrams,
+            "tokens_saved": tokens_saved,
+        }
+
+
+_GLOBAL_NGRAM_LOOKUP = TokenLocalNGramLookup()
+
+
+@spec.tool(speculatable=True, pure=True, ttl=600.0)
+def intercept_statutory_ngrams(text: str) -> dict[str, Any]:
+    """Intercept recurring statutory n-grams locally to avoid consuming model token budget."""
+    return _GLOBAL_NGRAM_LOOKUP.intercept_text(text)
+
+
+
 def detect_runtime_capabilities() -> dict[str, Any]:
     """Detect local runtime hardware acceleration and llama.cpp binding capabilities."""
     caps: dict[str, Any] = {
@@ -659,6 +816,9 @@ __all__ = [
     "SPECULATIVE_TOOLS_REGISTRY",
     "evaluate_statutory_predicate",
     "lookup_program_rules",
+    "query_filtered_program_rules",
+    "intercept_statutory_ngrams",
+    "TokenLocalNGramLookup",
     "cross_evaluate_rule_citations",
     "LocalRuntimeConfig",
     "LocalRulesProvider",

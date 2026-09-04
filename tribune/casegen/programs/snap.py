@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ...corpus.programs.jurisdictions import JurisdictionProfile
+from ...corpus.wiki import get_statutory_wiki
 from ...types import ApplicantSituation, ProgramGroundTruth, ProgramId
 from ...types import EvidenceType as ET
 from .base import generic_ground_truth
@@ -19,10 +20,12 @@ RELEVANT_EVIDENCE = [
 
 
 def ground_truth(situation: ApplicantSituation, profile: JurisdictionProfile) -> ProgramGroundTruth:
+    wiki = get_statutory_wiki()
+    rationale = wiki.get_program_rationale(PROGRAM, profile.code)
     return generic_ground_truth(
         PROGRAM,
         situation,
         profile,
-        rationale="SNAP turns on residency, citizenship/immigration status, and gross "
-        "monthly income vs. 130% of the poverty guideline (assets often waived under BBCE).",
+        rationale=rationale,
     )
+

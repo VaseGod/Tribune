@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ...corpus.programs.jurisdictions import JurisdictionProfile
+from ...corpus.wiki import get_statutory_wiki
 from ...types import ApplicantSituation, ProgramGroundTruth, ProgramId
 from ...types import EvidenceType as ET
 from .base import generic_ground_truth
@@ -18,11 +19,12 @@ RELEVANT_EVIDENCE = [
 
 
 def ground_truth(situation: ApplicantSituation, profile: JurisdictionProfile) -> ProgramGroundTruth:
+    wiki = get_statutory_wiki()
+    rationale = wiki.get_program_rationale(PROGRAM, profile.code)
     return generic_ground_truth(
         PROGRAM,
         situation,
         profile,
-        rationale="Unemployment turns on monetary eligibility (base-period earnings/weeks), "
-        "a non-disqualifying separation, and being able and available; a quit 'with good "
-        "cause' is fact-intensive and ambiguous.",
+        rationale=rationale,
     )
+

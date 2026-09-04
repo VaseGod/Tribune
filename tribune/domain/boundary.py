@@ -105,3 +105,81 @@ def parse_domain_object(target_type: type[T], raw_payload: Any) -> T:
     """Convenience function for parsing untrusted raw inputs into strongly typed domain objects."""
     parser = DomainParser(target_type)
     return parser.parse(raw_payload)
+
+
+class SandboxIntrospectionViolation(ValueError):
+    """Raised when an untrusted payload or agent attempts to introspect evaluation grader traces or inject completion signals."""
+
+    pass
+
+
+class EvaluationHarnessIsolationBarrier:
+    """Hardens evaluation harness sandbox against agent introspection and prompt/trace leakage.
+
+    Strips grader internal states, reference assertion markers, gold ground-truth labels,
+    and completion signal injections (<COMPLETION_SIGNAL>, <GRADER_PASS>, __grader_state__).
+    """
+
+    FORBIDDEN_SIGNALS = frozenset({
+        "<COMPLETION_SIGNAL>",
+        "<GRADER_PASS>",
+        "<EVAL_OVERRIDE>",
+        "TEST_PASSED_AUTOMATICALLY",
+        "__GRADER_ASSERTION__",
+        "__GOLD_LABEL__",
+    })
+
+    PROTECTED_KEYS = frozenset({
+        "ground_truth",
+        "gold_label",
+        "grader_assertion",
+        "grader_verdict",
+        "__grader__",
+        "expected_verdict",
+        "oracle_decision",
+        "secret_seed",
+    })
+
+    @classmethod
+    def sanitize_payload(cls, payload: Any) -> Any:
+        """Deep-sanitize dictionaries, lists, or strings to strip protected grader keys and signals."""
+        if isinstance(payload, dict):
+            clean = {}
+            for k, v in payload.items():
+                if k.lower() in cls.PROTECTED_KEYS or any(sig.lower() in str(k).lower() for sig in cls.FORBIDDEN_SIGNALS):
+                    continue
+                clean[k] = cls.sanitize_payload(v)
+            return clean
+        elif isinstance(payload, list):
+            return [cls.sanitize_payload(x) for x in payload]
+        elif isinstance(payload, str):
+            sanitized = payload
+            for sig in cls.FORBIDDEN_SIGNALS:
+                if sig in sanitized:
+                    sanitized = sanitized.replace(sig, "[REDACTED_COMPLETION_SIGNAL]")
+            return sanitized
+        return payload
+
+    @classmethod
+    def assert_sandbox_isolation(cls, text_or_data: Any) -> None:
+        """Enforce strict sandbox isolation.
+
+        Raises SandboxIntrospectionViolation if introspection or signal injection is attempted.
+        """
+        if isinstance(text_or_data, str):
+            for sig in cls.FORBIDDEN_SIGNALS:
+                if sig in text_or_data:
+                    raise SandboxIntrospectionViolation(
+                        f"Evaluation harness sandbox isolation violation: detected forged completion signal '{sig}'."
+                    )
+        elif isinstance(text_or_data, dict):
+            for k, v in text_or_data.items():
+                if str(k).lower() in cls.PROTECTED_KEYS:
+                    raise SandboxIntrospectionViolation(
+                        f"Evaluation harness sandbox isolation violation: detected introspection of protected key '{k}'."
+                    )
+                cls.assert_sandbox_isolation(v)
+        elif isinstance(text_or_data, list):
+            for item in text_or_data:
+                cls.assert_sandbox_isolation(item)
+

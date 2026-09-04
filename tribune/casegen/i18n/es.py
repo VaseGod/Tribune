@@ -50,6 +50,16 @@ GLOSSARY: dict[str, GlossaryEntry] = {
         GlossaryEntry("denial_date", "fecha de denegación", legal_term=True),
         GlossaryEntry("days_since_denial", "días desde la denegación", legal_term=True),
         GlossaryEntry("appeal_grounds", "fundamentos de la apelación", legal_term=True),
+        # Decoupled statutory terms (persistent wiki).
+        GlossaryEntry("bbce", "elegibilidad categórica de base amplia (BBCE)", legal_term=True),
+        GlossaryEntry("standard_deduction", "deducción estándar", legal_term=True),
+        GlossaryEntry("earned_income_deduction", "deducción de ingresos del trabajo", legal_term=True),
+        GlossaryEntry("excess_shelter_deduction", "deducción por exceso de costos de vivienda", legal_term=True),
+        GlossaryEntry("utility_allowance", "asignación estándar de servicios públicos", legal_term=True),
+        GlossaryEntry("good_cause", "causa justificada", legal_term=True),
+        GlossaryEntry("timely_filing", "presentación oportuna", legal_term=True),
+        GlossaryEntry("weekly_benefit_amount", "monto del beneficio semanal", legal_term=True),
+        GlossaryEntry("high_quarter_earnings", "ingresos del trimestre más alto", legal_term=True),
         # Document phrases.
         GlossaryEntry("application_intake", "formulario de solicitud"),
         GlossaryEntry(

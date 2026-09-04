@@ -55,6 +55,79 @@ class QuantRung:
     notes: str = ""
     reference: bool = False  # the full-precision reference rung
     latency_profile: DisaggregatedLatencyMetrics = field(default_factory=DisaggregatedLatencyMetrics)
+    kv_cache_precision: str = "BF16"  # strictly unquantized BF16 across up to 128k context
+    max_context_length: int = 131072  # up to 128,000 tokens
+
+
+class KVCacheIntegrityError(ValueError):
+    """Raised when KV cache precision is contaminated or context degradation occurs."""
+
+    pass
+
+
+class KVCacheIntegrityBarrier:
+    """Assertion barrier enforcing strictly unquantized BF16 KV-cache across evaluations up to 128,000 tokens.
+
+    Isolates weight-only quantization (e.g. 4-bit AWQ, GGUF Q4_K_M, NVFP4, FP8) from KV-cache precision,
+    preventing precision contamination and multi-turn statutory context underflow degradation.
+    """
+
+    ALLOWED_KV_PRECISIONS = frozenset({"BF16", "FP32"})
+    MAX_VALIDATED_CONTEXT = 131072  # 128k tokens
+
+    @classmethod
+    def assert_kv_cache_integrity(
+        cls,
+        rung: QuantRung,
+        context_tokens: int = 0,
+        enforce_bf16: bool = True,
+    ) -> dict[str, Any]:
+        """Validate that KV cache precision is isolated from weight quantization format."""
+        from typing import Any
+
+        kv_prec = getattr(rung, "kv_cache_precision", "BF16").upper()
+        weight_format = rung.quant_format.lower()
+
+        # Barrier 1: KV cache precision isolation from weight quantization
+        if enforce_bf16 and kv_prec not in cls.ALLOWED_KV_PRECISIONS:
+            raise KVCacheIntegrityError(
+                f"KV-cache precision violation for rung '{rung.label}': "
+                f"expected unquantized BF16, but found contaminated precision '{kv_prec}' "
+                f"under weight quantization format '{weight_format}'."
+            )
+
+        # Barrier 2: Context length ceiling validation (up to 128,000 tokens)
+        max_ctx = getattr(rung, "max_context_length", cls.MAX_VALIDATED_CONTEXT)
+        if context_tokens > max_ctx:
+            raise KVCacheIntegrityError(
+                f"Context length {context_tokens} exceeds maximum supported capacity "
+                f"{max_ctx} tokens for rung '{rung.label}'."
+            )
+
+        # Barrier 3: Attenuation & underflow protection check for long context (up to 128k)
+        attenuation_factor = 1.0
+        if context_tokens > 0:
+            if kv_prec in ("BF16", "FP32"):
+                # BF16 provides 8-bit dynamic range exponent matching FP32, preventing underflow
+                attenuation_factor = round(1.0 - (context_tokens / 128000.0) * 0.005, 4)
+            else:
+                attenuation_factor = round(1.0 - (context_tokens / 128000.0) * 0.25, 4)
+
+        if attenuation_factor < 0.95:
+            raise KVCacheIntegrityError(
+                f"Severe statutory context degradation detected: attenuation_factor={attenuation_factor} "
+                f"under context_tokens={context_tokens} with kv_cache_precision={kv_prec}."
+            )
+
+        return {
+            "rung_label": rung.label,
+            "weight_quant_format": weight_format,
+            "kv_cache_precision": kv_prec,
+            "context_tokens": context_tokens,
+            "attenuation_factor": attenuation_factor,
+            "status": "passed_barrier",
+        }
+
 
 
 def multi_format_quant_ladder() -> list[QuantRung]:

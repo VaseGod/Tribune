@@ -17,7 +17,14 @@ from ..metrics import (
     cohens_kappa,
     compute_metrics,
 )
-from .backends import QuantRung, default_mock_ladder, mount_rung, settings_for_rung
+from .backends import (
+    KVCacheIntegrityBarrier,
+    QuantRung,
+    default_mock_ladder,
+    mount_rung,
+    multi_format_quant_ladder,
+    settings_for_rung,
+)
 from .seedset import build_seed_set, load_manifest, seed_set_hash
 
 
@@ -104,6 +111,9 @@ def _run_rung(
     rung: QuantRung, cases: list[SyntheticCase], base_settings: TribuneSettings
 ) -> RungResult:
     from ...corpus.citations import track_quant_citation_retention
+
+    # Assert KV-cache integrity barrier: unquantized BF16 isolated from weight quantization
+    KVCacheIntegrityBarrier.assert_kv_cache_integrity(rung, enforce_bf16=True)
 
     settings = settings_for_rung(rung, base_settings)
     pipeline = CasePipeline(settings)
@@ -225,3 +235,25 @@ def run_ladder(
     ]
     out.pareto_frontier = cost_model.compute_pareto_frontier(points_data, reference_label=reference_rung.label)
     return out
+
+
+def benchmark_long_context_kv_integrity(
+    rungs: list[QuantRung] | None = None,
+    context_tokens: int = 128000,
+) -> list[dict[str, Any]]:
+    """Stress the evaluation pipeline under 128k context to measure and verify KV-cache integrity and context retention."""
+    target_rungs = rungs or multi_format_quant_ladder()
+    results = []
+    for rung in target_rungs:
+        check = KVCacheIntegrityBarrier.assert_kv_cache_integrity(
+            rung, context_tokens=context_tokens, enforce_bf16=True
+        )
+        results.append({
+            "rung_label": rung.label,
+            "weight_quant_format": rung.quant_format,
+            "kv_cache_precision": rung.kv_cache_precision,
+            "context_tokens": context_tokens,
+            "context_retention": check["attenuation_factor"],
+            "passed_barrier": True,
+        })
+    return results

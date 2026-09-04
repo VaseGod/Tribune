@@ -301,30 +301,54 @@ class SpeculativeInferenceRunner:
 
 @dataclass
 class SLATracker:
-    """Sliding-window latency and error tracking per provider tier for dynamic Pareto routing."""
+    """Sliding-window latency (total, TTFT, ITL) and error tracking per provider tier for dynamic Pareto routing."""
 
     tier: int
     sla_target_p95_ms: float = 800.0
+    sla_target_ttft_ms: float = 250.0
+    sla_target_itl_ms: float = 20.0
     window_size: int = 50
     latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=50))
+    ttft_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=50))
+    itl_latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=50))
     errors_count: int = 0
     total_calls: int = 0
     circuit_open: bool = False
     circuit_opened_at: float = 0.0
     recovery_timeout_sec: float = 30.0
 
-    def record_call(self, latency_ms: float, is_error: bool = False) -> None:
+    def record_call(
+        self,
+        latency_ms: float,
+        is_error: bool = False,
+        ttft_ms: float | None = None,
+        itl_ms: float | None = None,
+    ) -> None:
         self.total_calls += 1
         self.latencies_ms.append(latency_ms)
+        eff_ttft = ttft_ms if ttft_ms is not None else (latency_ms * 0.4)
+        eff_itl = itl_ms if itl_ms is not None else max(1.0, (latency_ms * 0.6) / 32.0)
+        self.ttft_latencies_ms.append(eff_ttft)
+        self.itl_latencies_ms.append(eff_itl)
+
         if is_error:
             self.errors_count += 1
 
         if len(self.latencies_ms) >= 10:
             p95 = self.p95_latency_ms()
+            p95_ttft = self.p95_ttft_ms()
+            p95_itl = self.p95_itl_ms()
             recent_errors = self.errors_count / max(1, len(self.latencies_ms))
-            if recent_errors > 0.35 or p95 > (self.sla_target_p95_ms * 2.0):
+            if (
+                recent_errors > 0.35
+                or p95 > (self.sla_target_p95_ms * 2.0)
+                or p95_ttft > (self.sla_target_ttft_ms * 2.5)
+                or p95_itl > (self.sla_target_itl_ms * 2.5)
+            ):
                 if not self.circuit_open:
-                    logger.warning(f"Tier {self.tier} SLA breached (p95={p95:.1f}ms, err={recent_errors:.2%}). Tripping circuit.")
+                    logger.warning(
+                        f"Tier {self.tier} SLA breached (p95={p95:.1f}ms, TTFT={p95_ttft:.1f}ms, ITL={p95_itl:.1f}ms, err={recent_errors:.2%}). Tripping circuit."
+                    )
                     self.circuit_open = True
                     self.circuit_opened_at = time.time()
 
@@ -334,6 +358,8 @@ class SLATracker:
         if time.time() - self.circuit_opened_at > self.recovery_timeout_sec:
             self.circuit_open = False
             self.latencies_ms.clear()
+            self.ttft_latencies_ms.clear()
+            self.itl_latencies_ms.clear()
             self.errors_count = 0
             return True
         return False
@@ -345,15 +371,81 @@ class SLATracker:
         idx = int(0.95 * len(sorted_lats))
         return sorted_lats[min(idx, len(sorted_lats) - 1)]
 
+    def p95_ttft_ms(self) -> float:
+        if not self.ttft_latencies_ms:
+            return 0.0
+        sorted_ttft = sorted(self.ttft_latencies_ms)
+        idx = int(0.95 * len(sorted_ttft))
+        return sorted_ttft[min(idx, len(sorted_ttft) - 1)]
+
+    def p95_itl_ms(self) -> float:
+        if not self.itl_latencies_ms:
+            return 0.0
+        sorted_itl = sorted(self.itl_latencies_ms)
+        idx = int(0.95 * len(sorted_itl))
+        return sorted_itl[min(idx, len(sorted_itl) - 1)]
+
     def stats(self) -> dict[str, Any]:
         return {
             "tier": self.tier,
             "total_calls": self.total_calls,
             "p95_latency_ms": round(self.p95_latency_ms(), 2),
+            "p95_ttft_ms": round(self.p95_ttft_ms(), 2),
+            "p95_itl_ms": round(self.p95_itl_ms(), 2),
             "sla_target_ms": self.sla_target_p95_ms,
             "circuit_open": self.circuit_open,
             "error_count": self.errors_count,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Multi-Objective Dynamic Pareto-Frontier Telemetry & Routing
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class EndpointTelemetry:
+    """Disaggregated live telemetry per serving endpoint."""
+
+    endpoint_name: str
+    tier: int
+    ttft_ms: float
+    itl_ms: float
+    unit_cost_usd_per_1k: float
+    speculative_supported: bool = False
+    speculative_method: str = "none"  # "MTP_3" | "EAGLE_3" | "draft_model"
+    is_frontier: bool = False
+    active: bool = True
+
+
+@dataclass
+class ParetoObjectiveWeights:
+    """Multi-objective optimization weights for Pareto routing."""
+
+    ttft_weight: float = 0.33
+    itl_weight: float = 0.33
+    cost_weight: float = 0.34
+
+    def normalize(self) -> tuple[float, float, float]:
+        tot = self.ttft_weight + self.itl_weight + self.cost_weight
+        if tot <= 0:
+            return (0.33, 0.33, 0.34)
+        return (self.ttft_weight / tot, self.itl_weight / tot, self.cost_weight / tot)
+
+
+@dataclass(frozen=True)
+class ParetoRoutingDecision:
+    """Routing decision produced by the multi-objective dynamic Pareto-frontier router."""
+
+    selected_endpoint: str
+    tier: int
+    ttft_ms: float
+    itl_ms: float
+    unit_cost_usd_per_1k: float
+    speculative_enabled: bool
+    speculative_method: str
+    pareto_score: float
+    rationale: str
 
 
 # --------------------------------------------------------------------------- #
@@ -507,6 +599,236 @@ class ModelRouter:
             "speculative_draft_calls": 0,
             "step_routing_calls": 0,
             "kv_affinity_routed_calls": 0,
+            "pareto_routed_calls": 0,
+        }
+
+        # Registered endpoints with live disaggregated telemetry (TTFT, ITL, Unit Cost)
+        self.endpoints: dict[str, EndpointTelemetry] = {
+            "qwen2.5-7b": EndpointTelemetry(
+                endpoint_name="qwen2.5-7b",
+                tier=1,
+                ttft_ms=45.0,
+                itl_ms=6.5,
+                unit_cost_usd_per_1k=0.0001,
+                speculative_supported=True,
+                speculative_method="MTP_3",
+            ),
+            "gemini-3.7-flash": EndpointTelemetry(
+                endpoint_name="gemini-3.7-flash",
+                tier=1,
+                ttft_ms=110.0,
+                itl_ms=8.0,
+                unit_cost_usd_per_1k=0.00025,
+                speculative_supported=True,
+                speculative_method="EAGLE_3",
+            ),
+            "qwen3.8-27b": EndpointTelemetry(
+                endpoint_name="qwen3.8-27b",
+                tier=0,
+                ttft_ms=35.0,
+                itl_ms=9.0,
+                unit_cost_usd_per_1k=0.0,
+                speculative_supported=True,
+                speculative_method="draft_model",
+            ),
+            "deepseek-v4-pro": EndpointTelemetry(
+                endpoint_name="deepseek-v4-pro",
+                tier=2,
+                ttft_ms=320.0,
+                itl_ms=18.0,
+                unit_cost_usd_per_1k=0.002,
+                speculative_supported=False,
+                is_frontier=True,
+            ),
+            "gpt-5.6-sol": EndpointTelemetry(
+                endpoint_name="gpt-5.6-sol",
+                tier=2,
+                ttft_ms=450.0,
+                itl_ms=22.0,
+                unit_cost_usd_per_1k=0.005,
+                speculative_supported=False,
+                is_frontier=True,
+            ),
+        }
+
+    def ingest_live_telemetry(
+        self,
+        endpoint_name: str,
+        ttft_ms: float,
+        itl_ms: float,
+        unit_cost_usd_per_1k: float | None = None,
+        speculative_supported: bool | None = None,
+        speculative_method: str | None = None,
+        tier: int | None = None,
+    ) -> EndpointTelemetry:
+        """Ingest live disaggregated telemetry distinguishing prefill overhead (TTFT) from generation (ITL)."""
+        if endpoint_name in self.endpoints:
+            ep = self.endpoints[endpoint_name]
+            ep.ttft_ms = ttft_ms
+            ep.itl_ms = itl_ms
+            if unit_cost_usd_per_1k is not None:
+                ep.unit_cost_usd_per_1k = unit_cost_usd_per_1k
+            if speculative_supported is not None:
+                ep.speculative_supported = speculative_supported
+            if speculative_method is not None:
+                ep.speculative_method = speculative_method
+            if tier is not None:
+                ep.tier = tier
+        else:
+            ep = EndpointTelemetry(
+                endpoint_name=endpoint_name,
+                tier=tier if tier is not None else 1,
+                ttft_ms=ttft_ms,
+                itl_ms=itl_ms,
+                unit_cost_usd_per_1k=unit_cost_usd_per_1k if unit_cost_usd_per_1k is not None else 0.0002,
+                speculative_supported=speculative_supported or False,
+                speculative_method=speculative_method or "none",
+            )
+            self.endpoints[endpoint_name] = ep
+
+        # Update matching SLA tracker if present
+        if ep.tier in self.sla_trackers:
+            total_est = ttft_ms + (itl_ms * 32.0)
+            self.sla_trackers[ep.tier].record_call(total_est, is_error=False, ttft_ms=ttft_ms, itl_ms=itl_ms)
+
+        return ep
+
+    def compute_dynamic_pareto_frontier(
+        self,
+        require_speculative: bool = False,
+    ) -> list[EndpointTelemetry]:
+        """Compute the Pareto frontier optimizing across TTFT, ITL, and unit cost."""
+        candidates = [
+            ep for ep in self.endpoints.values()
+            if ep.active and (not require_speculative or ep.speculative_supported)
+        ]
+        if not candidates:
+            return list(self.endpoints.values())
+
+        frontier: list[EndpointTelemetry] = []
+        for i, c1 in enumerate(candidates):
+            dominated = False
+            for j, c2 in enumerate(candidates):
+                if i == j:
+                    continue
+                # c2 dominates c1 if c2 <= c1 on all three metrics and < on at least one
+                if (
+                    c2.ttft_ms <= c1.ttft_ms
+                    and c2.itl_ms <= c1.itl_ms
+                    and c2.unit_cost_usd_per_1k <= c1.unit_cost_usd_per_1k
+                ) and (
+                    c2.ttft_ms < c1.ttft_ms
+                    or c2.itl_ms < c1.itl_ms
+                    or c2.unit_cost_usd_per_1k < c1.unit_cost_usd_per_1k
+                ):
+                    dominated = True
+                    break
+            if not dominated:
+                frontier.append(c1)
+        return frontier if frontier else candidates
+
+    def route_dynamic_pareto(
+        self,
+        intent: str = "general",
+        context_tokens: int = 0,
+        ttft_weight: float = 0.33,
+        itl_weight: float = 0.33,
+        cost_weight: float = 0.34,
+        require_speculative: bool = False,
+    ) -> ParetoRoutingDecision:
+        """Dynamic multi-objective Pareto-frontier router balancing TTFT, ITL, and unit cost."""
+        self.stats["pareto_routed_calls"] += 1
+        weights = ParetoObjectiveWeights(ttft_weight, itl_weight, cost_weight)
+        w_ttft, w_itl, w_cost = weights.normalize()
+
+        frontier = self.compute_dynamic_pareto_frontier(require_speculative=require_speculative)
+
+        max_ttft = max(e.ttft_ms for e in frontier) or 1.0
+        max_itl = max(e.itl_ms for e in frontier) or 1.0
+        max_cost = max(e.unit_cost_usd_per_1k for e in frontier) or 1.0
+
+        best_ep = frontier[0]
+        best_score = float("inf")
+
+        for ep in frontier:
+            norm_ttft = ep.ttft_ms / max_ttft
+            norm_itl = ep.itl_ms / max_itl
+            norm_cost = ep.unit_cost_usd_per_1k / max_cost
+            score = (w_ttft * norm_ttft) + (w_itl * norm_itl) + (w_cost * norm_cost)
+
+            tracker = self.sla_trackers.get(ep.tier)
+            if tracker and not tracker.is_healthy():
+                score += 10.0  # Penalty for tripped circuit
+
+            if score < best_score:
+                best_score = score
+                best_ep = ep
+
+        return ParetoRoutingDecision(
+            selected_endpoint=best_ep.endpoint_name,
+            tier=best_ep.tier,
+            ttft_ms=best_ep.ttft_ms,
+            itl_ms=best_ep.itl_ms,
+            unit_cost_usd_per_1k=best_ep.unit_cost_usd_per_1k,
+            speculative_enabled=best_ep.speculative_supported,
+            speculative_method=best_ep.speculative_method,
+            pareto_score=round(best_score, 4),
+            rationale=(
+                f"Pareto optimal selection '{best_ep.endpoint_name}' (tier {best_ep.tier}) "
+                f"under TTFT weight {w_ttft:.2f}, ITL weight {w_itl:.2f}, cost weight {w_cost:.2f}."
+            ),
+        )
+
+    def route_statutory_speculative(
+        self,
+        query: str,
+        intent: str = "statutory_determination",
+        context: str = "",
+    ) -> dict[str, Any]:
+        """Route complex statutory queries to endpoints capable of speculative decoding (MTP k=3, EAGLE-3)."""
+        complex_statutory_intents = {
+            "statutory_determination",
+            "statutory_ambiguity",
+            "multi_step_verification",
+            "appeals",
+            "contested_custody",
+            "categorical_eligibility",
+            "complex_synthesis",
+        }
+        is_complex = (
+            intent.lower() in complex_statutory_intents
+            or any(w in query.lower() for w in ("ambiguity", "appeal", "custody", "contested", "deduction"))
+            or len(context) > 2000
+        )
+
+        decision = self.route_dynamic_pareto(
+            intent=intent,
+            context_tokens=len(context) // 4,
+            ttft_weight=0.25,
+            itl_weight=0.50,  # High generation throughput emphasis
+            cost_weight=0.25,
+            require_speculative=is_complex,
+        )
+
+        if decision.speculative_enabled:
+            self.stats["speculative_draft_calls"] += 1
+        tier_key = f"tier{decision.tier}_calls"
+        if tier_key in self.stats:
+            self.stats[tier_key] += 1
+
+        return {
+            "status": "routed",
+            "query": query[:100],
+            "intent": intent,
+            "selected_endpoint": decision.selected_endpoint,
+            "tier": decision.tier,
+            "speculative_decoding": decision.speculative_enabled,
+            "speculative_method": decision.speculative_method,
+            "ttft_ms": decision.ttft_ms,
+            "itl_ms": decision.itl_ms,
+            "unit_cost_usd_per_1k": decision.unit_cost_usd_per_1k,
+            "pareto_score": decision.pareto_score,
+            "rationale": decision.rationale,
         }
 
     def route_execution_tier(
@@ -1497,6 +1819,9 @@ __all__ = [
     "RetryBudget",
     "SpeculativeInferenceRunner",
     "SLATracker",
+    "EndpointTelemetry",
+    "ParetoObjectiveWeights",
+    "ParetoRoutingDecision",
     "ModelRouter",
     "OperationalStepType",
     "StepRoutingDecision",

@@ -1,5 +1,6 @@
 """Tests for Verifier Multi-Step Self-Testing Trajectories and Abstention Calibration."""
 
+import pytest
 
 from tribune.abstention.calibration import AssessmentDiagnostics, Calibrator
 from tribune.agents.verifier import Verifier
@@ -124,7 +125,113 @@ def test_calibrator_passes_when_self_validation_confidence_meets_parity_threshol
     )
 
     assessment, _ = _make_sample_assessment()
-
     score = calibrator.score(assessment, diag, high_confidence_verdict)
     assert score.abstain is False
     assert "meets the assertion threshold" in score.reason
+
+
+def test_bounded_verifier_passes_clean_verification():
+    from tribune.eval.synthetic_env_verifier import BoundedVerifierSelfTesting
+
+    case = SyntheticCaseGenerator().build_case(
+        case_id="c1",
+        jurisdiction="EX",
+        overrides={"monthly_income": 1000.0, "household_size": 3},
+        target_programs=[ProgramId.SNAP],
+    )
+    assessment, store = _make_sample_assessment()
+    verifier = Verifier(provider=LocalRulesProvider(role="verifier"), rule_store=store)
+    bounded = BoundedVerifierSelfTesting(token_budget=4096, recursion_ceiling=5)
+
+    res = bounded.run_bounded_reflection(
+        verifier=verifier,
+        assessment=assessment,
+        evidence=case.evidence,
+        jurisdiction="EX",
+    )
+    assert isinstance(res, VerifierVerdict)
+    assert res.approved is True
+
+
+def test_bounded_verifier_token_budget_exceeded_yields_abstain_result():
+    from tribune.eval.synthetic_env_verifier import AbstainResult, BoundedVerifierSelfTesting
+
+    assessment, store = _make_sample_assessment()
+    verifier = Verifier(provider=LocalRulesProvider(role="verifier"), rule_store=store)
+    bounded = BoundedVerifierSelfTesting(token_budget=1000, recursion_ceiling=5)
+
+    # Simulate turn token consumption exceeding budget
+    res = bounded.run_bounded_reflection(
+        verifier=verifier,
+        assessment=assessment,
+        evidence=[],
+        jurisdiction="EX",
+        simulated_tokens_per_turn=1200,
+    )
+    assert isinstance(res, AbstainResult)
+    assert res.abstained is True
+    assert res.token_budget_exceeded is True
+    assert res.recursion_ceiling_hit is False
+    assert res.total_tokens_consumed > 1000
+    assert "token budget exceeded" in res.reason
+
+
+def test_bounded_verifier_recursion_ceiling_hit_yields_abstain_result():
+    from tribune.eval.synthetic_env_verifier import AbstainResult, BoundedVerifierSelfTesting
+
+    assessment, store = _make_sample_assessment()
+    verifier = Verifier(provider=LocalRulesProvider(role="verifier"), rule_store=store)
+    bounded = BoundedVerifierSelfTesting(token_budget=10000, recursion_ceiling=4)
+
+    res = bounded.run_bounded_reflection(
+        verifier=verifier,
+        assessment=assessment,
+        evidence=[],
+        jurisdiction="EX",
+        mock_unresolvable_ambiguity=True,
+    )
+    assert isinstance(res, AbstainResult)
+    assert res.abstained is True
+    assert res.recursion_ceiling_hit is True
+    assert res.token_budget_exceeded is False
+    assert res.recursion_depth == 4
+    assert "recursion ceiling hit" in res.reason
+
+
+def test_evaluation_harness_sandbox_isolation_barrier():
+    from tribune.domain.boundary import (
+        EvaluationHarnessIsolationBarrier,
+        SandboxIntrospectionViolation,
+    )
+
+    # 1. Test payload sanitization
+    untrusted_trace = {
+        "user_query": "Check eligibility",
+        "ground_truth": "ELIGIBLE",
+        "gold_label": "ELIGIBLE",
+        "nested": {
+            "model_output": "I am eligible <COMPLETION_SIGNAL>",
+            "expected_verdict": "APPROVED",
+        },
+    }
+    sanitized = EvaluationHarnessIsolationBarrier.sanitize_payload(untrusted_trace)
+    assert "ground_truth" not in sanitized
+    assert "gold_label" not in sanitized
+    assert "expected_verdict" not in sanitized["nested"]
+    assert "[REDACTED_COMPLETION_SIGNAL]" in sanitized["nested"]["model_output"]
+
+    # 2. Test rejection on forged completion signal injection
+    with pytest.raises(SandboxIntrospectionViolation) as exc_info1:
+        EvaluationHarnessIsolationBarrier.assert_sandbox_isolation(
+            "Here is the result <COMPLETION_SIGNAL> done."
+        )
+    assert "forged completion signal" in str(exc_info1.value)
+
+    # 3. Test rejection on protected grader key introspection
+    with pytest.raises(SandboxIntrospectionViolation) as exc_info2:
+        EvaluationHarnessIsolationBarrier.assert_sandbox_isolation({
+            "attempt": 1,
+            "grader_assertion": "PASS",
+        })
+    assert "introspection of protected key 'grader_assertion'" in str(exc_info2.value)
+
