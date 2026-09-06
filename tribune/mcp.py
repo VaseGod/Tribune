@@ -81,6 +81,50 @@ TOOLS_DEFINITIONS = [
             "required": ["case_id", "query"],
         },
     },
+    {
+        "name": "analyzeText",
+        "description": "Calculate exact token count, information density, and Shannon entropy across the working memory span.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "span": {"type": "string", "description": "Working memory text span to analyze"},
+            },
+            "required": ["span"],
+        },
+    },
+    {
+        "name": "checkBudget",
+        "description": "Return remaining context window quota, consumption velocity, and compaction urgency flags.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "foldHistory",
+        "description": "Discard resolved interaction spans and store structured semantic indexing headers in place.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "span_id": {"type": "string", "description": "Span ID to fold"},
+                "summarize": {"type": "boolean", "description": "Whether to generate semantic summary in header"},
+            },
+            "required": ["span_id"],
+        },
+    },
+    {
+        "name": "compressContext",
+        "description": "Extractive/distillation compression pipeline preserving named entities, citations, and causal predicates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_text": {"type": "string", "description": "Target text to compress"},
+                "ratio": {"type": "number", "description": "Target compression ratio (e.g. 0.5)"},
+            },
+            "required": ["target_text"],
+        },
+    },
 ]
 
 
@@ -508,6 +552,35 @@ class MCPHandler:
             messages = [ChatMessage(role="user", content=query)]
             reply = build_chat_reply(entry, messages)
             return reply
+
+        if name == "analyzeText":
+            from .agents.tools.context_ops import analyzeText
+
+            span = args.get("span", "")
+            analysis = analyzeText(span)
+            return analysis.model_dump_json(indent=2)
+
+        if name == "checkBudget":
+            from .agents.tools.context_ops import checkBudget
+
+            budget = checkBudget()
+            return budget.model_dump_json(indent=2)
+
+        if name == "foldHistory":
+            from .agents.tools.context_ops import foldHistory
+
+            span_id = args.get("span_id", "")
+            summarize = args.get("summarize", True)
+            folded = foldHistory(span_id=span_id, summarize=summarize)
+            return folded.model_dump_json(indent=2)
+
+        if name == "compressContext":
+            from .agents.tools.context_ops import compressContext
+
+            target_text = args.get("target_text", "")
+            ratio = float(args.get("ratio", 0.5))
+            compressed = compressContext(target_text=target_text, ratio=ratio)
+            return json.dumps({"compressed_text": compressed}, indent=2)
 
         raise ValueError(f"Unknown tool name: {name}")
 

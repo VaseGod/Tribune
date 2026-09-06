@@ -724,3 +724,137 @@ class PromotionMetrics(StrictModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- #
+# Phase 1: Proactive Context Engineering & Relational Graph Memory Types
+# --------------------------------------------------------------------------- #
+
+
+class CompactionUrgency(str, enum.Enum):
+    NORMAL = "normal"
+    ELEVATED = "elevated"
+    CRITICAL = "critical"
+
+
+class ContextAnalysis(StrictModel):
+    """Calculated exact token count, information density, and Shannon entropy for working memory."""
+
+    token_count: int
+    information_density: float
+    shannon_entropy: float
+    working_memory_bytes: int = 0
+    analyzed_at: datetime = Field(default_factory=_utcnow)
+
+
+class BudgetStatus(StrictModel):
+    """Remaining context window quota, consumption velocity, and compaction urgency status."""
+
+    total_budget: int
+    used_tokens: int
+    remaining_quota: int
+    consumption_velocity: float
+    compaction_urgency: CompactionUrgency = CompactionUrgency.NORMAL
+    is_urgent: bool = False
+    active_spans_count: int = 0
+
+
+class FoldResult(StrictModel):
+    """Result of folding resolved interaction spans with semantic indexing headers."""
+
+    span_id: str
+    discarded_tokens: int
+    indexing_header: str
+    summary: str = ""
+    preserved_keys: list[str] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class EntityNode(StrictModel):
+    """A node in the relational entity-temporal graph memory store."""
+
+    node_id: str
+    name: str
+    entity_type: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class EntityRelation(StrictModel):
+    """A directed edge in the relational entity-temporal graph memory store."""
+
+    source_id: str
+    target_id: str
+    relation_type: str
+    weight: float = 1.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CausalChain(StrictModel):
+    """A verified causal deduction chain connecting premises, predicates, and consequences."""
+
+    chain_id: str
+    premise: str
+    predicate: str
+    consequence: str
+    confidence: float = 1.0
+    evidence_citations: list[str] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class EntityGraph(StrictModel):
+    """Relational entity graph snapshot containing nodes and relations."""
+
+    nodes: list[EntityNode] = Field(default_factory=list)
+    edges: list[EntityRelation] = Field(default_factory=list)
+
+
+class GraphQuery(StrictModel):
+    """Query specification for traversing the relational entity-temporal graph."""
+
+    root_node_ids: list[str] = Field(default_factory=list)
+    relation_filters: list[str] = Field(default_factory=list)
+    entity_type_filters: list[str] = Field(default_factory=list)
+    max_hops: int = 2
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+
+
+class SubGraphResult(StrictModel):
+    """Subgraph extracted from episodic memory satisfying a GraphQuery."""
+
+    nodes: list[EntityNode] = Field(default_factory=list)
+    edges: list[EntityRelation] = Field(default_factory=list)
+    causal_chains: list[CausalChain] = Field(default_factory=list)
+    total_hop_depth: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: Out-of-Band Governance & Hardened Sandbox Types
+# --------------------------------------------------------------------------- #
+
+
+class ActionProposal(StrictModel):
+    """High-stakes action proposal emitted by agent for out-of-band evaluation."""
+
+    proposal_id: str
+    case_id: str
+    agent_id: str
+    action_type: str  # e.g. "formal_filing", "database_mutation", "external_api"
+    target_resource: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class HMACAuthorizationToken(StrictModel):
+    """Cryptographically signed, short-lived HMAC authorization token minted by supervisor."""
+
+    token_id: str
+    proposal_id: str
+    action_type: str
+    nonce: str
+    signature: str
+    issued_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime
+    supervisor_id: str = "gatekeeper_supervisor_v1"
+
+
+

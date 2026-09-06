@@ -48,7 +48,26 @@ def span(name: str, **attrs: object) -> Iterator[None]:
         yield
 
 
+_sinks: dict[str, Any] = {}
+
+
+def register_sink(name: str, sink: Any) -> None:
+    """Register an in-process telemetry/tracing sink."""
+    _sinks[name] = sink
+
+
+def unregister_sink(name: str) -> None:
+    """Unregister an in-process telemetry/tracing sink."""
+    _sinks.pop(name, None)
+
+
 def log(event: str, **fields: object) -> None:  # pragma: no cover - thin shim
+    for sink in list(_sinks.values()):
+        try:
+            sink(event, fields)
+        except Exception:
+            pass
+
     init_tracing()
     if _weave is None:
         return
@@ -56,3 +75,4 @@ def log(event: str, **fields: object) -> None:  # pragma: no cover - thin shim
         _weave.publish({"event": event, **fields})  # type: ignore[attr-defined]
     except Exception:
         pass
+
