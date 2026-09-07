@@ -120,6 +120,7 @@ class SMState(str, enum.Enum):
     ABSTAIN = "abstain"
     REPLAN = "replan"
     DONE = "done"
+    ESCALATED = "escalated"
 
 
 class IngestMethod(str, enum.Enum):

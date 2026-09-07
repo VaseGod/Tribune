@@ -237,9 +237,195 @@ class CPUPinnedKVCache:
             }
 
 
+# --------------------------------------------------------------------------- #
+# Asymmetric Prompt Caching: Multi-Tier Payload Serializer
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class SerializedMultiTierPayload:
+    """Structured payload ready for Anthropic Messages API with ephemeral breakpoints."""
+
+    system: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+    messages: list[dict[str, Any]]
+    static_breakpoint_injected: bool
+    execution_state_breakpoint_injected: bool
+    total_turns: int
+    cached_turns: int
+    dynamic_turns: int
+
+    def to_api_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"messages": self.messages}
+        if self.system:
+            kwargs["system"] = self.system
+        if self.tools:
+            kwargs["tools"] = self.tools
+        return kwargs
+
+
+class MultiTierPayloadSerializer:
+    """Constructs multi-tier payloads with ephemeral cache breakpoint injection.
+
+    1. Static Header: Base system prompts, static repository symbol graphs, and full
+       JSON tool registry schemas. Injects cache_control: {"type": "ephemeral"} on
+       the boundary of this block.
+    2. Execution State (N-1 Turn): Identifies second-to-last turn in execution trace.
+       Injects cache_control: {"type": "ephemeral"} at this boundary so prior tool
+       outputs and intermediary code execution contexts read at cached rate.
+    3. Dynamic Turn: The latest agent turn (turn N) and runtime environment observation
+       remains uncached.
+    """
+
+    EPHEMERAL_CACHE_CONTROL = {"type": "ephemeral"}
+
+    @classmethod
+    def serialize(
+        cls,
+        system_prompt: str | list[dict[str, Any]],
+        symbol_graph_context: str | None = None,
+        tool_schemas: list[dict[str, Any]] | None = None,
+        execution_trace: list[dict[str, Any]] | None = None,
+        dynamic_turn: dict[str, Any] | list[dict[str, Any]] | None = None,
+    ) -> SerializedMultiTierPayload:
+        # --- 1. Static Header Construction ---
+        system_blocks: list[dict[str, Any]] = []
+        if isinstance(system_prompt, str):
+            if system_prompt.strip():
+                system_blocks.append({"type": "text", "text": system_prompt})
+        elif isinstance(system_prompt, list):
+            system_blocks.extend(copy.deepcopy(system_prompt))
+
+        if symbol_graph_context and symbol_graph_context.strip():
+            system_blocks.append({
+                "type": "text",
+                "text": f"=== REPOSITORY SYMBOL GRAPH ===\n{symbol_graph_context.strip()}",
+            })
+
+        tools_list: list[dict[str, Any]] = copy.deepcopy(tool_schemas or [])
+
+        # Inject ephemeral breakpoint onto the boundary of the static header block.
+        # Prefer placing on the last tool if tools exist, otherwise on the last system block.
+        static_injected = False
+        if tools_list:
+            tools_list[-1]["cache_control"] = copy.deepcopy(cls.EPHEMERAL_CACHE_CONTROL)
+            static_injected = True
+        elif system_blocks:
+            system_blocks[-1]["cache_control"] = copy.deepcopy(cls.EPHEMERAL_CACHE_CONTROL)
+            static_injected = True
+
+        # --- 2. Execution State (N-1 Turn) & Dynamic Turn ---
+        trace = copy.deepcopy(execution_trace or [])
+        messages: list[dict[str, Any]] = []
+
+        # Normalize execution trace into message list
+        for item in trace:
+            if isinstance(item, dict):
+                # May already be a message dict {"role": ..., "content": ...}
+                if "role" in item and "content" in item:
+                    messages.append(copy.deepcopy(item))
+                elif "turn_messages" in item and isinstance(item["turn_messages"], list):
+                    messages.extend(copy.deepcopy(item["turn_messages"]))
+                else:
+                    messages.append(copy.deepcopy(item))
+
+        cached_turns = 0
+        execution_injected = False
+
+        # Identify second-to-last turn boundary (N-1):
+        # - If dynamic_turn is passed separately, execution_trace contains prior turns up to N-1,
+        #   so the boundary of the execution state is the last item of execution_trace.
+        # - If dynamic_turn is not passed, execution_trace includes the active turn at the end,
+        #   so turn N-1 is the penultimate item (len - 2).
+        has_dynamic = bool(dynamic_turn)
+        if messages:
+            if has_dynamic:
+                target_idx = len(messages) - 1
+            else:
+                target_idx = max(0, len(messages) - 2) if len(messages) >= 2 else len(messages) - 1
+            target_msg = messages[target_idx]
+
+            # Inject cache_control on content block and message
+            target_msg["cache_control"] = copy.deepcopy(cls.EPHEMERAL_CACHE_CONTROL)
+            content = target_msg.get("content")
+            if isinstance(content, str):
+                target_msg["content"] = [
+                    {"type": "text", "text": content, "cache_control": copy.deepcopy(cls.EPHEMERAL_CACHE_CONTROL)}
+                ]
+                execution_injected = True
+            elif isinstance(content, list) and content:
+                if isinstance(content[-1], dict):
+                    content[-1]["cache_control"] = copy.deepcopy(cls.EPHEMERAL_CACHE_CONTROL)
+                    execution_injected = True
+            elif isinstance(content, dict):
+                content["cache_control"] = copy.deepcopy(cls.EPHEMERAL_CACHE_CONTROL)
+                execution_injected = True
+            else:
+                execution_injected = True
+
+            cached_turns = target_idx + 1
+
+        # --- 3. Dynamic Turn (Uncached) ---
+        dynamic_turns_count = 0
+        if dynamic_turn:
+            if isinstance(dynamic_turn, list):
+                for d in dynamic_turn:
+                    cleaned_d = copy.deepcopy(d)
+                    cls._strip_cache_control(cleaned_d)
+                    messages.append(cleaned_d)
+                    dynamic_turns_count += 1
+            elif isinstance(dynamic_turn, dict):
+                cleaned_d = copy.deepcopy(dynamic_turn)
+                cls._strip_cache_control(cleaned_d)
+                messages.append(cleaned_d)
+                dynamic_turns_count += 1
+
+        return SerializedMultiTierPayload(
+            system=system_blocks,
+            tools=tools_list,
+            messages=messages,
+            static_breakpoint_injected=static_injected,
+            execution_state_breakpoint_injected=execution_injected,
+            total_turns=len(messages),
+            cached_turns=cached_turns,
+            dynamic_turns=dynamic_turns_count,
+        )
+
+    @classmethod
+    def _strip_cache_control(cls, data: Any) -> None:
+        """Ensure dynamic turn contains 0 cache_control markers."""
+        if isinstance(data, dict):
+            data.pop("cache_control", None)
+            for v in data.values():
+                cls._strip_cache_control(v)
+        elif isinstance(data, list):
+            for item in data:
+                cls._strip_cache_control(item)
+
+
+def serialize_multi_tier_payload(
+    system_prompt: str | list[dict[str, Any]],
+    symbol_graph_context: str | None = None,
+    tool_schemas: list[dict[str, Any]] | None = None,
+    execution_trace: list[dict[str, Any]] | None = None,
+    dynamic_turn: dict[str, Any] | list[dict[str, Any]] | None = None,
+) -> SerializedMultiTierPayload:
+    return MultiTierPayloadSerializer.serialize(
+        system_prompt=system_prompt,
+        symbol_graph_context=symbol_graph_context,
+        tool_schemas=tool_schemas,
+        execution_trace=execution_trace,
+        dynamic_turn=dynamic_turn,
+    )
+
+
 __all__ = [
     "KVCachePageMetadata",
     "KVCacheRoutingTable",
     "CPUPinnedKVCache",
     "PinnedHostMemoryBuffer",
+    "SerializedMultiTierPayload",
+    "MultiTierPayloadSerializer",
+    "serialize_multi_tier_payload",
 ]
+

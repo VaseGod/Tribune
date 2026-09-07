@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import enum
 import logging
+import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..governance.audit import AuditLog
 from ..instrumentation.usage import UsageRecorder
 from ..memory.consolidation import MemoryConsolidator
+from ..security.audit import SecurityEventType, record_security_event
 from ..types import ProgramId, ProgramOutcome, RecommendedAction, SMState
 from .router import Router
 
 logger = logging.getLogger(__name__)
+
+STATE_ESCALATED: str = "escalated"
 
 
 class InvalidStateTransitionError(RuntimeError):
@@ -31,6 +36,7 @@ class FSMState(str, enum.Enum):
     REPLAN = "replan"  # Recovery loop on incomplete rule coverage
     ABSTAIN = "abstain"  # Safe terminal state when uncertain or unverified
     DONE = "done"  # Successful terminal state without submission
+    ESCALATED = "escalated"  # Safe terminal state when environmental defect is escalated
 
 
 @dataclass(frozen=True)
@@ -49,20 +55,21 @@ class TraceInducedFSM:
     """Deterministic, compact Finite-State Machine induced from validated statutory execution traces.
 
     Strictly governs state transitions along the statutory pipeline sequence:
-        Preparer -> Eligibility -> Navigator -> Verifier -> ActionGate -> { Done | Abstain }
+        Preparer -> Eligibility -> Navigator -> Verifier -> ActionGate -> { Done | Abstain | Escalated }
     Guarantees exactly 0 unscripted or unverified agent transitions.
     """
 
     # Induced transition graph from validated statutory execution traces
     ALLOWED_TRANSITIONS: dict[FSMState, set[FSMState]] = {
-        FSMState.PREPARER: {FSMState.ELIGIBILITY, FSMState.ABSTAIN},
-        FSMState.ELIGIBILITY: {FSMState.NAVIGATOR, FSMState.ABSTAIN},
-        FSMState.NAVIGATOR: {FSMState.VERIFIER, FSMState.ABSTAIN},
-        FSMState.VERIFIER: {FSMState.ACTION_GATE, FSMState.REPLAN, FSMState.ABSTAIN},
-        FSMState.REPLAN: {FSMState.ELIGIBILITY, FSMState.ABSTAIN},
-        FSMState.ACTION_GATE: {FSMState.PREPARER, FSMState.DONE, FSMState.ABSTAIN},
+        FSMState.PREPARER: {FSMState.ELIGIBILITY, FSMState.ABSTAIN, FSMState.ESCALATED},
+        FSMState.ELIGIBILITY: {FSMState.NAVIGATOR, FSMState.ABSTAIN, FSMState.ESCALATED},
+        FSMState.NAVIGATOR: {FSMState.VERIFIER, FSMState.ABSTAIN, FSMState.ESCALATED},
+        FSMState.VERIFIER: {FSMState.ACTION_GATE, FSMState.REPLAN, FSMState.ABSTAIN, FSMState.ESCALATED},
+        FSMState.REPLAN: {FSMState.ELIGIBILITY, FSMState.ABSTAIN, FSMState.ESCALATED},
+        FSMState.ACTION_GATE: {FSMState.PREPARER, FSMState.DONE, FSMState.ABSTAIN, FSMState.ESCALATED},
         FSMState.DONE: set(),
         FSMState.ABSTAIN: set(),
+        FSMState.ESCALATED: set(),
     }
 
     def __init__(self, initial_state: FSMState = FSMState.PREPARER) -> None:
@@ -84,7 +91,6 @@ class TraceInducedFSM:
         metadata: dict[str, Any] | None = None,
     ) -> FSMState:
         """Execute a state transition under strict statutory governance.
-        
         Raises InvalidStateTransitionError if an unscripted transition is attempted, failing safe to ABSTAIN.
         """
         if not self.can_transition(target_state):
@@ -116,9 +122,61 @@ class TraceInducedFSM:
         )
         self.history.append(transition_record)
         self.current_state = target_state
-        if target_state in (FSMState.DONE, FSMState.ABSTAIN):
+        if target_state in (FSMState.DONE, FSMState.ABSTAIN, FSMState.ESCALATED):
             self.is_terminal = True
         return self.current_state
+
+    def handle_defect_escalation(
+        self,
+        agent: Any,
+        defect_report: dict[str, Any],
+        workspace_root: str | None = None,
+        notification_dispatch: Callable[[dict[str, Any]], None] | None = None,
+        case_id: str | None = None,
+    ) -> FSMTransition:
+        """Freeze agent tool execution, capture workspace diff, transition to ESCALATED,
+
+        and dispatch diagnostic report to security audit and notification queues.
+        """
+        # 1. Freeze agent tool execution
+        if hasattr(agent, "freeze"):
+            agent.freeze(reason=f"Defect escalated: {defect_report.get('defect_type')}")
+
+        # 2. Capture workspace diffs
+        workspace_diff = capture_workspace_diff(workspace_root)
+        defect_report["workspace_diff"] = workspace_diff
+
+        # 3. Transition to ESCALATED
+        agent_name = getattr(agent, "agent_id", str(agent))
+        record = FSMTransition(
+            from_state=self.current_state,
+            to_state=FSMState.ESCALATED,
+            agent=agent_name,
+            action=f"DEFECT_ESCALATED: {defect_report.get('defect_type')} in {defect_report.get('target_file')}",
+            metadata=dict(defect_report),
+        )
+        self.history.append(record)
+        self.current_state = FSMState.ESCALATED
+        self.is_terminal = True
+
+        # 4. Dispatch structured audit event
+        record_security_event(
+            event_type=SecurityEventType.DEFECT_ESCALATED,
+            source="tribune.orchestration.state_machine",
+            message=f"Defect escalated by {agent_name}: {defect_report.get('defect_type')} in {defect_report.get('target_file')}",
+            severity="HIGH",
+            details=defect_report,
+            case_id=case_id,
+        )
+
+        # 5. Invoke downstream notifications (e.g. ticket queue)
+        if notification_dispatch:
+            try:
+                notification_dispatch(defect_report)
+            except Exception as exc:
+                logger.error(f"Downstream escalation notification failed: {exc}")
+
+        return record
 
     @classmethod
     def induce_fsm_from_traces(cls, execution_traces: list[list[str]]) -> dict[str, Any]:
@@ -406,11 +464,115 @@ class CaseStateMachine:
                 total_latency_ms=tot_lat,
             )
 
+    def handle_escalation(
+        self,
+        case_id: str,
+        defect_report: dict[str, Any],
+        agent: Any = "agent",
+        workspace_root: str | None = None,
+        notification_dispatch: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Intercept escalate_defect event, freeze agent execution, and transition to ESCALATED."""
+        trans = self.fsm.handle_defect_escalation(
+            agent=agent,
+            defect_report=defect_report,
+            workspace_root=workspace_root,
+            notification_dispatch=notification_dispatch,
+            case_id=case_id,
+        )
+        self.audit.append(
+            case_id,
+            SMState.ESCALATED,
+            agent=trans.agent,
+            action=trans.action,
+            payload={
+                "defect_type": defect_report.get("defect_type", ""),
+                "target_file": defect_report.get("target_file", ""),
+                "reproduction_trace": defect_report.get("reproduction_trace", "")[:300],
+            },
+        )
+        return {
+            "status": "ESCALATED",
+            "transition": trans,
+            "defect_report": defect_report,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Workspace Diff Capture & CI Escalation Integration
+# --------------------------------------------------------------------------- #
+
+
+def capture_workspace_diff(workspace_root: str | None = None) -> str:
+    """Capture current workspace git diff or empty string if clean / not a repo."""
+    try:
+        cmd = ["git", "diff", "HEAD"]
+        res = subprocess.run(
+            cmd,
+            cwd=workspace_root or None,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception as exc:
+        logger.debug(f"Workspace diff capture skipped: {exc}")
+    return ""
+
+
+class CIEscalationHandler:
+    """Monitors CI test exit codes and forces escalation when external fixtures fail."""
+
+    def __init__(self, failure_threshold: int = 2) -> None:
+        self.failure_threshold = failure_threshold
+        self._consecutive_failures: dict[str, int] = {}
+
+    def record_ci_run(
+        self,
+        test_file: str,
+        exit_code: int,
+        is_externally_authored: bool = True,
+    ) -> tuple[bool, str]:
+        """Record CI run exit code.
+
+        If repeated non-zero exit codes occur on unmodified external test files,
+        returns (True, escalation_message) to trigger escalate_defect instead of test tampering.
+        """
+        if exit_code == 0:
+            self._consecutive_failures[test_file] = 0
+            return False, "CI tests passed successfully."
+
+        if not is_externally_authored:
+            return False, f"CI test failed on internal agent-authored test '{test_file}' (code={exit_code})."
+
+        self._consecutive_failures[test_file] = self._consecutive_failures.get(test_file, 0) + 1
+        fails = self._consecutive_failures[test_file]
+
+        if fails >= self.failure_threshold:
+            msg = (
+                f"External test file '{test_file}' has failed {fails} consecutive times (exit code {exit_code}). "
+                f"Per anti-reward-hacking policy POL-ANTI-REWARD-HACK-001, test tampering is strictly prohibited. "
+                f"Halting test modification loop and triggering escalate_defect prompt."
+            )
+            return True, msg
+
+        return False, f"External test '{test_file}' failed ({fails}/{self.failure_threshold} attempts)."
+
+    def get_failure_count(self, test_file: str) -> int:
+        return self._consecutive_failures.get(test_file, 0)
+
+    def reset(self) -> None:
+        self._consecutive_failures.clear()
+
 
 __all__ = [
+    "STATE_ESCALATED",
     "FSMState",
     "FSMTransition",
     "InvalidStateTransitionError",
     "TraceInducedFSM",
     "CaseStateMachine",
+    "CIEscalationHandler",
+    "capture_workspace_diff",
 ]

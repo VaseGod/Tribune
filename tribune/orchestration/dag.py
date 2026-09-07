@@ -146,10 +146,84 @@ class DAG:
         return dag
 
 
+@dataclass
+class DAGRunContext:
+    """Execution context for a DAG run with execution trace and prompt caching support."""
+
+    run_id: str = field(default_factory=lambda: f"dag_run_{int(time.time() * 1000)}")
+    is_fallback_active: bool = False
+    fallback_model: str | None = None
+    fallback_reason: str = ""
+    execution_trace: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def record_turn(self, turn_data: dict[str, Any]) -> None:
+        """Record an executed turn (message, tool invocation, or observation)."""
+        self.execution_trace.append(dict(turn_data))
+
+    def tag_fallback(self, fallback_model: str, reason: str = "") -> None:
+        """Tag run context with detected upstream model fallback."""
+        self.is_fallback_active = True
+        self.fallback_model = fallback_model
+        self.fallback_reason = reason
+        self.metadata["model_fallback"] = {
+            "fallback_model": fallback_model,
+            "reason": reason,
+            "tagged_at": time.time(),
+        }
+
+    def inject_penultimate_cache_breakpoint(self) -> list[dict[str, Any]]:
+        """Identify the second-to-last turn (N-1) and inject an ephemeral cache breakpoint.
+
+        Returns a deepcopy of the execution trace where turn N-1 carries
+        cache_control: {"type": "ephemeral"}, while the latest active turn N remains uncached.
+        """
+        import copy
+        trace_copy = copy.deepcopy(self.execution_trace)
+        if not trace_copy:
+            return trace_copy
+
+        # If 2 or more turns, target index is N-2 (second to last)
+        # If 1 turn, target index is 0
+        target_idx = max(0, len(trace_copy) - 2) if len(trace_copy) >= 2 else 0
+        target_item = trace_copy[target_idx]
+
+        cache_ctrl = {"type": "ephemeral"}
+        content = target_item.get("content")
+        if isinstance(content, str):
+            target_item["content"] = [{"type": "text", "text": content, "cache_control": cache_ctrl}]
+        elif isinstance(content, list) and content:
+            if isinstance(content[-1], dict):
+                content[-1]["cache_control"] = cache_ctrl
+        elif isinstance(content, dict):
+            content["cache_control"] = cache_ctrl
+        else:
+            target_item["cache_control"] = cache_ctrl
+
+        # Ensure the latest turn (index -1 if len >= 2) has NO cache_control (dynamic turn)
+        if len(trace_copy) >= 2:
+            latest_item = trace_copy[-1]
+            latest_item.pop("cache_control", None)
+            lcontent = latest_item.get("content")
+            if isinstance(lcontent, list):
+                for blk in lcontent:
+                    if isinstance(blk, dict):
+                        blk.pop("cache_control", None)
+            elif isinstance(lcontent, dict):
+                lcontent.pop("cache_control", None)
+
+        return trace_copy
+
+
 class DAGRunner:
     """Executes a DAG synchronously in topological order, collecting per-task results."""
 
-    def run(self, dag: DAG, executor: Callable[[Task], object]) -> dict[str, object]:
+    def run(
+        self,
+        dag: DAG,
+        executor: Callable[[Task], object],
+        context: DAGRunContext | None = None,
+    ) -> dict[str, object]:
         results: dict[str, object] = {}
         for task in dag.topological_order():
             task.status = TaskStatus.RUNNING
@@ -159,9 +233,25 @@ class DAGRunner:
                 task.result = res
                 task.status = TaskStatus.COMPLETED
                 results[task.task_id] = res
+                if context:
+                    context.record_turn({
+                        "task_id": task.task_id,
+                        "kind": task.kind,
+                        "role": "assistant",
+                        "content": str(res),
+                        "status": task.status.value,
+                    })
             except Exception as exc:
                 task.status = TaskStatus.FAILED
                 task.error = str(exc)
+                if context:
+                    context.record_turn({
+                        "task_id": task.task_id,
+                        "kind": task.kind,
+                        "role": "system",
+                        "content": f"Task failed: {exc}",
+                        "status": task.status.value,
+                    })
                 raise
             finally:
                 task.completed_at = time.time()
@@ -175,6 +265,7 @@ class AsyncDAGRunner:
         self,
         dag: DAG,
         async_executor: Callable[[Task], Awaitable[object]],
+        context: DAGRunContext | None = None,
     ) -> dict[str, object]:
         results: dict[str, object] = {}
         waves = dag.topological_waves()
@@ -187,10 +278,26 @@ class AsyncDAGRunner:
                     res = await async_executor(task)
                     task.result = res
                     task.status = TaskStatus.COMPLETED
+                    if context:
+                        context.record_turn({
+                            "task_id": task.task_id,
+                            "kind": task.kind,
+                            "role": "assistant",
+                            "content": str(res),
+                            "status": task.status.value,
+                        })
                     return task.task_id, res
                 except Exception as exc:
                     task.status = TaskStatus.FAILED
                     task.error = str(exc)
+                    if context:
+                        context.record_turn({
+                            "task_id": task.task_id,
+                            "kind": task.kind,
+                            "role": "system",
+                            "content": f"Task failed: {exc}",
+                            "status": task.status.value,
+                        })
                     raise
                 finally:
                     task.completed_at = time.time()
@@ -205,4 +312,11 @@ class AsyncDAGRunner:
         return results
 
 
-__all__ = ["Task", "TaskStatus", "DAG", "DAGRunner", "AsyncDAGRunner"]
+__all__ = [
+    "Task",
+    "TaskStatus",
+    "DAG",
+    "DAGRunContext",
+    "DAGRunner",
+    "AsyncDAGRunner",
+]

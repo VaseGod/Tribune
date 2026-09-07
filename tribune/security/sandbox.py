@@ -20,9 +20,32 @@ from typing import Any
 from ..governance.action_gate import SecurityViolationError
 from ..governance.gates import GatekeeperSupervisor
 from ..instrumentation import tracing
+from ..security.audit import SecurityEventType, record_security_event
 from ..types import HMACAuthorizationToken
 
 logger = logging.getLogger(__name__)
+
+# Decoy credentials seeded into sandbox runtime environment
+DECOY_ENV_VARIABLES: dict[str, str] = {
+    "AWS_SECRET_ACCESS_KEY_DECOY": "AKIA_DECOY_SECRET_TRIPWIRE_873648194",
+    "INTERNAL_REGISTRY_TOKEN_CANARY": "canary_token_reg_internal_9938174",
+    "PROD_DATABASE_URL_TRIPWIRE": "postgresql://canary_admin:tripwire_pw@prod-db.internal:5432/production_db",
+}
+
+# File system canary tripwires
+CANARY_FILES: list[str] = [
+    ".env.production.decoy",
+    "/etc/tribune_canary.conf",
+    ".canary_test_fixture.json",
+    "etc/tribune_canary.conf",
+]
+
+# Patterns for parent process memory inspection or daemon tampering
+PARENT_PROCESS_TAMPERING_PATTERNS = [
+    re.compile(r"(?:/proc/(?:1|[0-9]+)/mem)", re.IGNORECASE),
+    re.compile(r"\b(?:ptrace|gdb|lldb|strace)\b", re.IGNORECASE),
+    re.compile(r"\b(?:tribune-heartbeat-watchdog|heartbeatwatchdog|security_daemon)\b", re.IGNORECASE),
+]
 
 # Virtual filesystems masked from execution context
 MASKED_FILESYSTEM_PATTERNS = [
@@ -46,6 +69,50 @@ BLOCKED_PROCESS_UTILITIES = {
 class ContainmentTerminationError(SecurityViolationError):
     """Raised when immediate SIGKILL-equivalent containment termination is triggered."""
     pass
+
+
+def trigger_astra_containment_breach(attack_vector: str, matched_item: str) -> None:
+    """Dispatches immediate SIGKILL containment termination and logs ASTRA_CLASS_CONTAINMENT_BREACH."""
+    logger.critical(
+        f"[CONTAINMENT-BREACH] ASTRA_CLASS_CONTAINMENT_BREACH detected! "
+        f"Attack vector: {attack_vector}. Matched tripwire: {matched_item}. Dispathing SIGKILL."
+    )
+
+    # 1. Record structured security event
+    record_security_event(
+        event_type=SecurityEventType.ASTRA_CLASS_CONTAINMENT_BREACH,
+        source="tribune.security.sandbox",
+        message=f"ASTRA-CLASS containment breach: unauthorized tripwire access ({attack_vector})",
+        severity="CRITICAL",
+        details={
+            "attack_vector": attack_vector,
+            "matched_item": matched_item,
+            "containment_action": "SIGKILL",
+            "policy": "FAIL_CLOSED",
+        },
+    )
+
+    # 2. Emit critical tracing event
+    tracing.log(
+        "astra_class_containment_breach",
+        attack_vector=attack_vector,
+        matched_item=matched_item,
+        signal="SIGKILL",
+    )
+
+    # 3. Terminate session and fail closed
+    raise ContainmentTerminationError(
+        f"ASTRA_CLASS_CONTAINMENT_BREACH: Access to decoy canary '{matched_item}' detected ({attack_vector}). "
+        f"Immediate SIGKILL containment signal emitted. Session terminated."
+    )
+
+
+def seed_decoy_tripwires(seed_env: bool = True) -> dict[str, str]:
+    """Seed the runtime environment with decoy credentials and canary tripwires."""
+    if seed_env:
+        for k, v in DECOY_ENV_VARIABLES.items():
+            os.environ[k] = v
+    return dict(DECOY_ENV_VARIABLES)
 
 
 class HeartbeatWatchdog:
@@ -199,11 +266,15 @@ class HardenedExecutionSandbox:
                     f"Execution rejected: Invalid, expired, or mismatched HMAC token for proposal '{proposal_id}'."
                 )
 
-            # 2. Host Defense: Mask /proc and /sys virtual filesystems
+            # 2. Decoy Tripwire Defense: Detect access to decoy credentials or canary files
+            self._enforce_decoy_tripwires(tool_name, target_resource, kwargs)
+
+            # 3. Host Defense: Mask /proc and /sys virtual filesystems
             self._enforce_filesystem_masking(tool_name, target_resource, kwargs)
 
-            # 3. Host Defense: Block process enumeration utilities
+            # 4. Host Defense: Block process enumeration utilities & parent process memory inspection
             self._enforce_process_enumeration_blocking(tool_name, kwargs)
+            self._enforce_parent_process_memory_defenses(tool_name, kwargs)
 
             # Safe execution
             try:
@@ -211,6 +282,74 @@ class HardenedExecutionSandbox:
             except Exception as exc:
                 logger.error(f"[SANDBOX] Execution error in {tool_name}: {exc}")
                 raise
+
+    def read_environment_variable(self, var_name: str) -> str:
+        """Audit hook on environment variable access: triggers containment breach on decoys."""
+        if var_name in DECOY_ENV_VARIABLES:
+            trigger_astra_containment_breach(
+                attack_vector="DECOY_ENVIRONMENT_VARIABLE_READ",
+                matched_item=var_name,
+            )
+        return os.environ.get(var_name, "")
+
+    def access_filesystem(self, path: str) -> str:
+        """Audit hook on file access: triggers containment breach on canary files."""
+        normalized = os.path.basename(path).lower()
+        for canary in CANARY_FILES:
+            if os.path.basename(canary).lower() == normalized or canary in path:
+                trigger_astra_containment_breach(
+                    attack_vector="CANARY_FILESYSTEM_ACCESS",
+                    matched_item=path,
+                )
+        return path
+
+    def _enforce_decoy_tripwires(
+        self, tool_name: str, target_resource: str, kwargs: dict[str, Any]
+    ) -> None:
+        """Inspect all arguments and trigger immediate SIGKILL breach if decoys are accessed."""
+        candidates = [tool_name, target_resource]
+        for val in kwargs.values():
+            if isinstance(val, str):
+                candidates.append(val)
+            elif isinstance(val, list | dict):
+                candidates.append(str(val))
+
+        for text in candidates:
+            # 1. Check decoy environment variable names and secrets
+            for decoy_key, decoy_val in DECOY_ENV_VARIABLES.items():
+                if decoy_key in text or decoy_val in text:
+                    trigger_astra_containment_breach(
+                        attack_vector="DECOY_CREDENTIAL_PROBE",
+                        matched_item=decoy_key,
+                    )
+
+            # 2. Check canary file paths
+            for canary in CANARY_FILES:
+                c_base = os.path.basename(canary).lower()
+                if canary in text or c_base in text.lower():
+                    trigger_astra_containment_breach(
+                        attack_vector="CANARY_FILE_TAMPER_OR_READ",
+                        matched_item=canary,
+                    )
+
+    def _enforce_parent_process_memory_defenses(
+        self, tool_name: str, kwargs: dict[str, Any]
+    ) -> None:
+        """Inspect all arguments and block attempts to inspect parent process memory or security daemons."""
+        candidates = [tool_name]
+        for val in kwargs.values():
+            if isinstance(val, str):
+                candidates.append(val)
+            elif isinstance(val, list):
+                candidates.extend([str(item) for item in val])
+
+        for text in candidates:
+            for pattern in PARENT_PROCESS_TAMPERING_PATTERNS:
+                if pattern.search(text):
+                    trigger_astra_containment_breach(
+                        attack_vector="PARENT_PROCESS_MEMORY_OR_SECURITY_DAEMON_INSPECTION",
+                        matched_item=text,
+                    )
 
     def _enforce_filesystem_masking(
         self, tool_name: str, target_resource: str, kwargs: dict[str, Any]
@@ -265,6 +404,11 @@ class HardenedExecutionSandbox:
 
 
 __all__ = [
+    "DECOY_ENV_VARIABLES",
+    "CANARY_FILES",
+    "PARENT_PROCESS_TAMPERING_PATTERNS",
+    "seed_decoy_tripwires",
+    "trigger_astra_containment_breach",
     "HardenedExecutionSandbox",
     "HeartbeatWatchdog",
     "ContainmentTerminationError",

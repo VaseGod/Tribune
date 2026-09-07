@@ -8,6 +8,12 @@ from .context_ops import (
     get_context_manager,
     set_context_manager,
 )
+from .escalation import (
+    ESCALATE_DEFECT_TOOL_SCHEMA,
+    DefectType,
+    VALID_DEFECT_TYPES,
+    escalate_defect,
+)
 
 __all__ = [
     "analyzeText",
@@ -16,4 +22,8 @@ __all__ = [
     "compressContext",
     "get_context_manager",
     "set_context_manager",
+    "escalate_defect",
+    "ESCALATE_DEFECT_TOOL_SCHEMA",
+    "DefectType",
+    "VALID_DEFECT_TYPES",
 ]

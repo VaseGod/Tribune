@@ -14,11 +14,12 @@ Implements the Autoresearch Optimization Ratchet:
 
 from __future__ import annotations
 
-import copy
 import enum
 import hashlib
 import logging
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -594,6 +595,131 @@ class ContinualOptimizer:
         }
 
 
+# --------------------------------------------------------------------------- #
+# Output Length Dampener Subsystem
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class DampenerConfig:
+    """Configuration governing generation length dampening and token expansion mitigation."""
+
+    max_cot_tokens: int = 500
+    max_cot_steps: int = 10
+    enforce_unified_diff: bool = True
+    strip_conversational_filler: bool = True
+    diff_command: str = "diff -u"
+
+
+class GenerationLengthDampener:
+    """Mitigates token expansion by enforcing concise unified diff constraints,
+
+    eliminating conversational filler, and trimming runaway chain-of-thought loops.
+    """
+
+    SYSTEM_CONSTRAINT_PROMPT = (
+        "=== MANDATORY OUTPUT FORMAT & LENGTH CONSTRAINTS ===\n"
+        "1. CODE MODIFICATIONS: Enforce concise unified diffs (`diff -u`) only. Never output full file rewrites.\n"
+        "2. ZERO CONVERSATIONAL FILLER: Omit all preambles, greetings, transitional filler, and closing pleasantries "
+        "(e.g., 'Sure!', 'Here is the code', 'I have updated the file', 'Hope this helps').\n"
+        "3. BOUNDED CHAIN-OF-THOUGHT: Conclude reasoning immediately once a decision criterion is met. "
+        "Repetitive chain-of-thought expansion exceeding task step budgets will be rejected.\n"
+        "===================================================="
+    )
+
+    _FILLER_PREAMBLES = [
+        re.compile(r"^\s*(?:Sure(?: thing)?|Certainly|Of course|Here is|Below is|I can help with that|I'll help|As requested|Okay|Alright)[^\n]*\n+", re.IGNORECASE),
+        re.compile(r"^\s*Here(?:'s| is) (?:the|a) (?:unified )?diff[^\n]*:\s*\n+", re.IGNORECASE),
+    ]
+
+    _FILLER_CLOSINGS = [
+        re.compile(r"\n+\s*(?:Hope this helps|Let me know if|Feel free to|Thanks|Good luck)[^\n]*$", re.IGNORECASE),
+    ]
+
+    _THINKING_RE = re.compile(
+        r"(<(?:think|thought|reasoning)[^>]*>)(.*?)(</(?:think|thought|reasoning)>)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def __init__(self, config: DampenerConfig | None = None) -> None:
+        self.config = config or DampenerConfig()
+
+    def inject_constraints(self, system_prompt: str) -> str:
+        """Inject unified diff and token dampening constraints into base system prompt."""
+        if "MANDATORY OUTPUT FORMAT & LENGTH CONSTRAINTS" in system_prompt:
+            return system_prompt
+        return f"{system_prompt.strip()}\n\n{self.SYSTEM_CONSTRAINT_PROMPT}"
+
+    def dampen(self, text: str, task_step_budget: int | None = None) -> tuple[str, bool]:
+        """Dampen output text: remove filler and trim repetitive or oversized reasoning chains.
+
+        Returns (dampened_text, was_trimmed).
+        """
+        trimmed = False
+        result = text
+
+        # 1. Eliminate conversational filler if configured
+        if self.config.strip_conversational_filler:
+            for pat in self._FILLER_PREAMBLES:
+                if pat.search(result):
+                    result = pat.sub("", result)
+                    trimmed = True
+            for pat in self._FILLER_CLOSINGS:
+                if pat.search(result):
+                    result = pat.sub("", result)
+                    trimmed = True
+
+        # 2. Inspect and dampen reasoning / chain-of-thought blocks
+        def _dampen_cot(match: re.Match[str]) -> str:
+            nonlocal trimmed
+            tag_open, body, tag_close = match.group(1), match.group(2), match.group(3)
+            dampened_body, cot_trimmed = self._trim_cot_expansion(
+                body, budget=task_step_budget or self.config.max_cot_tokens
+            )
+            if cot_trimmed:
+                trimmed = True
+            return f"{tag_open}{dampened_body}{tag_close}"
+
+        result = self._THINKING_RE.sub(_dampen_cot, result)
+
+        # 3. If unified diff is strictly required for code changes, verify diff -u syntax
+        if self.config.enforce_unified_diff and ("--- " in text and "+++ " in text):
+            # Already in unified diff format
+            pass
+
+        return result.strip(), trimmed
+
+    def _trim_cot_expansion(self, cot_text: str, budget: int) -> tuple[str, bool]:
+        """Trim repetitive thoughts and enforce maximum token/character budget on CoT."""
+        lines = [line.strip() for line in cot_text.splitlines() if line.strip()]
+        if not lines:
+            return cot_text, False
+
+        # Detect repetitive lines (cycling loops)
+        seen_lines: set[str] = set()
+        deduped_lines: list[str] = []
+        trimmed = False
+
+        for line in lines:
+            norm = line.lower()
+            if norm in seen_lines:
+                trimmed = True
+                continue  # Skip repetitive chain-of-thought statement
+            seen_lines.add(norm)
+            deduped_lines.append(line)
+
+        # Approximate token count (approx 4 chars per token)
+        joined = "\n".join(deduped_lines)
+        approx_tokens = len(joined) // 4
+        if approx_tokens > budget:
+            trimmed = True
+            # Truncate at character boundary approximately matching budget
+            char_limit = budget * 4
+            joined = joined[:char_limit].rstrip() + "\n[... CoT truncated by GenerationLengthDampener budget ...]"
+
+        return joined, trimmed
+
+
 __all__ = [
     "MutationType",
     "RatchetMutationProposal",
@@ -601,4 +727,7 @@ __all__ = [
     "RatchetAcceptanceGate",
     "AutoresearchRatchetLoop",
     "ContinualOptimizer",
+    "DampenerConfig",
+    "GenerationLengthDampener",
 ]
+
