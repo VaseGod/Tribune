@@ -308,6 +308,23 @@ TRIBUNE features an adaptive, tiered, cost-optimized, and self-patching engine:
    - **Speculative Inference Runner:** Employs local models for fast speculative drafting and target models for verification, calculating acceptance rates, speedup factors, and latency savings.
    - **Token Cost Attribution & SLA Tracking:** Measures per-run token costs, tracks latency percentiles (P95), manages exponential backoff retry budgets, and trips circuit breakers on SLA breaches.
 
+7. **Asymmetric Prompt Caching & Fallback Accounting (`tribune/orchestration/cache.py`, `tribune/cost_tracker.py`, `tribune/providers/anthropic.py`):**
+   - **Ephemeral Cache Breakpoints:** Injects cache control breakpoints at the static header (system prompt + symbol dependency graphs + tool registry) and the penultimate $(N-1)$ execution turn via `MultiTierPayloadSerializer`. Intermediate execution traces read at cache read pricing ($0.25/M tokens) leaving only the active dynamic turn uncached.
+   - **Opus Checkpoint Fallback Audit:** Inspects Anthropic fallback routing headers (`x-fallback-model`, `x-actual-model-used`) to dynamically adjust cost accounting to legacy Opus checkpoints ($75/M tokens) and dispatches `MODEL_FALLBACK_ROUTING` audit events.
+   - **Generation Length Dampening:** `GenerationLengthDampener` bounds reasoning monologue expansion and enforces `diff -u` patch formats across autonomous agents.
+
+8. **Tri-Memory Topology & Citation-Locked Retrieval (`tribune/memory/`):**
+   - **Tri-Memory State Stores:** Replaces flat vector search with three deterministic stores: an append-only chronological state timeline (`MemoryEventsTimeline`), an entity-dependency graph (`EntityEventGraph` indexing `imports`, `calls`, `mutates` with $k$-hop traversal), and 3-tier hierarchical documentary memory (`HierarchicalDocumentaryMemory` spanning $L_0$ invariants, $L_1$ module contracts, and $L_2$ local schemas).
+   - **CitationLockHarness ($C \subseteq O$):** Wraps all memory interactions in provenanced tuples $\tau = (x, \pi(x))$. Enforces mathematical citation inclusion $C \subseteq O$ where any ungrounded claim triggers an immediate abstention signal ($a = \perp$) and raises `UNGROUNDED_ASSERTION_VIOLATION`.
+
+9. **Decision-Environment Escalation Interlock (`tribune/agents/tools/escalation.py`, `tribune/orchestration/state_machine.py`):**
+   - **Anti-Reward-Hacking Policy (`POL-ANTI-REWARD-HACK-001`):** Injected into agent system contexts to prohibit test-assertion tampering, fixture deletion, or dummy mock returns.
+   - **Escalation Interlock Tool (`escalate_defect`):** If external CI tests or integration fixtures fail repeatedly, tool execution is frozen, workspace diffs are snapshotted, and the orchestrator state transitions directly to `STATE_ESCALATED` / `FSMState.ESCALATED`.
+
+10. **Evaluator-Awareness Hardening & Tripwire Containment (`tribune/redteam/adversarial.py`, `tribune/security/sandbox.py`):**
+    - **Grader-Awareness Probes:** `GraderAwarenessProbe` runs dual-condition probes against agent reasoning traces to detect grading-environment gaming or sycophancy.
+    - **Sandbox Decoy Tripwires:** Seeds decoy credentials (`AWS_SECRET_ACCESS_KEY_DECOY`, `.env.production.decoy`) and canary files. Unauthorized access attempts trip an immediate container `SIGKILL` and fail closed under an `ASTRA_CLASS_CONTAINMENT_BREACH` security event.
+
 ---
 
 ## Cost accounting: cost per completed verification
