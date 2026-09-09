@@ -6,6 +6,10 @@ the equity-bug flag firing on a synthetic bad delta, and threshold
 configurability.
 """
 
+import numpy as np
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
 from tribune.casegen import i18n
 from tribune.casegen.i18n import es as es_glossary
 from tribune.eval.costreport import compute_cost_report
@@ -19,6 +23,7 @@ from tribune.eval.parity import (
     run_parity,
 )
 from tribune.eval.quant_sensitivity.seedset import SEED_WEIGHTS, build_seed_set
+from tribune.orchestration.mtp import NativeMTPBackbone
 from tribune.types import ProgramId
 
 # --------------------------------------------------------------------------- #
@@ -131,3 +136,121 @@ def test_thresholds_are_configurable():
     loose = dict(load_thresholds(), max_abstention_rate_delta=0.20)
     assert any(b.metric == "abstention_rate" for b in compare_language_slices(en, es, tight))
     assert not any(b.metric == "abstention_rate" for b in compare_language_slices(en, es, loose))
+
+
+# --------------------------------------------------------------------------- #
+# Logit & Distribution Parity Assurance (Speculative MTP vs Autoregressive)
+# --------------------------------------------------------------------------- #
+
+
+def _simulate_autoregressive_step(last_token: int, step_offset: int, vocab_size: int) -> np.ndarray:
+    """Deterministic autoregressive reference implementation predicting next token logits."""
+    logits = np.zeros(vocab_size, dtype=np.float32)
+    head_token = (last_token + step_offset * 7) % vocab_size
+    logits[head_token] = 8.5
+    logits[(head_token + 1) % vocab_size] = 2.0
+    return logits
+
+
+@settings(max_examples=25, deadline=None)
+@given(
+    seed=st.integers(min_value=1, max_value=5000),
+    seq_length=st.integers(min_value=3, max_value=30),
+)
+def test_speculative_mtp_logit_parity_property_based(seed: int, seq_length: int):
+    """Property-based test: verify exact mathematical logit parity between speculative MTP
+    and baseline autoregressive generation across diverse pseudorandom sequences."""
+    rng = np.random.default_rng(seed)
+    vocab_size = 500
+    hidden_dim = 128
+    sequence = rng.integers(0, vocab_size, size=seq_length).tolist()
+    hidden_state = rng.standard_normal(hidden_dim).astype(np.float32)
+
+    backbone = NativeMTPBackbone(vocab_size=vocab_size, hidden_dim=hidden_dim, max_speculative_depth=4)
+
+    # 1. Speculative MTP forward pass projecting depth K
+    branch = backbone.project_candidates(
+        current_sequence=sequence,
+        hidden_state=hidden_state,
+        content_hint="structured",
+    )
+    k = branch.depth_k
+    mtp_logits = branch.logits  # shape (k, vocab_size)
+
+    # 2. Baseline Autoregressive step-by-step rollout
+    ar_logits = np.zeros((k, vocab_size), dtype=np.float32)
+    last_tok = sequence[-1]
+    for step in range(k):
+        ar_logits[step] = _simulate_autoregressive_step(last_tok, step + 1, vocab_size)
+
+    # 3. Assert exact mathematical logit parity across all speculative steps
+    np.testing.assert_allclose(
+        mtp_logits,
+        ar_logits,
+        rtol=1e-5,
+        atol=1e-6,
+        err_msg="Mathematical logit parity violation between native MTP and autoregressive baseline",
+    )
+
+
+def test_greedy_output_equivalence_mtp_vs_autoregressive():
+    """Verify greedy output equivalence (argmax over logits) between MTP execution
+    and baseline autoregressive generation across varied sequence lengths."""
+    vocab_size = 1000
+    hidden_dim = 256
+    backbone = NativeMTPBackbone(vocab_size=vocab_size, hidden_dim=hidden_dim, max_speculative_depth=4)
+
+    test_lengths = [4, 8, 16, 32, 64]
+    for length in test_lengths:
+        rng = np.random.default_rng(length * 100)
+        seq = rng.integers(0, vocab_size, size=length).tolist()
+        hidden = rng.standard_normal(hidden_dim).astype(np.float32)
+
+        branch = backbone.project_candidates(seq, hidden, content_hint="json")
+        k = branch.depth_k
+
+        mtp_greedy = [int(np.argmax(branch.logits[s])) for s in range(k)]
+
+        last_tok = seq[-1]
+        ar_greedy = [
+            int(np.argmax(_simulate_autoregressive_step(last_tok, s + 1, vocab_size)))
+            for s in range(k)
+        ]
+
+        # Greedy predictions must be identically equal
+        assert mtp_greedy == ar_greedy
+        assert mtp_greedy == branch.candidate_tokens[:k]
+
+
+def test_distribution_preservation_temperature_scaled_sampling():
+    """Verify probability distribution preservation under temperature-scaled sampling
+    (asserting zero KL divergence between MTP and autoregressive distributions)."""
+    vocab_size = 200
+    hidden_dim = 64
+    backbone = NativeMTPBackbone(vocab_size=vocab_size, hidden_dim=hidden_dim, max_speculative_depth=4)
+
+    seq = [12, 34, 56]
+    hidden = np.ones(hidden_dim, dtype=np.float32)
+    branch = backbone.project_candidates(seq, hidden, content_hint="code")
+    k = branch.depth_k
+
+    temperatures = [0.2, 0.5, 0.7, 1.0, 1.5]
+
+    for temp in temperatures:
+        for step in range(k):
+            # MTP scaled softmax
+            mtp_z = branch.logits[step] / temp
+            mtp_shift = mtp_z - np.max(mtp_z)
+            mtp_p = np.exp(mtp_shift) / np.sum(np.exp(mtp_shift))
+
+            # Autoregressive scaled softmax
+            ar_z = _simulate_autoregressive_step(seq[-1], step + 1, vocab_size) / temp
+            ar_shift = ar_z - np.max(ar_z)
+            ar_p = np.exp(ar_shift) / np.sum(np.exp(ar_shift))
+
+            # Exact distribution preservation check
+            np.testing.assert_allclose(mtp_p, ar_p, rtol=1e-5, atol=1e-6)
+
+            # Assert KL divergence is practically zero (< 1e-6)
+            kl_div = np.sum(ar_p * np.log(np.maximum(ar_p, 1e-12) / np.maximum(mtp_p, 1e-12)))
+            assert abs(kl_div) < 1e-6

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from typing import Any
 
 from tribune.governance.action_gate import (
     ActionGate,
+    CostTripwireError,
+    CyclicalRetryLoopError,
     GateDecisionType,
     GateSeverity,
     SecurityViolationError,
@@ -124,6 +127,139 @@ class TestActionGateGuardrails(unittest.TestCase):
         dec_mock = self.gate.evaluate_text_patterns("with mock.patch('os.system'): pass")
         self.assertEqual(dec_mock.decision, GateDecisionType.BLOCK)
         self.assertIn("ENVIRONMENT_TAMPERING", dec_mock.matched_rules)
+
+    def test_rae_gating_suppresses_retrieval_on_entropy_increase(self) -> None:
+        """Verify RAE Gating suppresses external retrieved payload and forces parametric weights
+        when injecting the retrieval increases action prediction entropy."""
+        # Baseline model distribution without retrieval (sharp, confident, low entropy)
+        base_probs = [0.90, 0.05, 0.03, 0.02]
+        # Counterfactual distribution with irrelevant or confusing retrieval (flattened, high entropy)
+        retrieved_probs = [0.25, 0.25, 0.25, 0.25]
+
+        res = self.gate.evaluate_retrieval_entropy_effect(
+            skill_or_tool="unemployment_rules_api",
+            base_probs_or_logits=base_probs,
+            retrieved_probs_or_logits=retrieved_probs,
+        )
+
+        self.assertTrue(res.retrieval_suppressed)
+        self.assertTrue(res.force_parametric_weights)
+        self.assertGreater(res.entropy_delta, 0.5)
+        self.assertIn("RAE Gating suppressed", res.reason)
+
+        # Verify gate_retrieved_payload returns suppressed signal
+        allowed, payload = self.gate.gate_retrieved_payload(
+            skill_or_tool="unemployment_rules_api",
+            retrieved_payload={"doc": "ambiguous legal text"},
+            base_distribution=base_probs,
+            retrieved_distribution=retrieved_probs,
+        )
+        self.assertFalse(allowed)
+        self.assertIsNone(payload)
+
+    def test_rae_gating_allows_retrieval_on_entropy_reduction(self) -> None:
+        """Verify RAE Gating allows external retrieved payload when it reduces or clarifies predictive entropy."""
+        # Baseline model distribution with ambiguity
+        base_probs = [0.35, 0.35, 0.20, 0.10]
+        # Distribution after injecting exact statutory citation (sharp, clarified)
+        retrieved_probs = [0.95, 0.03, 0.01, 0.01]
+
+        res = self.gate.evaluate_retrieval_entropy_effect(
+            skill_or_tool="medicaid_magi_calculator",
+            base_probs_or_logits=base_probs,
+            retrieved_probs_or_logits=retrieved_probs,
+        )
+
+        self.assertFalse(res.retrieval_suppressed)
+        self.assertFalse(res.force_parametric_weights)
+        self.assertLess(res.entropy_delta, 0.0)
+        self.assertIn("RAE Gating approved", res.reason)
+
+        allowed, payload = self.gate.gate_retrieved_payload(
+            skill_or_tool="medicaid_magi_calculator",
+            retrieved_payload={"formula": "magi_net = gross - deductions"},
+            base_distribution=base_probs,
+            retrieved_distribution=retrieved_probs,
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(payload["formula"], "magi_net = gross - deductions")
+
+    def test_cost_control_tripwire_payload_size_limit(self) -> None:
+        """Verify ActionGate enforces deterministic tool invocation serialization size ceiling."""
+        tight_gate = ActionGate(max_payload_bytes=1024)
+
+        def dummy_tool(data: str, case_id: str = "case_c1") -> str:
+            return "processed"
+
+        # Small payload passes
+        sig = SupervisorSignature.issue("sup_1", "dummy_tool:case_c1")
+        res = tight_gate.execute_tool(
+            tool_name="dummy_tool",
+            tool_fn=dummy_tool,
+            kwargs={"data": "x" * 100, "case_id": "case_c1"},
+            sandbox_mode=False,
+            supervisor_signature=sig,
+        )
+        self.assertEqual(res, "processed")
+
+        # Huge payload breaching 1024 bytes triggers CostTripwireError
+        with self.assertRaises(CostTripwireError) as ctx:
+            tight_gate.execute_tool(
+                tool_name="dummy_tool",
+                tool_fn=dummy_tool,
+                kwargs={"data": "x" * 5000, "case_id": "case_c1"},
+                sandbox_mode=False,
+                supervisor_signature=sig,
+            )
+        self.assertIn("Cost tripwire breached", str(ctx.exception))
+        self.assertIn("argument payload size", str(ctx.exception))
+
+    def test_cost_control_tripwire_cyclical_error_loop_breaker(self) -> None:
+        """Verify ActionGate detects and breaks infinite cyclical error recovery loops."""
+        gate = ActionGate(max_cyclical_retries=3)
+
+        def failing_tool(**kwargs: Any) -> None:
+            raise ValueError("Upstream service unavailable 503")
+
+        # Attempts 1, 2, 3 fail with ValueError
+        for i in range(3):
+            with self.assertRaises(ValueError):
+                gate.execute_tool(
+                    tool_name="remote_fetch",
+                    tool_fn=failing_tool,
+                    kwargs={"attempt": i, "case_id": "case_loop"},
+                    sandbox_mode=False,
+                )
+
+        # Attempt 4 breaches max_cyclical_retries (3) and raises CyclicalRetryLoopError
+        with self.assertRaises(CyclicalRetryLoopError) as ctx:
+            gate.execute_tool(
+                tool_name="remote_fetch",
+                tool_fn=failing_tool,
+                kwargs={"attempt": 3, "case_id": "case_loop"},
+                sandbox_mode=False,
+            )
+        self.assertIn("cyclical error recovery exceeded threshold", str(ctx.exception))
+        self.assertIn("Force-terminating infinite recovery loop", str(ctx.exception))
+
+    def test_cost_control_tripwire_cumulative_token_ceiling(self) -> None:
+        """Verify ActionGate force-terminates runaway exploratory sub-tasks exceeding token ceilings."""
+        gate = ActionGate(max_cumulative_tokens=5000)
+
+        subtask_id = "exploratory_appeal_research_01"
+        # 1. First spending step: 2000 tokens (accumulated: 2000 <= 5000)
+        accum1 = gate.record_and_enforce_token_ceiling(subtask_id, 2000)
+        self.assertEqual(accum1, 2000)
+
+        # 2. Second spending step: 2500 tokens (accumulated: 4500 <= 5000)
+        accum2 = gate.record_and_enforce_token_ceiling(subtask_id, 2500)
+        self.assertEqual(accum2, 4500)
+
+        # 3. Third spending step: 1000 tokens (accumulated: 5500 > 5000) -> CostTripwireError
+        with self.assertRaises(CostTripwireError) as ctx:
+            gate.record_and_enforce_token_ceiling(subtask_id, 1000)
+        self.assertIn("cumulative token ceiling exceeded", str(ctx.exception))
+        self.assertIn("Force-terminating runaway exploratory path", str(ctx.exception))
 
 
 if __name__ == "__main__":

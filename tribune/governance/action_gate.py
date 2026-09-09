@@ -18,18 +18,22 @@ Includes static pattern detectors to prevent specification gaming across 8 threa
 
 from __future__ import annotations
 
-import enum
-import re
-import secrets
 import copy
+import enum
 import hashlib
 import json
+import os
+import re
+import secrets
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+import numpy as np
 
 from ..corpus.rule_store import RuleStore
 from ..types import (
@@ -62,6 +66,98 @@ class PostConditionError(ActionBlocked):
 class SecurityViolationError(ActionBlocked):
     """Raised when high-severity adversarial patterns or specification gaming attempts are detected."""
     pass
+
+
+class CostTripwireError(SecurityViolationError):
+    """Raised when deterministic cost tripwires (payload size ceiling, cumulative token budget) are breached."""
+    pass
+
+
+class CyclicalRetryLoopError(SecurityViolationError):
+    """Raised when maximum cyclical error recovery attempts are exceeded to break infinite retry loops."""
+    pass
+
+
+class RetrievalEntropyDegradationError(ActionBlocked):
+    """Raised when external skill retrieval increases predictive entropy, triggering parametric fallback."""
+    pass
+
+
+@dataclass
+class RAEValidationResult:
+    """Structured outcome of counterfactual RAE entropy validation."""
+
+    tool_or_skill_name: str
+    base_entropy: float
+    retrieved_entropy: float
+    entropy_delta: float
+    retrieval_suppressed: bool
+    force_parametric_weights: bool
+    reason: str
+    decision: Any = None
+
+
+class RAEGater:
+    """Retrieval-Invoked Actual-Use Effect (RAE) Gating Engine.
+
+    Counterfactual validation step prior to dispatching external skill retrieval:
+    1. Evaluates model predictive entropy both with (H_retrieved) and without (H_base) retrieved context.
+    2. If injecting retrieved context increases entropy (Delta H = H_retrieved - H_base > 0),
+       signaling retrieval degradation or confusion: suppresses payload and forces execution
+       using parametric weights.
+    3. If Delta H <= 0, approves retrieved payload injection.
+    """
+
+    def __init__(self, entropy_margin: float = 0.0) -> None:
+        self.entropy_margin = entropy_margin
+        self.evaluations_count = 0
+        self.suppressions_count = 0
+        self.approvals_count = 0
+
+    def evaluate_retrieval_entropy_effect(
+        self,
+        skill_or_tool: str,
+        base_probs_or_logits: list[float] | np.ndarray,
+        retrieved_probs_or_logits: list[float] | np.ndarray,
+        is_logits: bool = False,
+    ) -> RAEValidationResult:
+        """Counterfactual evaluation of model predictive entropy with and without retrieved context."""
+        from ..orchestration.mtp import EntropyAwareDepthScaler
+
+        self.evaluations_count += 1
+        h_base = EntropyAwareDepthScaler.compute_shannon_entropy(base_probs_or_logits, is_logits=is_logits)
+        h_retrieved = EntropyAwareDepthScaler.compute_shannon_entropy(retrieved_probs_or_logits, is_logits=is_logits)
+        delta_h = round(h_retrieved - h_base, 4)
+
+        if delta_h > self.entropy_margin:
+            # Retrieval increases predictive entropy -> confusion/degradation
+            self.suppressions_count += 1
+            return RAEValidationResult(
+                tool_or_skill_name=skill_or_tool,
+                base_entropy=h_base,
+                retrieved_entropy=h_retrieved,
+                entropy_delta=delta_h,
+                retrieval_suppressed=True,
+                force_parametric_weights=True,
+                reason=(
+                    f"RAE Gating suppressed '{skill_or_tool}': retrieved payload increased action "
+                    f"prediction entropy by +{delta_h:.4f} (H_base={h_base:.4f} -> H_retrieved={h_retrieved:.4f}), "
+                    f"signaling retrieval confusion. Falling back to parametric weights."
+                ),
+                decision=GateDecisionType.BLOCK,
+            )
+        else:
+            self.approvals_count += 1
+            return RAEValidationResult(
+                tool_or_skill_name=skill_or_tool,
+                base_entropy=h_base,
+                retrieved_entropy=h_retrieved,
+                entropy_delta=delta_h,
+                retrieval_suppressed=False,
+                force_parametric_weights=False,
+                reason=f"RAE Gating approved '{skill_or_tool}': predictive entropy stabilized or decreased (delta={delta_h:.4f}).",
+                decision=GateDecisionType.ALLOW,
+            )
 
 
 class GateDecisionType(str, enum.Enum):
@@ -434,6 +530,9 @@ class ActionGate:
         self,
         denylist_paths: list[str] | None = None,
         allowlist_tools: list[str] | None = None,
+        max_payload_bytes: int = 65536,
+        max_cyclical_retries: int = 3,
+        max_cumulative_tokens: int = 16384,
     ) -> None:
         self.denylist_paths = denylist_paths or [
             ".env",
@@ -448,10 +547,95 @@ class ActionGate:
             "statutory_evaluator",
             "rule_lookup",
         ]
+        self.max_payload_bytes = max_payload_bytes
+        self.max_cyclical_retries = max_cyclical_retries
+        self.max_cumulative_tokens = max_cumulative_tokens
+        self.rae_gater = RAEGater()
+
         self.violations_log: list[GateDecision] = []
         self.failure_payloads: list[dict[str, Any]] = []
         self.event_log = TrajectoryEventLog()
         self.sandboxes: dict[str, SandboxContext] = {}
+        self._cyclical_error_counts: dict[str, int] = defaultdict(int)
+        self._subtask_tokens_spent: dict[str, int] = defaultdict(int)
+
+    def validate_payload_size(self, tool_name: str, kwargs: dict[str, Any]) -> int:
+        """Enforce maximum argument payload serialization byte size tripwire."""
+        try:
+            payload_str = json.dumps(kwargs, default=str)
+        except Exception:
+            payload_str = str(kwargs)
+        payload_bytes = len(payload_str.encode("utf-8"))
+        if payload_bytes > self.max_payload_bytes:
+            raise CostTripwireError(
+                f"Cost tripwire breached: tool '{tool_name}' argument payload size "
+                f"({payload_bytes} bytes) exceeds maximum ceiling of {self.max_payload_bytes} bytes."
+            )
+        return payload_bytes
+
+    def track_cyclical_recovery(self, tool_name: str, error_signature: str, case_id: str = "global") -> int:
+        """Detect and break infinite cyclical error recovery loops."""
+        key = f"{case_id}:{tool_name}:{error_signature}"
+        self._cyclical_error_counts[key] += 1
+        count = self._cyclical_error_counts[key]
+        if count > self.max_cyclical_retries:
+            raise CyclicalRetryLoopError(
+                f"Cost tripwire breached: cyclical error recovery exceeded threshold "
+                f"({count} > {self.max_cyclical_retries}) for tool '{tool_name}' on error '{error_signature}'. "
+                f"Force-terminating infinite recovery loop."
+            )
+        return count
+
+    def reset_cyclical_recovery(self, tool_name: str, case_id: str = "global") -> None:
+        """Reset cyclical error counter upon successful tool execution."""
+        prefix = f"{case_id}:{tool_name}:"
+        for k in list(self._cyclical_error_counts.keys()):
+            if k.startswith(prefix):
+                self._cyclical_error_counts.pop(k, None)
+
+    def record_and_enforce_token_ceiling(self, subtask_id: str, tokens_spent: int) -> int:
+        """Track cumulative subtask tokens and enforce cost ceiling tripwire."""
+        self._subtask_tokens_spent[subtask_id] += tokens_spent
+        accumulated = self._subtask_tokens_spent[subtask_id]
+        if accumulated > self.max_cumulative_tokens:
+            raise CostTripwireError(
+                f"Cost tripwire breached: cumulative token ceiling exceeded "
+                f"({accumulated} > {self.max_cumulative_tokens}) for sub-task '{subtask_id}'. "
+                f"Force-terminating runaway exploratory path."
+            )
+        return accumulated
+
+    def evaluate_retrieval_entropy_effect(
+        self,
+        skill_or_tool: str,
+        base_probs_or_logits: list[float] | np.ndarray,
+        retrieved_probs_or_logits: list[float] | np.ndarray,
+        is_logits: bool = False,
+    ) -> RAEValidationResult:
+        """Execute counterfactual RAE validation on candidate skill retrieval."""
+        return self.rae_gater.evaluate_retrieval_entropy_effect(
+            skill_or_tool=skill_or_tool,
+            base_probs_or_logits=base_probs_or_logits,
+            retrieved_probs_or_logits=retrieved_probs_or_logits,
+            is_logits=is_logits,
+        )
+
+    def gate_retrieved_payload(
+        self,
+        skill_or_tool: str,
+        retrieved_payload: Any,
+        base_distribution: list[float] | np.ndarray,
+        retrieved_distribution: list[float] | np.ndarray,
+    ) -> tuple[bool, Any]:
+        """Gate retrieved skill payload: suppress and force parametric weights if entropy increases."""
+        res = self.evaluate_retrieval_entropy_effect(
+            skill_or_tool=skill_or_tool,
+            base_probs_or_logits=base_distribution,
+            retrieved_probs_or_logits=retrieved_distribution,
+        )
+        if res.retrieval_suppressed:
+            return False, None
+        return True, retrieved_payload
 
     def create_sandbox(
         self, case_id: str, initial_state: dict[str, Any] | None = None
@@ -961,6 +1145,9 @@ class ActionGate:
     ) -> Any:
         """Execute a tool wrapped with pre- and post-condition assertion checks and sandbox security."""
         case_id = kwargs.get("case_id", "global")
+        # Cost tripwire: payload serialization size validation
+        self.validate_payload_size(tool_name, kwargs)
+
         # Path containment validation on any file path parameters
         for k in ["path", "file_path", "target_path", "filepath", "output_path", "input_path"]:
             if k in kwargs and isinstance(kwargs[k], str):
@@ -971,7 +1158,6 @@ class ActionGate:
 
         # Guardrail check on tool inputs
         self.enforce_guardrails(kwargs, action_type=f"tool_input:{tool_name}")
-
 
         self.assert_preconditions(
             tool_name=tool_name,
@@ -999,6 +1185,7 @@ class ActionGate:
                     f"Post-condition failed: tool '{tool_name}' returned null unexpectedly."
                 )
             self.assert_postconditions(result=result)
+            self.reset_cyclical_recovery(tool_name, case_id)
             return result
         except Exception as exc:
             sb.rollback_to_snapshot(pre_snap.snapshot_id)
@@ -1009,6 +1196,9 @@ class ActionGate:
                 action_name=tool_name,
                 payload={"error": str(exc)},
             )
+            # Track cyclical error recovery tripwire before re-raising
+            if not isinstance(exc, CostTripwireError):
+                self.track_cyclical_recovery(tool_name, type(exc).__name__, case_id)
             raise
 
     def authorize_submission(
@@ -1155,6 +1345,11 @@ __all__ = [
     "PreConditionError",
     "PostConditionError",
     "SecurityViolationError",
+    "CostTripwireError",
+    "CyclicalRetryLoopError",
+    "RetrievalEntropyDegradationError",
+    "RAEValidationResult",
+    "RAEGater",
     "GateDecisionType",
     "GateSeverity",
     "GateDecision",

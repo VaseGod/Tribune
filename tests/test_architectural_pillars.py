@@ -18,7 +18,7 @@ from tribune.eval.costmodel import CostModel
 from tribune.eval.quant_sensitivity.backends import smoke_ladder
 from tribune.eval.quant_sensitivity.ladder import run_ladder
 from tribune.governance.action_gate import ActionGate, PreConditionError
-from tribune.governance.audit import AuditLog, CheckpointManager
+from tribune.governance.audit import AuditLog, CheckpointManager, DiskStateJournal
 from tribune.governance.disclosure import generate_determination_notice
 from tribune.memory.partitions import (
     AccessDenied,
@@ -438,3 +438,87 @@ async def test_end_to_end_concurrent_multibenefit_crash_and_verified_notice(tmp_
     notice = generate_determination_notice(snap_outcome, verification_report=report, action_gate=gate)
     assert "OFFICIAL DETERMINATION & DISCLOSURE NOTICE" in notice
     assert "FAIR HEARING APPEAL RIGHTS" in notice
+
+
+def test_disk_backed_state_journaling_and_crash_replay(tmp_path):
+    """Verify DiskStateJournal eliminates environment state amnesia by appending
+    environment variables, tool outputs, and dependency graphs at discrete state boundaries,
+    and accurately replaying state upon crash recovery."""
+    journal_file = str(tmp_path / "subsystem_state_journal.jsonl")
+    journal = DiskStateJournal(journal_path=journal_file)
+
+    case_id = "case_journal_crash_recovery_01"
+
+    # 1. State boundary: PLAN
+    dag = DAG()
+    dag.add(Task(task_id="gather", kind="gather"))
+    dag.add(Task(task_id="assess:snap", kind="assess", deps=["gather"], program=ProgramId.SNAP))
+
+    env_snap_1 = {
+        "APP_ENV": "production",
+        "JURISDICTION": "EX",
+        "SECRET_AUTH_TOKEN": "sk-secret-password-12345678",
+    }
+    rec1 = journal.record_state_boundary(
+        case_id=case_id,
+        state=SMState.PLAN,
+        environment_variables=env_snap_1,
+        tool_outputs={},
+        dag_snapshot=dag.to_dict(),
+    )
+    assert rec1.sequence == 1
+    assert rec1.environment_variables["SECRET_AUTH_TOKEN"] == "[REDACTED]"
+    assert rec1.environment_variables["APP_ENV"] == "production"
+
+    # 2. State boundary: GATHER
+    tool_out_gather = {
+        "doc_ocr_01": {"income": 1150.0, "status": "verified"},
+        "residency_check": {"resident": True},
+    }
+    rec2 = journal.record_state_boundary(
+        case_id=case_id,
+        state=SMState.GATHER,
+        environment_variables=env_snap_1,
+        tool_outputs=tool_out_gather,
+        dag_snapshot=dag.to_dict(),
+    )
+    assert rec2.sequence == 2
+
+    # 3. State boundary: ASSESS
+    tool_out_assess = {
+        "statutory_lookup:7_CFR_273_9": {"gross_income_cap": 1300.0, "eligible": True},
+    }
+    rec3 = journal.record_state_boundary(
+        case_id=case_id,
+        state=SMState.ASSESS,
+        environment_variables=env_snap_1,
+        tool_outputs=tool_out_assess,
+        dag_snapshot=dag.to_dict(),
+    )
+    assert rec3.sequence == 3
+    assert os.path.exists(journal_file)
+
+    # 4. Simulate unexpected process crash and resume from disk journal
+    recovering_journal = DiskStateJournal(journal_path=journal_file)
+    recovered = recovering_journal.recover_state(case_id)
+
+    assert recovered is not None
+    assert recovered["case_id"] == case_id
+    assert recovered["latest_state"] == SMState.ASSESS.value
+    assert recovered["sequence"] == 3
+    assert recovered["total_state_boundaries_replayed"] == 3
+
+    # Zero environment amnesia: environment variables restored
+    assert recovered["environment_variables"]["APP_ENV"] == "production"
+    assert recovered["environment_variables"]["JURISDICTION"] == "EX"
+    assert recovered["environment_variables"]["SECRET_AUTH_TOKEN"] == "[REDACTED]"
+
+    # Zero tool output amnesia: all tool outputs across state boundaries are merged
+    assert "doc_ocr_01" in recovered["tool_outputs"]
+    assert "residency_check" in recovered["tool_outputs"]
+    assert "statutory_lookup:7_CFR_273_9" in recovered["tool_outputs"]
+    assert recovered["tool_outputs"]["doc_ocr_01"]["income"] == 1150.0
+
+    # Dependency graph recovered
+    assert "tasks" in recovered["dag_snapshot"]
+    assert len(recovered["dag_snapshot"]["tasks"]) == 2

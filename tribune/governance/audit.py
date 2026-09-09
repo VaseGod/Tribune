@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..types import AuditRecord, SMState
@@ -321,9 +323,174 @@ def _canonical_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+
+# --------------------------------------------------------------------------- #
+# Append-Only Disk-Backed Transactional State Journaling
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class JournalStateBoundaryRecord:
+    """An append-only disk journal entry recorded at a discrete state boundary."""
+
+    journal_id: str
+    case_id: str
+    sequence: int
+    state: str  # e.g. SMState.PLAN.value
+    timestamp: str
+    environment_variables: dict[str, str]
+    tool_outputs: dict[str, Any]
+    dag_snapshot: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)
+    entry_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "journal_id": self.journal_id,
+            "case_id": self.case_id,
+            "sequence": self.sequence,
+            "state": self.state,
+            "timestamp": self.timestamp,
+            "environment_variables": self.environment_variables,
+            "tool_outputs": self.tool_outputs,
+            "dag_snapshot": self.dag_snapshot,
+            "metadata": self.metadata,
+            "entry_hash": self.entry_hash,
+        }
+
+
+class DiskStateJournal:
+    """Append-only, disk-backed transactional journal eliminating environment state amnesia.
+
+    Serializes all environment variables, tool outputs, and dependency graphs at every
+    discrete state boundary (PLAN -> GATHER -> ASSESS -> VERIFY -> PREPARE -> DONE).
+    Supports exact replay and state re-hydration upon crash recovery.
+    """
+
+    DEFAULT_JOURNAL_PATH = ".tribune/state_journal.jsonl"
+
+    def __init__(self, journal_path: str | None = None) -> None:
+        self.journal_path = journal_path or self.DEFAULT_JOURNAL_PATH
+        self._lock = threading.RLock()
+        self._sequence_counter: dict[str, int] = {}
+
+    def record_state_boundary(
+        self,
+        case_id: str,
+        state: SMState | str,
+        environment_variables: dict[str, str] | None = None,
+        tool_outputs: dict[str, Any] | None = None,
+        dag_snapshot: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> JournalStateBoundaryRecord:
+        """Atomically append environment variables, tool outputs, and DAG state to disk journal."""
+        with self._lock:
+            state_str = state.value if isinstance(state, SMState) else str(state)
+            seq = self._sequence_counter.get(case_id, 0) + 1
+            self._sequence_counter[case_id] = seq
+
+            # Sanitize environment variables (remove sensitive tokens/keys)
+            clean_env: dict[str, str] = {}
+            if environment_variables:
+                for k, v in environment_variables.items():
+                    if any(secret_term in k.lower() for secret_term in ("key", "secret", "token", "password")):
+                        clean_env[k] = "[REDACTED]"
+                    else:
+                        clean_env[k] = str(v)
+
+            clean_tools = sanitize_audit_data(tool_outputs or {})
+            clean_dag = dag_snapshot or {}
+
+            journal_id = f"jnl_{case_id}_{seq}_{uuid.uuid4().hex[:8]}"
+            timestamp = _canonical_now()
+
+            # Hash entry for tamper detection
+            content = f"{journal_id}:{case_id}:{seq}:{state_str}:{json.dumps(clean_tools, sort_keys=True, default=str)}"
+            entry_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+            record = JournalStateBoundaryRecord(
+                journal_id=journal_id,
+                case_id=case_id,
+                sequence=seq,
+                state=state_str,
+                timestamp=timestamp,
+                environment_variables=clean_env,
+                tool_outputs=clean_tools,
+                dag_snapshot=clean_dag,
+                metadata=metadata or {},
+                entry_hash=entry_hash,
+            )
+
+            # Atomic append to disk with fsync
+            dirname = os.path.dirname(os.path.abspath(self.journal_path))
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+
+            with open(self.journal_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record.to_dict(), default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            return record
+
+    def recover_state(self, case_id: str) -> dict[str, Any] | None:
+        """Replay disk journal to recover latest environment variables, tool outputs, and DAG state."""
+        with self._lock:
+            if not os.path.exists(self.journal_path):
+                return None
+
+            latest_record: dict[str, Any] | None = None
+            all_records: list[dict[str, Any]] = []
+
+            with open(self.journal_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("case_id") == case_id:
+                            latest_record = rec
+                            all_records.append(rec)
+                    except Exception:
+                        continue
+
+            if not latest_record:
+                return None
+
+            # Merge all cumulative tool outputs across state boundaries to prevent amnesia
+            merged_tool_outputs: dict[str, Any] = {}
+            for r in all_records:
+                merged_tool_outputs.update(r.get("tool_outputs", {}))
+
+            return {
+                "case_id": case_id,
+                "latest_state": latest_record.get("state"),
+                "sequence": latest_record.get("sequence"),
+                "timestamp": latest_record.get("timestamp"),
+                "environment_variables": latest_record.get("environment_variables", {}),
+                "tool_outputs": merged_tool_outputs,
+                "dag_snapshot": latest_record.get("dag_snapshot", {}),
+                "total_state_boundaries_replayed": len(all_records),
+            }
+
+    def clear(self) -> None:
+        """Clear the journal file."""
+        with self._lock:
+            if os.path.exists(self.journal_path):
+                try:
+                    os.remove(self.journal_path)
+                except OSError:
+                    pass
+            self._sequence_counter.clear()
+
+
 __all__ = [
     "AuditLog",
     "CheckpointManager",
+    "JournalStateBoundaryRecord",
+    "DiskStateJournal",
     "sanitize_audit_text",
     "sanitize_audit_data",
 ]
+

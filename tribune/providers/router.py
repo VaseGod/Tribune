@@ -23,14 +23,21 @@ import logging
 import math
 import os
 import time
+import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from ..config import TribuneSettings, get_settings
-from ..eval.costmodel import TrajectoryCostModel, default_cost_model
+from ..eval.costmodel import TrajectoryCostModel
 from ..instrumentation.usage import UsageRecorder
+from ..orchestration.mtp import (
+    EntropyAwareDepthScaler,
+    NativeMTPBackbone,
+    NonStallingRollbackPipeline,
+    SharedTensorMemory,
+)
 from .base import (
     ModelProvider,
     ReviewRequest,
@@ -254,6 +261,13 @@ class SpeculativeInferenceRunner:
         target_provider: ModelProvider,
         config: SpeculativeDraftConfig | None = None,
     ) -> None:
+        warnings.warn(
+            "SpeculativeInferenceRunner dual-model draft/target verification pipeline is deprecated. "
+            "Use native MTP prediction heads directly on the primary model backbone via "
+            "tribune.orchestration.mtp.NativeMTPBackbone.",
+            category=DeprecationWarning,
+            stacklevel=2,
+        )
         self.draft_provider = draft_provider
         self.target_provider = target_provider
         self.config = config or SpeculativeDraftConfig()
@@ -1055,7 +1069,7 @@ class ModelRouter:
         context: str = "",
     ) -> SynthesisResult:
         """Route complex legal reasoning payloads to high-throughput local hybrid endpoints (e.g. Qwen3.8-Flash-Next).
-        
+
         Applies dynamic confidence scoring thresholds and automatically falls back to deterministic local
         rule engines (tribune/providers/local_rules.py) when LLM confidence falls below calibrated levels.
         """
@@ -1818,6 +1832,10 @@ __all__ = [
     "TokenCostAttribution",
     "RetryBudget",
     "SpeculativeInferenceRunner",
+    "NativeMTPBackbone",
+    "EntropyAwareDepthScaler",
+    "NonStallingRollbackPipeline",
+    "SharedTensorMemory",
     "SLATracker",
     "EndpointTelemetry",
     "ParetoObjectiveWeights",
