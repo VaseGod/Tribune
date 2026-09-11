@@ -28,6 +28,7 @@ from ..governance.action_gate import ActionBlocked, ActionGate, HumanSignoff
 from ..ingestion.base import make_doc_ingest
 from ..orchestration.pipeline import CasePipeline
 from ..types import CaseRunResult, Evidence, EvidenceType, SMState, SyntheticCase
+from .adversarial import DivergenceScore, DualSurfaceDivergenceEngine
 from .notice_generator import tamper_case
 from .payloads import PAYLOADS, AttackGoal, Payload
 
@@ -191,6 +192,20 @@ class InjectionProbe:
     def run_evomal_probes(self) -> dict[str, Any]:
         """Run EvoMal memory tampering, unsigned partition injection, and browser sandbox exfiltration probes."""
         return probe_evomal_defense()
+
+    def run_dual_surface_probe(
+        self,
+        verbal_output: str,
+        tool_invocations: list[dict[str, Any]] | None = None,
+        system_commands: list[str] | None = None,
+    ) -> DivergenceScore:
+        """Evaluate decoupled verbal surface vs operational surface for deceptive compliance."""
+        engine = DualSurfaceDivergenceEngine()
+        return engine.evaluate_turn(
+            verbal_output=verbal_output,
+            tool_invocations=tool_invocations,
+            system_commands=system_commands,
+        )
 
 
 def probe_evomal_defense() -> dict[str, Any]:

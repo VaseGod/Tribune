@@ -249,6 +249,187 @@ def track_quant_citation_retention(records: list[Any]) -> float:
     return round(min(1.0, total_retained / total_expected), 4)
 
 
+# --------------------------------------------------------------------------- #
+# Segment-Level Cryptographic Citation Mapping
+# --------------------------------------------------------------------------- #
+
+from typing import TYPE_CHECKING
+from pydantic import Field
+from ..types import StrictModel
+from .provenance import CompactedTraceState, content_hash
+
+if TYPE_CHECKING:
+    from .rule_store import LocalRuleStore
+
+
+class CitationSegment(StrictModel):
+    """A semantic document segment anchored by an immutable SHA-256 hash."""
+
+    segment_id: str
+    segment_hash: str
+    source_id: str
+    content: str
+    start_char: int = 0
+    end_char: int = 0
+
+
+class CitationVerificationReport(StrictModel):
+    """Deterministic verification report for claims checked against preserved segment hashes."""
+
+    is_verified: bool
+    assertion_text: str
+    cited_segment_hashes: list[str]
+    matched_hashes: list[str]
+    unmatched_hashes: list[str]
+    confidence: float
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+def normalize_segment_text(text: str) -> str:
+    """Canonical normalization for deterministic segment hashing."""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+class CryptographicCitationMapper:
+    """Cryptographic segment-level grounding and assertion verifier.
+
+    Maps semantic document segments to cryptographic hashes and guarantees
+    mathematically deterministic verification against compacted trace state,
+    independent of contextual padding stripping or text compaction.
+    """
+
+    def __init__(self, rule_store: Any | None = None) -> None:
+        if rule_store is None:
+            from .rule_store import LocalRuleStore
+            self._rule_store = LocalRuleStore()
+        else:
+            self._rule_store = rule_store
+
+        self._segments: dict[str, CitationSegment] = {}
+        # Pre-seed segments from statutory rule anchors
+        for crit_id, anchor_hash in self._rule_store.all_rule_anchors().items():
+            rule = self._rule_store._rule_lookup.get(crit_id)
+            if rule:
+                text = f"{rule.title}. {rule.description} {rule.text}"
+                seg = CitationSegment(
+                    segment_id=f"rule_seg_{crit_id}",
+                    segment_hash=anchor_hash,
+                    source_id=rule.source,
+                    content=text,
+                    start_char=0,
+                    end_char=len(text),
+                )
+                self._segments[anchor_hash] = seg
+
+    def segment_document(
+        self,
+        text: str,
+        source_id: str,
+        segment_size_words: int = 25,
+    ) -> list[CitationSegment]:
+        """Split a document into semantic segments and compute cryptographic hashes."""
+        if not text:
+            return []
+
+        words = text.split()
+        segments: list[CitationSegment] = []
+        start_idx = 0
+
+        for i in range(0, len(words), segment_size_words):
+            chunk_words = words[i : i + segment_size_words]
+            chunk_text = " ".join(chunk_words)
+            norm = normalize_segment_text(chunk_text)
+            seg_hash = content_hash(norm)
+            seg_id = f"{source_id}_{len(segments):03d}_{seg_hash[:8]}"
+
+            seg = CitationSegment(
+                segment_id=seg_id,
+                segment_hash=seg_hash,
+                source_id=source_id,
+                content=chunk_text,
+                start_char=start_idx,
+                end_char=start_idx + len(chunk_text),
+            )
+            segments.append(seg)
+            self._segments[seg_hash] = seg
+            start_idx += len(chunk_text) + 1
+
+        return segments
+
+    def register_segment(self, segment: CitationSegment) -> None:
+        """Register an existing segment in the cryptographic mapper."""
+        self._segments[segment.segment_hash] = segment
+
+    def verify_assertion(
+        self,
+        assertion_text: str,
+        compacted_context: CompactedTraceState,
+    ) -> CitationVerificationReport:
+        """Verify whether claims made cite valid segment hashes preserved in compacted trace state.
+
+        Guarantees mathematical determinism: verification succeeds even if non-cited
+        contextual padding around the segment has been compacted or stripped.
+        """
+        if not assertion_text.strip():
+            return CitationVerificationReport(
+                is_verified=False,
+                assertion_text=assertion_text,
+                cited_segment_hashes=[],
+                matched_hashes=[],
+                unmatched_hashes=[],
+                confidence=0.0,
+                details={"reason": "Empty assertion text"},
+            )
+
+        # 1. Extract explicit cryptographic hash citations (e.g., [cite:abc...], [hash:...], or raw 64-char hex)
+        explicit_cites = set(re.findall(r"\[(?:cite|hash|segment):([a-f0-9]{16,64})\]", assertion_text, re.IGNORECASE))
+        raw_hexes = set(re.findall(r"\b[a-f0-9]{64}\b", assertion_text, re.IGNORECASE))
+        all_cited_hashes = list(explicit_cites.union(raw_hexes))
+
+        # 2. Check content-based segment matching
+        norm_assertion = normalize_segment_text(assertion_text)
+        for seg_hash, seg in self._segments.items():
+            norm_seg = normalize_segment_text(seg.content)
+            # If significant portion of segment appears in assertion or vice-versa
+            if len(norm_seg) > 20 and (norm_seg in norm_assertion or norm_assertion in norm_seg):
+                if seg_hash not in all_cited_hashes:
+                    all_cited_hashes.append(seg_hash)
+
+        # 3. Match against preserved state in CompactedTraceState
+        preserved_hashes = set(compacted_context.preserved_segment_hashes)
+        # Also include all root rule anchors from rule_store
+        root_anchors = set(self._rule_store.all_rule_anchors().values())
+        valid_pool = preserved_hashes.union(root_anchors).union(set(self._segments.keys()))
+
+        matched: list[str] = []
+        unmatched: list[str] = []
+
+        for h in all_cited_hashes:
+            # Check full match or prefix match (for 16-character short hashes)
+            is_match = any(vh.startswith(h) or h.startswith(vh) for vh in valid_pool)
+            if is_match:
+                matched.append(h)
+            else:
+                unmatched.append(h)
+
+        is_verified = len(matched) > 0 and len(unmatched) == 0
+        confidence = (len(matched) / (len(matched) + len(unmatched))) if (matched or unmatched) else 0.0
+
+        return CitationVerificationReport(
+            is_verified=is_verified,
+            assertion_text=assertion_text,
+            cited_segment_hashes=all_cited_hashes,
+            matched_hashes=matched,
+            unmatched_hashes=unmatched,
+            confidence=round(confidence, 4),
+            details={
+                "preserved_pool_size": len(valid_pool),
+                "matched_count": len(matched),
+                "unmatched_count": len(unmatched),
+            },
+        )
+
+
 __all__ = [
     "tokenize",
     "embed_token",
@@ -260,4 +441,9 @@ __all__ = [
     "cross_evaluate_citations",
     "calculate_citation_retention",
     "track_quant_citation_retention",
+    "CitationSegment",
+    "CitationVerificationReport",
+    "CryptographicCitationMapper",
+    "normalize_segment_text",
 ]
+

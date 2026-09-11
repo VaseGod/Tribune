@@ -58,6 +58,19 @@ def _doc_text(rule: Rule) -> str:
     return f"{rule.title}. {rule.description} {rule.text}"
 
 
+def canonical_rule_repr(rule: Rule) -> str:
+    """Deterministic, canonical serialization of a statutory rule for cryptographic anchoring."""
+    return (
+        f"CRITERION:{rule.criterion_id}|REQUIRED:{rule.required}|"
+        f"SOURCE:{rule.source}|TITLE:{rule.title}|DESC:{rule.description}|TEXT:{rule.text}"
+    )
+
+
+def rule_cryptographic_anchor(rule: Rule) -> str:
+    """Compute immutable SHA-256 root cryptographic anchor for a canonical rule representation."""
+    return hashlib.sha256(canonical_rule_repr(rule).encode("utf-8")).hexdigest()
+
+
 class LocalRuleStore:
     """In-repo rule store backed by deterministic late-interaction retrieval and filterable HNSW indexing."""
 
@@ -67,6 +80,7 @@ class LocalRuleStore:
         self._retriever = LateInteractionRetriever()
         self._hnsw_index = FilterableHNSWIndex(dim=96)
         self._rule_lookup: dict[str, Rule] = {}
+        self._anchored_rule_hashes: dict[str, str] = {}
         self.engram_store = StatutoryEngramRAMStore()
         self._cleared = False
 
@@ -77,6 +91,11 @@ class LocalRuleStore:
                 text = _doc_text(rule)
                 self._rule_lookup[doc_key] = rule
                 self._retriever.index(doc_key, text)
+
+                # Store immutable root cryptographic anchor
+                anchor = rule_cryptographic_anchor(rule)
+                self._anchored_rule_hashes[rule.criterion_id] = anchor
+                self._anchored_rule_hashes[doc_key] = anchor
 
                 # Index in filterable HNSW with rich statutory metadata
                 dense_vec = embed_dense(text)
@@ -91,13 +110,27 @@ class LocalRuleStore:
                         "statutory_level": "federal" if "CFR" in rule.source or "USC" in rule.source else "state",
                         "effective_year": 2026,
                         "title": rule.title,
+                        "cryptographic_anchor": anchor,
                     },
                 )
+
+    def get_rule_anchor(self, criterion_id: str) -> str | None:
+        """Retrieve the immutable SHA-256 cryptographic anchor for a statutory criterion."""
+        if self._cleared:
+            return None
+        return self._anchored_rule_hashes.get(criterion_id)
+
+    def all_rule_anchors(self) -> dict[str, str]:
+        """Return all registered criterion cryptographic root anchors."""
+        if self._cleared:
+            return {}
+        return dict(self._anchored_rule_hashes)
 
     def clear(self) -> None:
         """Clear all indexed rules to serve as an unskilled/empty baseline store."""
         self._cleared = True
         self._rule_lookup.clear()
+        self._anchored_rule_hashes.clear()
         self._retriever = LateInteractionRetriever()
         self._hnsw_index = FilterableHNSWIndex(dim=96)
 
@@ -535,5 +568,7 @@ __all__ = [
     "StatutoryEngramRAMStore",
     "make_rule_store",
     "ruleset_fingerprint",
+    "canonical_rule_repr",
+    "rule_cryptographic_anchor",
 ]
 

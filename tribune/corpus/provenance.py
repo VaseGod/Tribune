@@ -312,6 +312,220 @@ def verify_c2pa_manifest(
     return manifest.signature_hash == expected_sig
 
 
+# --------------------------------------------------------------------------- #
+# Trace-as-State Context Compaction Engine
+# --------------------------------------------------------------------------- #
+
+import enum
+import json
+import time
+from collections import defaultdict
+
+
+class ProvenanceNodeType(str, enum.Enum):
+    ACTION = "action"
+    OBSERVATION = "observation"
+    REASONING = "reasoning"
+    TOOL_DISPATCH = "tool_dispatch"
+    ENVIRONMENT_DELTA = "environment_delta"
+
+
+class ProvenanceNode(StrictModel):
+    """Discrete graph-based provenance node representing an agent trace event."""
+
+    node_id: str
+    turn: int
+    node_type: ProvenanceNodeType | str
+    content: str
+    content_hash: str
+    parent_ids: list[str] = Field(default_factory=list)
+    environmental_constraints: dict[str, Any] = Field(default_factory=dict)
+    file_mutations: list[dict[str, str]] = Field(default_factory=list)
+    permission_changes: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    timestamp: float = Field(default_factory=time.time)
+
+
+class CompactedTraceState(StrictModel):
+    """Serialized and compacted multi-turn agent state preserving critical invariant deltas."""
+
+    compacted_summary: str
+    state_delta_hash: str
+    original_node_count: int
+    compacted_node_count: int
+    preserved_constraints: dict[str, Any]
+    preserved_file_mutations: list[dict[str, str]]
+    preserved_permission_changes: list[dict[str, Any]]
+    preserved_segment_hashes: list[str] = Field(default_factory=list)
+    estimated_tokens: int = 0
+    serialized_context: str = ""
+
+
+class TraceAsStateEngine:
+    """Graph-based agent trajectory tracker with invariant-preserving compaction."""
+
+    def __init__(self) -> None:
+        self._nodes: dict[str, ProvenanceNode] = {}
+        self._children: dict[str, list[str]] = defaultdict(list)
+
+    def add_node(
+        self,
+        turn: int,
+        node_type: ProvenanceNodeType | str,
+        content: str,
+        parent_ids: list[str] | None = None,
+        environmental_constraints: dict[str, Any] | None = None,
+        file_mutations: list[dict[str, str]] | None = None,
+        permission_changes: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+        node_id: str | None = None,
+    ) -> ProvenanceNode:
+        """Create and index a discrete provenance node in the execution graph."""
+        c_hash = content_hash(f"{turn}:{node_type}:{content}")
+        n_id = node_id or f"node_{turn}_{c_hash[:10]}"
+        p_ids = parent_ids or []
+
+        node = ProvenanceNode(
+            node_id=n_id,
+            turn=turn,
+            node_type=node_type,
+            content=content,
+            content_hash=c_hash,
+            parent_ids=p_ids,
+            environmental_constraints=environmental_constraints or {},
+            file_mutations=file_mutations or [],
+            permission_changes=permission_changes or [],
+            metadata=metadata or {},
+            timestamp=time.time(),
+        )
+
+        self._nodes[n_id] = node
+        for p in p_ids:
+            self._children[p].append(n_id)
+
+        return node
+
+    def compact_trace_history(
+        self,
+        nodes: list[ProvenanceNode],
+        max_token_budget: int = 1000,
+    ) -> CompactedTraceState:
+        """Distill historical multi-turn actions into state delta summaries.
+
+        Strictly preserves:
+        1. Active environmental constraints (merged across turns, latest wins).
+        2. File-path mutations (complete cumulative history of changes).
+        3. Permission changes (cumulative access boundary deltas).
+        4. Cryptographic segment hashes (for grounding and verification).
+        """
+        if not nodes:
+            return CompactedTraceState(
+                compacted_summary="No trace history.",
+                state_delta_hash=content_hash("EMPTY_TRACE"),
+                original_node_count=0,
+                compacted_node_count=0,
+                preserved_constraints={},
+                preserved_file_mutations=[],
+                preserved_permission_changes=[],
+                preserved_segment_hashes=[],
+                estimated_tokens=5,
+                serialized_context="=== COMPACTED TRACE-AS-STATE: EMPTY ===",
+            )
+
+        # 1. Aggregate invariants that must NEVER be lost across compaction boundaries
+        preserved_constraints: dict[str, Any] = {}
+        preserved_file_mutations: list[dict[str, str]] = []
+        preserved_permission_changes: list[dict[str, Any]] = []
+        preserved_segment_hashes: set[str] = set()
+
+        turns_present = sorted({n.turn for n in nodes})
+        latest_turn = max(turns_present)
+
+        for n in nodes:
+            # Merge constraints
+            if n.environmental_constraints:
+                preserved_constraints.update(n.environmental_constraints)
+            # Accumulate file mutations
+            if n.file_mutations:
+                for m in n.file_mutations:
+                    if m not in preserved_file_mutations:
+                        preserved_file_mutations.append(m)
+            # Accumulate permission changes
+            if n.permission_changes:
+                for p in n.permission_changes:
+                    if p not in preserved_permission_changes:
+                        preserved_permission_changes.append(p)
+            # Track cryptographic hashes
+            preserved_segment_hashes.add(n.content_hash)
+            if "segment_hash" in n.metadata:
+                preserved_segment_hashes.add(str(n.metadata["segment_hash"]))
+
+        # 2. Algorithmic distillation: older turns are summarized, recent turn in full
+        summary_lines: list[str] = []
+        for t in turns_present:
+            turn_nodes = [n for n in nodes if n.turn == t]
+            if t < latest_turn:
+                # Distill turn
+                actions = [n for n in turn_nodes if n.node_type in (ProvenanceNodeType.ACTION, "action", ProvenanceNodeType.TOOL_DISPATCH, "tool_dispatch")]
+                obs = [n for n in turn_nodes if n.node_type in (ProvenanceNodeType.OBSERVATION, "observation")]
+                reasons = [n for n in turn_nodes if n.node_type in (ProvenanceNodeType.REASONING, "reasoning")]
+
+                act_summary = f"{len(actions)} actions" if actions else "no actions"
+                obs_summary = f"{len(obs)} observations" if obs else "no observations"
+                key_actions = ", ".join(n.content[:40] for n in actions[:2])
+                summary_lines.append(
+                    f"Turn {t}: {act_summary} ({key_actions}), {obs_summary}. "
+                    f"Reasoning gist: {reasons[0].content[:60] if reasons else 'none'}"
+                )
+            else:
+                # Latest turn kept in higher fidelity
+                summary_lines.append(f"Turn {t} (Active):")
+                for n in turn_nodes:
+                    summary_lines.append(f"  [{n.node_type}] {n.content}")
+
+        compacted_summary = "\n".join(summary_lines)
+
+        # 3. Compute deterministic state delta hash
+        hash_payload = (
+            f"CONSTRAINTS:{json.dumps(preserved_constraints, sort_keys=True)}|"
+            f"MUTATIONS:{json.dumps(preserved_file_mutations, sort_keys=True)}|"
+            f"PERMISSIONS:{json.dumps(preserved_permission_changes, sort_keys=True)}|"
+            f"SEGMENTS:{':'.join(sorted(preserved_segment_hashes))}"
+        )
+        state_delta_h = content_hash(hash_payload)
+
+        # 4. Construct serialized context representation
+        serialized_context = (
+            f"=== COMPACTED TRACE-AS-STATE (DELTA HASH: {state_delta_h[:16]}) ===\n"
+            f"[ACTIVE CONSTRAINTS]: {json.dumps(preserved_constraints)}\n"
+            f"[FILE MUTATIONS]: {json.dumps(preserved_file_mutations)}\n"
+            f"[PERMISSIONS]: {json.dumps(preserved_permission_changes)}\n"
+            f"[HISTORICAL TRACE SUMMARY]:\n{compacted_summary}\n"
+            f"============================================================"
+        )
+
+        estimated_tokens = max(1, len(serialized_context) // 4)
+
+        return CompactedTraceState(
+            compacted_summary=compacted_summary,
+            state_delta_hash=state_delta_h,
+            original_node_count=len(nodes),
+            compacted_node_count=len(summary_lines),
+            preserved_constraints=preserved_constraints,
+            preserved_file_mutations=preserved_file_mutations,
+            preserved_permission_changes=preserved_permission_changes,
+            preserved_segment_hashes=sorted(preserved_segment_hashes),
+            estimated_tokens=estimated_tokens,
+            serialized_context=serialized_context,
+        )
+
+    def prepend_to_context(self, prompt: str, compacted_state: CompactedTraceState) -> str:
+        """Prepend serialized compacted trace state directly to system evaluation prompt."""
+        if not compacted_state or not compacted_state.serialized_context:
+            return prompt
+        return f"{compacted_state.serialized_context}\n\n{prompt.strip()}"
+
+
 __all__ = [
     "anonymize",
     "content_hash",
@@ -324,6 +538,11 @@ __all__ = [
     "C2PAManifest",
     "sign_c2pa_manifest",
     "verify_c2pa_manifest",
+    "ProvenanceNodeType",
+    "ProvenanceNode",
+    "CompactedTraceState",
+    "TraceAsStateEngine",
 ]
+
 
 
