@@ -33,6 +33,7 @@ from ..types import (
 )
 from . import programs as labelers
 from .programs.base import build_all_evidence
+from ..clients.routing import TieredRoutingGateway
 
 _DEFAULTS = dict(
     household_size=1,
@@ -554,8 +555,9 @@ class ScenarioAgent:
 class DualAgentScenarioMiner:
     """Orchestrates ResearchAgent and ScenarioAgent to generate complex synthetic test environments."""
 
-    def __init__(self, seed: int = 7) -> None:
+    def __init__(self, seed: int = 7, gateway: TieredRoutingGateway | None = None) -> None:
         self.seed = seed
+        self.gateway = gateway or TieredRoutingGateway()
         self.research_agent = ResearchAgent()
         self.scenario_agent = ScenarioAgent(seed=seed, research_agent=self.research_agent)
 
@@ -614,13 +616,29 @@ class SyntheticCaseGenerator:
     """High-assurance synthetic case generator backed by the Dual-Agent Scenario Mining architecture."""
 
     routing_intent: str = "synthetic_casegen"
-    default_engine: str = "DeepSeek V4 Pro"
+    default_engine: str = "glm-5.3-flash"
 
-    def __init__(self, seed: int = 7) -> None:
+    def __init__(self, seed: int = 7, gateway: TieredRoutingGateway | None = None) -> None:
         self.seed = seed
-        self.miner = DualAgentScenarioMiner(seed=seed)
+        self.gateway = gateway or TieredRoutingGateway()
+        self.miner = DualAgentScenarioMiner(seed=seed, gateway=self.gateway)
         self.research_agent = self.miner.research_agent
         self.scenario_agent = self.miner.scenario_agent
+
+    def generate_bulk_variations(
+        self,
+        base_prompt: str,
+        n_variations: int = 5,
+        target_program: ProgramId = ProgramId.SNAP,
+        counterfactual_constraints: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate bulk scenario permutations routed to cost-deflated open MoE backends (GLM-5.3-Flash)."""
+        return self.gateway.generate_bulk_scenarios(
+            base_scenario_prompt=base_prompt,
+            n_variations=n_variations,
+            target_program=target_program.value,
+            counterfactual_constraints=counterfactual_constraints,
+        )
 
     def build_case(
         self,

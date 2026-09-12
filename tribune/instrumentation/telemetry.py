@@ -32,6 +32,10 @@ class TelemetryRecord:
     latency_ms: float
     cost_usd: float
     backend_id: str | None = None
+    cache_hit_ratio: float = 0.0
+    active_experts: int | None = None
+    early_exit_step: int | None = None
+    tokens_saved_estimate: int = 0
     extra_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -53,6 +57,10 @@ class TelemetryMetricsStore:
         role: str = "general",
         accounting_date: date | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        active_experts: int | None = None,
+        cache_hit_ratio: float | None = None,
+        early_exit_step: int | None = None,
+        tokens_saved_estimate: int = 0,
     ) -> TelemetryRecord:
         on_date = accounting_date or date.today()
 
@@ -63,12 +71,19 @@ class TelemetryMetricsStore:
             tokens_input=input_tokens,
             tokens_output=output_tokens,
             cache_read_tokens=cached_tokens,
+            active_experts=active_experts,
         )
 
         cost_usd, backend_id = self.cost_model.cost_of_call(call_usage, on_date)
 
+        computed_cache_hit_ratio = (
+            cache_hit_ratio
+            if cache_hit_ratio is not None
+            else (round(cached_tokens / max(1, input_tokens + cached_tokens), 4) if (input_tokens + cached_tokens) > 0 else 0.0)
+        )
+
         rec = TelemetryRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="microseconds"),
             provider_name=provider_name,
             model=model,
             role=role,
@@ -78,6 +93,10 @@ class TelemetryMetricsStore:
             latency_ms=latency_ms,
             cost_usd=cost_usd,
             backend_id=backend_id,
+            cache_hit_ratio=computed_cache_hit_ratio,
+            active_experts=active_experts,
+            early_exit_step=early_exit_step,
+            tokens_saved_estimate=tokens_saved_estimate,
             extra_metadata=extra_metadata or {},
         )
         self.records.append(rec)

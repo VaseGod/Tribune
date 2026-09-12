@@ -10,12 +10,17 @@ Extends synthetic case generation into a dynamic, real-time multimodal depositio
 
 from __future__ import annotations
 
+import copy
 import enum
 import logging
 import secrets
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from .conformal import ConformalCalibrator, ConformalScoreType
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +311,271 @@ class WitnessDepositionSimulator:
             return "Yes, that accurately reflects my employment history during that calendar quarter."
 
 
+# --------------------------------------------------------------------------- #
+# Conformal Runtime Verification Engine & State Rollback Mechanics
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class SimulationTurn:
+    """A discrete turn within a multi-turn case or courtroom simulation trajectory."""
+
+    step: int
+    action: str
+    speaker: str = "agent"
+    statement: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    )
+
+
+class SimulationState:
+    """Transactional simulation state with snapshotting and atomic rollback capabilities."""
+
+    def __init__(
+        self,
+        case_id: str,
+        initial_facts: dict[str, Any] | None = None,
+        initial_exhibits: dict[str, Any] | None = None,
+    ) -> None:
+        self.case_id = case_id
+        self.step: int = 0
+        self.facts: dict[str, Any] = dict(initial_facts or {})
+        self.exhibits: dict[str, Any] = dict(initial_exhibits or {})
+        self.committed_turns: list[SimulationTurn] = []
+        self._uncommitted_mutations: dict[str, Any] = {}
+        self._uncommitted_turn: SimulationTurn | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        """Create an immutable snapshot of the committed state for atomic rollback."""
+        return {
+            "case_id": self.case_id,
+            "step": self.step,
+            "facts": copy.deepcopy(self.facts),
+            "exhibits": copy.deepcopy(self.exhibits),
+            "committed_turns": list(self.committed_turns),
+        }
+
+    def stage_mutation(self, turn: SimulationTurn) -> None:
+        """Stage proposed mutations from turn without committing them."""
+        self._uncommitted_turn = turn
+        self._uncommitted_mutations = copy.deepcopy(turn.data)
+
+    def commit(self) -> None:
+        """Commit staged mutations into verified state."""
+        if self._uncommitted_turn is not None:
+            self.facts.update(self._uncommitted_mutations)
+            self.committed_turns.append(self._uncommitted_turn)
+            self.step += 1
+            self._uncommitted_turn = None
+            self._uncommitted_mutations = {}
+
+    def rollback(self, snapshot: dict[str, Any]) -> None:
+        """Atomically restore state to snapshot, discarding all uncommitted mutations."""
+        self.case_id = snapshot["case_id"]
+        self.step = snapshot["step"]
+        self.facts = copy.deepcopy(snapshot["facts"])
+        self.exhibits = copy.deepcopy(snapshot["exhibits"])
+        self.committed_turns = list(snapshot["committed_turns"])
+        self._uncommitted_turn = None
+        self._uncommitted_mutations = {}
+
+
+@dataclass
+class TrajectoryOutcome:
+    """Result of a real-time gated simulation trajectory run."""
+
+    trajectory_id: str
+    status: str  # "Completed" | "Interrupted (CRC Fault at Step {t})"
+    turns_executed: int
+    max_turns: int
+    tokens_burned: int
+    tokens_saved: int
+    early_exit_step: int | None
+    transition_scores: list[float]
+    final_state: SimulationState
+    interrupted: bool = False
+    fault_score: float | None = None
+    cutoff_threshold: float = 0.80
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class SimulationEngine:
+    """Simulation engine enforcing real-time Conformal Risk Control (CRC) gating.
+
+    Intercepts statutory invariant breaches inline at step 3 or 4, performing clean
+    state rollbacks and logging token savings rather than burning 100% of trajectory tokens.
+    """
+
+    def __init__(
+        self,
+        world_model: Any,
+        calibrator: ConformalCalibrator | None = None,
+        conformal_threshold: float | None = None,
+        usage_recorder: Any = None,
+        max_turns: int = 12,
+        tokens_per_turn: int = 500,
+    ) -> None:
+        self.world_model = world_model
+        self.calibrator = calibrator or ConformalCalibrator(alpha=0.10, delta=0.05)
+        self.usage_recorder = usage_recorder
+        self.max_turns = max_turns
+        self.tokens_per_turn = tokens_per_turn
+
+        if conformal_threshold is not None:
+            self.conformal_threshold = conformal_threshold
+        elif hasattr(self.calibrator, "_last_result") and self.calibrator._last_result is not None:
+            self.conformal_threshold = self.calibrator._last_result.padded_threshold
+        else:
+            # Calibrate on baseline traces
+            traces = self.calibrator.generate_calibration_traces(n=500, world_model=self.world_model)
+            cal_res = self.calibrator.calibrate(traces, alpha=0.10, delta=0.05)
+            self.conformal_threshold = cal_res.padded_threshold
+
+    def run_trajectory(
+        self,
+        initial_state: SimulationState,
+        proposed_turns: list[SimulationTurn] | list[dict[str, Any]] | Iterator[SimulationTurn],
+    ) -> TrajectoryOutcome:
+        """Run sequential trajectory with inline conformal verification and state rollback.
+
+        At each turn t:
+        1. Takes pre-turn snapshot.
+        2. Stages turn mutation.
+        3. Calls world_model.score_transition(current_state, proposed_turn).
+        4. Compares against calibrated threshold lambda_hat_padded.
+        5. If valid: commits mutation and proceeds.
+        6. If breached: immediately halts, rolls back uncommitted changes, logs to usage recorder,
+           annotates trajectory as 'Interrupted (CRC Fault at Step t)', and exits.
+        """
+        trajectory_id = f"traj_{secrets.token_hex(6)}"
+        state = initial_state
+        turns_list: list[SimulationTurn] = []
+
+        if isinstance(proposed_turns, list):
+            for i, t in enumerate(proposed_turns):
+                if isinstance(t, SimulationTurn):
+                    turns_list.append(t)
+                else:
+                    turns_list.append(
+                        SimulationTurn(
+                            step=i + 1,
+                            action=t.get("action", "unknown_action"),
+                            speaker=t.get("speaker", "agent"),
+                            statement=t.get("statement", ""),
+                            data=t,
+                        )
+                    )
+        else:
+            for i, t in enumerate(proposed_turns):
+                if isinstance(t, SimulationTurn):
+                    turns_list.append(t)
+                else:
+                    turns_list.append(
+                        SimulationTurn(
+                            step=i + 1,
+                            action=t.get("action", "unknown_action"),
+                            speaker=t.get("speaker", "agent"),
+                            statement=t.get("statement", ""),
+                            data=t,
+                        )
+                    )
+
+        total_turns = min(len(turns_list), self.max_turns)
+        transition_scores: list[float] = []
+        tokens_burned = 0
+
+        for t_idx in range(total_turns):
+            turn = turns_list[t_idx]
+            current_step = t_idx + 1
+
+            # 1. Take clean state snapshot
+            snapshot = state.snapshot()
+
+            # 2. Stage mutation
+            state.stage_mutation(turn)
+
+            # 3. Call world_model.score_transition(current_state, proposed_turn)
+            score = self.world_model.score_transition(state, turn)
+            transition_scores.append(score)
+
+            # 4. Compare against calibrated threshold
+            is_valid = self.calibrator.is_valid(
+                score=score,
+                threshold=self.conformal_threshold,
+                score_type=self.calibrator.score_type,
+            )
+
+            if is_valid:
+                # 5a. Valid: Commit mutation and burn turn tokens
+                state.commit()
+                tokens_burned += self.tokens_per_turn
+                if self.usage_recorder is not None and hasattr(self.usage_recorder, "record_turn"):
+                    self.usage_recorder.record_turn(role=turn.speaker)
+            else:
+                # 5b. Breached: Trigger immediate CRC fault interception
+                state.rollback(snapshot)
+
+                # Burn partial tokens for the intercepted turn evaluation
+                tokens_burned += int(self.tokens_per_turn * 0.35)
+                remaining_turns = self.max_turns - current_step
+                tokens_saved = remaining_turns * self.tokens_per_turn
+
+                fault_annotation = f"Interrupted (CRC Fault at Step {current_step})"
+
+                # Record early termination to usage telemetry
+                if self.usage_recorder is not None and hasattr(self.usage_recorder, "record_crc_early_exit"):
+                    self.usage_recorder.record_crc_early_exit(
+                        early_exit_step=current_step,
+                        max_steps=self.max_turns,
+                        tokens_per_step_estimate=self.tokens_per_turn,
+                        details={
+                            "trajectory_id": trajectory_id,
+                            "fault_score": score,
+                            "threshold": self.conformal_threshold,
+                            "action": turn.action,
+                            "speaker": turn.speaker,
+                        },
+                    )
+
+                return TrajectoryOutcome(
+                    trajectory_id=trajectory_id,
+                    status=fault_annotation,
+                    turns_executed=current_step,
+                    max_turns=self.max_turns,
+                    tokens_burned=tokens_burned,
+                    tokens_saved=tokens_saved,
+                    early_exit_step=current_step,
+                    transition_scores=transition_scores,
+                    final_state=state,
+                    interrupted=True,
+                    fault_score=score,
+                    cutoff_threshold=self.conformal_threshold,
+                    metadata={
+                        "breach_step": current_step,
+                        "breach_action": turn.action,
+                        "rollback_executed": True,
+                    },
+                )
+
+        # Full completion without invariant breaches
+        return TrajectoryOutcome(
+            trajectory_id=trajectory_id,
+            status="Completed",
+            turns_executed=total_turns,
+            max_turns=self.max_turns,
+            tokens_burned=tokens_burned,
+            tokens_saved=0,
+            early_exit_step=None,
+            transition_scores=transition_scores,
+            final_state=state,
+            interrupted=False,
+            cutoff_threshold=self.conformal_threshold,
+            metadata={"all_steps_verified": True},
+        )
+
+
 __all__ = [
     "FacialExpression",
     "QuestionPressure",
@@ -315,4 +585,9 @@ __all__ = [
     "FalMiniMaxStreamingClient",
     "WitnessDepositionSimulator",
     "DepositionTurnResult",
+    "SimulationTurn",
+    "SimulationState",
+    "TrajectoryOutcome",
+    "SimulationEngine",
 ]
+

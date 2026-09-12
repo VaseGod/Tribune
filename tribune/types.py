@@ -367,6 +367,10 @@ class ModelCallUsage(StrictModel):
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     estimated: bool = False
+    active_experts: int | None = None
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    )
 
 
 class TaskUsage(BaseModel):
@@ -389,6 +393,11 @@ class TaskUsage(BaseModel):
     tokens_output: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    cache_hit_ratio: float = 0.0
+    active_experts: int | None = None
+    early_exit_step: int | None = None
+    tokens_saved_estimate: int = 0
+    crc_breach_events: list[dict[str, Any]] = Field(default_factory=list)
     calls: list[ModelCallUsage] = Field(default_factory=list)
     tokenizer_ids: list[str] = Field(default_factory=list)
     estimated: bool = False
