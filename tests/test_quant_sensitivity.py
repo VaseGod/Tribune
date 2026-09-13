@@ -260,3 +260,56 @@ def test_qwen3_8_flash_next_offload_ladder_and_benchmarks():
     assert cost_info["cost_per_1k"] > 0
 
 
+def test_hdm_tak_quantization_memory_reduction_and_fidelity():
+    """Verify Task-Aware Knapsack (TAK) quantization achieves ~85%+ memory reduction and >=0.99 fidelity."""
+    import numpy as np
+    from tribune.memory.hdm import (
+        HDMMemory,
+        HDMTier,
+        HierarchicalDocumentaryMemory,
+        TAKQuantizer,
+    )
+
+    # 1. Backward-compatible documentary memory interface
+    doc_mem = HierarchicalDocumentaryMemory()
+    u = doc_mem.store_document("doc_l0", HDMTier.L0_GLOBAL, "Invariant", "Strict bounds", "src/invariants.py")
+    assert u.doc_id == "doc_l0"
+    assert doc_mem.get_unit("doc_l0") is not None
+
+    # 2. HDM Vector operations
+    hdm = HDMMemory(input_dim=128, hd_dim=2048, seed=42)
+    assert hdm.is_quantized is False
+
+    v_income = hdm.store("snap_income", "SNAP Gross Income Standard <= 130% Federal Poverty Line")
+    v_assets = hdm.store("snap_assets", "SNAP Liquid Assets standard $3,000 threshold")
+    v_medicaid = hdm.store("medicaid_magi", "Medicaid MAGI household income test")
+
+    assert v_income.shape == (2048,)
+    sim_unquant = hdm.similarity(v_income, v_assets)
+    assert -1.0 <= sim_unquant <= 1.0
+
+    # HDC binding and bundling
+    bound = hdm.bind(v_income, v_assets)
+    assert bound.shape == (2048,)
+    bundled = hdm.bundle([v_income, v_assets, v_medicaid])
+    assert bundled.shape == (2048,)
+
+    # 3. Task-Aware Knapsack Quantization
+    cal_data = np.random.default_rng(123).standard_normal((150, 128)).astype(np.float32)
+    stats = hdm.quantize(calibration_data=cal_data, high_precision_ratio=0.14)
+
+    assert hdm.is_quantized is True
+    # Memory reduction target ~85%+ (achieved ~87%)
+    assert stats["memory_reduction_ratio"] >= 0.85
+    assert hdm.memory_reduction_ratio >= 0.85
+
+    # Cosine fidelity target >= 0.99
+    assert stats["cosine_fidelity"] >= 0.99
+
+    # 4. Decoding and retrieval under quantized projection
+    decoded = hdm.decode(v_income, top_k=2)
+    assert len(decoded) == 2
+    assert decoded[0][0] == "snap_income"
+    assert decoded[0][1] >= 0.99
+
+

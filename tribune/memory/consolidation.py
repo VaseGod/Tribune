@@ -8,14 +8,20 @@ records past their TTL — useful for a deployment that wants case data to expir
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..types import Assessment, Evidence, EvidenceType
 from .partitions import CasePartition
+
+logger = logging.getLogger(__name__)
 
 LONGITUDINAL = "longitudinal"
 EVIDENCE = "evidence"
@@ -491,5 +497,228 @@ class VRAMProtectionGate:
                 consolidator.consolidate_evidence()
             return new_ubatch, True
         return current_ubatch_size, False
+
+
+# --------------------------------------------------------------------------- #
+# Recursive Language Model (RLM) Provenance Compaction & Memory Traces
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ProvenanceNode:
+    """Lineage metadata node representing a verified content chunk with SHA-256 provenance."""
+
+    source_id: str
+    chunk_index: int
+    content_hash: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    node_id: str = ""
+
+    @classmethod
+    def from_chunk(
+        cls,
+        source_id: str,
+        chunk_index: int,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> ProvenanceNode:
+        """Create a provenance node with deterministic SHA-256 chunk hash."""
+        c_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        n_id = f"{source_id}:{chunk_index}:{c_hash[:8]}"
+        return cls(
+            source_id=source_id,
+            chunk_index=chunk_index,
+            content_hash=c_hash,
+            metadata=metadata or {},
+            node_id=n_id,
+        )
+
+
+@dataclass
+class ConsolidatedMemoryTrace:
+    """Hierarchical, recursive condensed context trace with citation linkage."""
+
+    trace_id: str
+    root_assertion: str
+    child_citations: list[ProvenanceNode] = field(default_factory=list)
+    confidence_score: float = 1.0
+    compaction_level: int = 0
+    sub_traces: list[ConsolidatedMemoryTrace] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def resolve_all_leaf_citations(self) -> list[ProvenanceNode]:
+        """Recursively traverse down trace hierarchy to retrieve all leaf ProvenanceNode citations."""
+        leaves: list[ProvenanceNode] = list(self.child_citations)
+        for sub in self.sub_traces:
+            leaves.extend(sub.resolve_all_leaf_citations())
+
+        # Deduplicate while preserving order
+        seen: set[tuple[str, int, str]] = set()
+        unique_leaves: list[ProvenanceNode] = []
+        for leaf in leaves:
+            key = (leaf.source_id, leaf.chunk_index, leaf.content_hash)
+            if key not in seen:
+                seen.add(key)
+                unique_leaves.append(leaf)
+        return unique_leaves
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trace_id": self.trace_id,
+            "root_assertion": self.root_assertion,
+            "child_citations_count": len(self.child_citations),
+            "confidence_score": self.confidence_score,
+            "compaction_level": self.compaction_level,
+            "sub_traces_count": len(self.sub_traces),
+        }
+
+
+class RecursiveTraceConsolidator:
+    """Hierarchical recursive context condensation engine.
+
+    Condenses subagent trace streams into multi-level ConsolidatedMemoryTrace trees,
+    preventing context dilution over long multi-turn sessions while preserving
+    verified cryptographic provenance.
+    """
+
+    def __init__(
+        self,
+        max_chunk_tokens: int = 500,
+        compaction_threshold_tokens: int = 1500,
+        branching_factor: int = 3,
+    ) -> None:
+        self.max_chunk_tokens = max_chunk_tokens
+        self.compaction_threshold_tokens = compaction_threshold_tokens
+        self.branching_factor = max(2, branching_factor)
+
+    def compact_subagent_traces(
+        self,
+        raw_traces: list[dict[str, Any]],
+        parent_context_hash: str,
+        compaction_level: int = 0,
+    ) -> ConsolidatedMemoryTrace:
+        """Hierarchically condense raw subagent traces into a ConsolidatedMemoryTrace.
+
+        Computes deterministic trace IDs hashing parent_context_hash + condensed trace text.
+        Aggregates provenance citations from child nodes with verified SHA-256 chunk hashes.
+        Supports recursive multi-level compaction (Level N+1 generated from Level N traces)
+        when trace count or token estimate exceeds thresholds.
+        """
+        if not raw_traces:
+            empty_root = "No subagent trace assertions recorded."
+            trace_id = hashlib.sha256(f"{parent_context_hash}:{empty_root}".encode()).hexdigest()
+            return ConsolidatedMemoryTrace(
+                trace_id=trace_id,
+                root_assertion=empty_root,
+                child_citations=[],
+                confidence_score=1.0,
+                compaction_level=compaction_level,
+            )
+
+        # 1. Parse and verify provenance nodes from raw traces
+        extracted_citations: list[ProvenanceNode] = []
+        extracted_assertions: list[str] = []
+        confidences: list[float] = []
+
+        for item in raw_traces:
+            source_id = str(item.get("source_id", "subagent_trace"))
+            chunk_index = int(item.get("chunk_index", 0))
+            content = str(item.get("content", item.get("text", item.get("assertion", ""))))
+
+            # Validate or compute content hash
+            computed_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            provided_hash = item.get("content_hash")
+            if provided_hash and provided_hash != computed_hash:
+                logger.warning(
+                    f"[RLM-PROVENANCE] Content hash verification mismatch: "
+                    f"provided={provided_hash} vs computed={computed_hash}"
+                )
+            content_hash_val = computed_hash
+
+            meta = dict(item.get("metadata", {}))
+            extracted_citations.append(
+                ProvenanceNode(
+                    source_id=source_id,
+                    chunk_index=chunk_index,
+                    content_hash=content_hash_val,
+                    metadata=meta,
+                    node_id=f"{source_id}:{chunk_index}:{content_hash_val[:8]}",
+                )
+            )
+            if content.strip():
+                extracted_assertions.append(content.strip())
+            if "confidence" in item:
+                confidences.append(float(item["confidence"]))
+
+        # 2. Check if recursive multi-level compaction is required
+        total_chars = sum(len(a) for a in extracted_assertions)
+        estimated_tokens = total_chars // 4
+
+        # If trace count or tokens exceed threshold and we have enough traces to group
+        if (
+            len(raw_traces) > self.branching_factor
+            or estimated_tokens > self.compaction_threshold_tokens
+        ) and len(raw_traces) > 1:
+            # Partition into chunks of size branching_factor
+            sub_traces: list[ConsolidatedMemoryTrace] = []
+            for i in range(0, len(raw_traces), self.branching_factor):
+                group = raw_traces[i : i + self.branching_factor]
+                group_hash = hashlib.sha256(f"{parent_context_hash}:group_{i}".encode()).hexdigest()
+                sub_trace = self.compact_subagent_traces(
+                    raw_traces=group,
+                    parent_context_hash=group_hash,
+                    compaction_level=compaction_level,
+                )
+                sub_traces.append(sub_trace)
+
+            # Synthesize root assertion from sub-traces
+            condensed_sub_assertions = [st.root_assertion for st in sub_traces]
+            root_assertion = f"[Level {compaction_level + 1} Compaction]: " + " | ".join(
+                condensed_sub_assertions
+            )
+
+            # Deterministic trace ID hashing parent_context_hash + condensed text
+            trace_id = hashlib.sha256(
+                f"{parent_context_hash}:{root_assertion}".encode()
+            ).hexdigest()
+
+            # Aggregate all child citations from sub-traces
+            all_child_citations: list[ProvenanceNode] = []
+            for st in sub_traces:
+                all_child_citations.extend(st.resolve_all_leaf_citations())
+
+            mean_conf = (
+                sum(st.confidence_score for st in sub_traces) / len(sub_traces)
+                if sub_traces
+                else 1.0
+            )
+
+            return ConsolidatedMemoryTrace(
+                trace_id=trace_id,
+                root_assertion=root_assertion,
+                child_citations=all_child_citations,
+                confidence_score=round(mean_conf, 4),
+                compaction_level=compaction_level + 1,
+                sub_traces=sub_traces,
+            )
+
+        # Base level compaction
+        root_assertion = (
+            " | ".join(extracted_assertions)
+            if extracted_assertions
+            else "Verified subagent findings."
+        )
+        trace_id = hashlib.sha256(
+            f"{parent_context_hash}:{root_assertion}".encode()
+        ).hexdigest()
+        mean_conf = sum(confidences) / len(confidences) if confidences else 1.0
+
+        return ConsolidatedMemoryTrace(
+            trace_id=trace_id,
+            root_assertion=root_assertion,
+            child_citations=extracted_citations,
+            confidence_score=round(mean_conf, 4),
+            compaction_level=compaction_level,
+        )
 
 

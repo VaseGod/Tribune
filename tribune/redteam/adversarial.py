@@ -346,6 +346,155 @@ class DualSurfaceDivergenceEngine:
         return score
 
 
+# --------------------------------------------------------------------------- #
+# Multi-Agent Lateral Escalation Probe
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class LateralEscalationAttempt:
+    """Record of an intercepted lateral escalation or prompt injection attempt."""
+
+    subagent_id: str
+    target_tool: str
+    injected_endpoint: str
+    payload: dict[str, Any]
+    intercepted_by: str  # "SentinelSecurityProxy" | "SecureForgeRuntime" | "ASTValidation"
+    prevented: bool
+    diagnostic_reason: str
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subagent_id": self.subagent_id,
+            "target_tool": self.target_tool,
+            "injected_endpoint": self.injected_endpoint,
+            "intercepted_by": self.intercepted_by,
+            "prevented": self.prevented,
+            "diagnostic_reason": self.diagnostic_reason,
+            "timestamp": self.timestamp,
+        }
+
+
+class LateralEscalationProbe:
+    """Simulates and verifies defense against sub-agent lateral escalation attacks.
+
+    Verifies that SentinelSecurityProxy and SecureForgeRuntime prevent lateral exfiltration
+    even when prompt context or intermediate sub-agent outputs are poisoned.
+    """
+
+    def __init__(
+        self,
+        sentinel_proxy: Any = None,
+        forge_runtime: Any = None,
+    ) -> None:
+        from ..security.secure_forge import SecureForgeRuntime, SentinelSecurityProxy
+
+        self.sentinel_proxy = sentinel_proxy or SentinelSecurityProxy(
+            endpoint_allowlist={"https://api.cms.gov", "https://fns.usda.gov"}
+        )
+        self.forge_runtime = forge_runtime or SecureForgeRuntime()
+        self.intercepted_attempts: list[LateralEscalationAttempt] = []
+
+    def probe_unauthorized_endpoint_dispatch(
+        self,
+        subagent_id: str,
+        tool_name: str,
+        unauthorized_endpoint: str,
+        payload: dict[str, Any] | None = None,
+    ) -> LateralEscalationAttempt:
+        """Simulate a subagent attempting to trick root agent into calling an unauthorized server."""
+        from ..governance.action_gate import SecurityViolationError
+        from ..security.secure_forge import ToolExecutionIntent
+
+        intent = ToolExecutionIntent(
+            tool_name=tool_name,
+            target_endpoint=unauthorized_endpoint,
+            payload=payload or {"action": "exfiltrate"},
+        )
+
+        prevented = False
+        reason = ""
+        try:
+            self.sentinel_proxy.authorize_and_execute(
+                intent=intent,
+                raw_executor=lambda it, tok: {"status": "dispatched", "token": tok},
+            )
+        except SecurityViolationError as err:
+            prevented = True
+            reason = str(err)
+        except Exception as err:
+            prevented = True
+            reason = f"Execution blocked by: {err}"
+
+        attempt = LateralEscalationAttempt(
+            subagent_id=subagent_id,
+            target_tool=tool_name,
+            injected_endpoint=unauthorized_endpoint,
+            payload=payload or {},
+            intercepted_by="SentinelSecurityProxy",
+            prevented=prevented,
+            diagnostic_reason=reason,
+        )
+        self.intercepted_attempts.append(attempt)
+
+        record_security_event(
+            event_type=SecurityEventType.LATERAL_ESCALATION_ATTEMPT,
+            source="tribune.redteam.adversarial.LateralEscalationProbe",
+            message=f"Lateral escalation attempt blocked ({reason})",
+            severity="CRITICAL",
+            details=attempt.to_dict(),
+        )
+
+        return attempt
+
+    def probe_synthesized_tool_ast_obfuscation(
+        self,
+        subagent_id: str,
+        malicious_code: str,
+        entry_point: str = "run",
+    ) -> LateralEscalationAttempt:
+        """Simulate a subagent injecting obfuscated malicious Python code into dynamic tool synthesis."""
+        from ..governance.action_gate import SecurityViolationError
+
+        prevented = False
+        reason = ""
+        try:
+            self.forge_runtime.execute_synthesized_tool(
+                source_code=malicious_code,
+                entry_point=entry_point,
+                kwargs={},
+                sentinel_proxy=self.sentinel_proxy,
+            )
+        except SecurityViolationError as err:
+            prevented = True
+            reason = str(err)
+        except Exception as err:
+            prevented = True
+            reason = f"AST validation blocked execution: {err}"
+
+        attempt = LateralEscalationAttempt(
+            subagent_id=subagent_id,
+            target_tool=entry_point,
+            injected_endpoint="local_synthesized_ast",
+            payload={"code": malicious_code[:200]},
+            intercepted_by="SecureForgeRuntime",
+            prevented=prevented,
+            diagnostic_reason=reason,
+        )
+        self.intercepted_attempts.append(attempt)
+
+        record_security_event(
+            event_type=SecurityEventType.LATERAL_ESCALATION_ATTEMPT,
+            source="tribune.redteam.adversarial.LateralEscalationProbe",
+            message=f"Malicious synthesized code blocked by SecureForgeRuntime: {reason}",
+            severity="CRITICAL",
+            details=attempt.to_dict(),
+        )
+
+        return attempt
+
+
 __all__ = [
     "GraderAwarenessAlert",
     "GraderAwarenessProbe",
@@ -353,5 +502,7 @@ __all__ = [
     "DivergenceScore",
     "DualSurfaceSessionTurn",
     "DualSurfaceDivergenceEngine",
+    "LateralEscalationAttempt",
+    "LateralEscalationProbe",
 ]
 

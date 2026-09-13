@@ -34,6 +34,7 @@ class SecurityEventType(str, enum.Enum):
     GRADER_AWARENESS_ALERT = "GRADER_AWARENESS_ALERT"
     ASTRA_CLASS_CONTAINMENT_BREACH = "ASTRA_CLASS_CONTAINMENT_BREACH"
     SECURITY_VIOLATION = "SECURITY_VIOLATION"
+    LATERAL_ESCALATION_ATTEMPT = "LATERAL_ESCALATION_ATTEMPT"
 
 
 @dataclass
@@ -63,6 +64,12 @@ class SecurityAuditLogger:
         self._events: list[SecurityAuditEvent] = []
         self._governance_audit = governance_audit_log
         self._lock = threading.RLock()
+
+    @property
+    def events(self) -> list[SecurityAuditEvent]:
+        """Return shallow copy of recorded security events."""
+        with self._lock:
+            return list(self._events)
 
     def record_event(
         self,

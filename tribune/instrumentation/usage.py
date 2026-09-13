@@ -85,8 +85,7 @@ class UsageRecorder:
 
     def record_turn(self, role: str) -> None:
         if self._current is None:
-            self.start_task("simulation")
-        assert self._current is not None
+            return
         self._current.turns += 1
         if role == "proposer":
             self._current.proposer_turns += 1

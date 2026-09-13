@@ -131,3 +131,31 @@ def test_step_level_disaggregated_latencies():
     assert "synthesis (mean)" in rendered
     assert "tool_param_formatting (mean)" in rendered
 
+
+def test_session_sticky_routing_disaggregated_prefill_latency_savings():
+    """Verify session-sticky routing yields quantifiable disaggregated prefill latency savings."""
+    from tribune.routing.session_sticky_router import SessionStickyRouter, WorkerNodeState
+
+    node = WorkerNodeState(node_id="worker_gpu_0", total_vram_gb=24.0)
+    router = SessionStickyRouter(
+        nodes=[node],
+        max_concurrency_per_node=4,
+        cold_prefill_ms=120.0,
+        warm_hit_ms=15.0,
+    )
+
+    base_prompt = ("Statutory rule 7 CFR 273.9 Gross income limits for SNAP assistance and eligibility. " * 15)[:1024]
+    assert len(base_prompt) == 1024
+    d_cold = router.route(base_prompt)
+    assert d_cold.is_cache_hit is False
+    assert d_cold.estimated_prefill_latency_ms == 120.0
+
+    d_warm = router.route(f"{base_prompt}\nTurn 2: evaluate countable income.")
+    assert d_warm.is_cache_hit is True
+    assert d_warm.estimated_prefill_latency_ms == 15.0
+
+    prefill_savings_ms = d_cold.estimated_prefill_latency_ms - d_warm.estimated_prefill_latency_ms
+    assert prefill_savings_ms == 105.0
+    prefill_speedup_ratio = d_cold.estimated_prefill_latency_ms / d_warm.estimated_prefill_latency_ms
+    assert prefill_speedup_ratio == 8.0
+

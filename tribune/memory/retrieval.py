@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
 from ..security.audit import SecurityEventType, record_security_event
+from .consolidation import ConsolidatedMemoryTrace, ProvenanceNode
 
 T = TypeVar("T")
 
@@ -116,8 +117,8 @@ class CitationLockHarness:
     """
 
     _CITATION_REGEX = [
-        # Explicit pointer id pattern: path/to/file@hash:start-end
-        re.compile(r"\[(?:cite|provenance|ref):\s*([^\]@\s]+@[a-f0-9]+:\d+-\d+)\]", re.IGNORECASE),
+        # Explicit citation tag: [cite: target] or [ref: target]
+        re.compile(r"\[(?:cite|provenance|ref):\s*([^\]]+)\]", re.IGNORECASE),
         # Markdown file range link pattern: [ref](uri#Lstart-Lend) or (uri:start-end)
         re.compile(r"(?:\[(?:[^\]]*)\]\(([^)#\s]+)(?:#L?(\d+)-L?(\d+))?\))"),
         # Plain citation reference pattern: @source_uri:line_start-line_end
@@ -131,7 +132,13 @@ class CitationLockHarness:
 
     def register_evidence(
         self,
-        pointer_or_tuple: ProvenancePointer | ProvenancedTuple[Any] | list[ProvenancePointer] | list[ProvenancedTuple[Any]],
+        pointer_or_tuple: (
+            ProvenancePointer
+            | ProvenancedTuple[Any]
+            | ConsolidatedMemoryTrace
+            | ProvenanceNode
+            | list[Any]
+        ),
     ) -> None:
         """Load open validated evidence pointers O into the agent context."""
         with self._lock:
@@ -139,13 +146,59 @@ class CitationLockHarness:
             for item in items:
                 if isinstance(item, ProvenancedTuple):
                     ptr = item.provenance
+                    self._open_pointers[ptr.pointer_id] = ptr
+                    self._open_pointers[ptr.source_uri] = ptr
                 elif isinstance(item, ProvenancePointer):
-                    ptr = item
-                else:
-                    continue
-                self._open_pointers[ptr.pointer_id] = ptr
-                # Also index by source_uri for relaxed URI matching
-                self._open_pointers[ptr.source_uri] = ptr
+                    self._open_pointers[item.pointer_id] = item
+                    self._open_pointers[item.source_uri] = item
+                elif isinstance(item, ProvenanceNode):
+                    ptr = ProvenancePointer(
+                        source_uri=item.source_id,
+                        commit_hash=item.content_hash,
+                        timestamp=time.time(),
+                        line_start=item.chunk_index,
+                        line_end=item.chunk_index,
+                    )
+                    self._open_pointers[ptr.pointer_id] = ptr
+                    self._open_pointers[item.source_id] = ptr
+                    self._open_pointers[item.content_hash] = ptr
+                    self._open_pointers[item.content_hash[:16]] = ptr
+                    self._open_pointers[f"{item.source_id}:{item.chunk_index}"] = ptr
+                    if item.node_id:
+                        self._open_pointers[item.node_id] = ptr
+                elif isinstance(item, ConsolidatedMemoryTrace):
+                    # Register root assertion pointer
+                    trace_ptr = ProvenancePointer(
+                        source_uri=f"trace:{item.trace_id[:16]}",
+                        commit_hash=item.trace_id,
+                        timestamp=time.time(),
+                        line_start=1,
+                        line_end=1,
+                    )
+                    self._open_pointers[item.trace_id] = trace_ptr
+                    self._open_pointers[item.trace_id[:16]] = trace_ptr
+                    self._open_pointers[f"trace:{item.trace_id[:16]}"] = trace_ptr
+
+                    # Recursively register all underlying leaf ProvenanceNodes
+                    for leaf in item.resolve_all_leaf_citations():
+                        l_ptr = ProvenancePointer(
+                            source_uri=leaf.source_id,
+                            commit_hash=leaf.content_hash,
+                            timestamp=time.time(),
+                            line_start=leaf.chunk_index,
+                            line_end=leaf.chunk_index,
+                        )
+                        self._open_pointers[l_ptr.pointer_id] = l_ptr
+                        self._open_pointers[leaf.source_id] = l_ptr
+                        self._open_pointers[leaf.content_hash] = l_ptr
+                        self._open_pointers[leaf.content_hash[:16]] = l_ptr
+                        self._open_pointers[f"{leaf.source_id}:{leaf.chunk_index}"] = l_ptr
+                        if leaf.node_id:
+                            self._open_pointers[leaf.node_id] = l_ptr
+
+    def resolve_trace_provenance(self, trace: ConsolidatedMemoryTrace) -> list[ProvenanceNode]:
+        """Navigate from root assertion down to underlying leaf ProvenanceNode citations."""
+        return trace.resolve_all_leaf_citations()
 
     def get_open_pointers(self) -> list[ProvenancePointer]:
         """Return list of distinct open evidence pointers."""
@@ -212,6 +265,11 @@ class CitationLockHarness:
             end = m.group(3)
             cited.add(f"{uri}:{start}-{end}")
             cited.add(uri)
+
+        if not cited:
+            for k in self._open_pointers:
+                if len(k) > 4 and k in text_to_scan:
+                    cited.add(k)
 
         return cited
 
@@ -293,10 +351,41 @@ class CitationLockHarness:
         return False, signal
 
 
+class HierarchicalTraceRetriever:
+    """Hierarchical trace resolver navigating from root assertions down to leaf provenance citations."""
+
+    def __init__(self, harness: CitationLockHarness | None = None) -> None:
+        self.harness = harness or CitationLockHarness()
+
+    def resolve_leaf_sources(self, trace: ConsolidatedMemoryTrace) -> list[ProvenanceNode]:
+        """Resolve all leaf ProvenanceNode sources for a given consolidated trace."""
+        return trace.resolve_all_leaf_citations()
+
+    def navigate_trace_hierarchy(self, trace: ConsolidatedMemoryTrace) -> dict[str, Any]:
+        """Recursively navigate trace hierarchy and return structured tree with leaf citations."""
+        return {
+            "trace_id": trace.trace_id,
+            "compaction_level": trace.compaction_level,
+            "root_assertion": trace.root_assertion,
+            "confidence_score": trace.confidence_score,
+            "sub_traces": [self.navigate_trace_hierarchy(st) for st in trace.sub_traces],
+            "leaf_citations": [
+                {
+                    "source_id": node.source_id,
+                    "chunk_index": node.chunk_index,
+                    "content_hash": node.content_hash,
+                    "metadata": node.metadata,
+                }
+                for node in trace.resolve_all_leaf_citations()
+            ],
+        }
+
+
 __all__ = [
     "ProvenancePointer",
     "ProvenancedTuple",
     "AbstentionSignal",
     "UngroundedAssertionViolationError",
     "CitationLockHarness",
+    "HierarchicalTraceRetriever",
 ]

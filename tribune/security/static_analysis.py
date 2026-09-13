@@ -116,6 +116,35 @@ class ASTSecurityScanner(ast.NodeVisitor):
                 )
             )
 
+        # Check for __import__()
+        if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            self.findings.append(
+                SecurityFinding(
+                    rule_id="AST-DYNAMIC-IMPORT-INSECURE",
+                    severity="HIGH",
+                    message="Use of `__import__()` allows arbitrary dynamic module loading.",
+                    line_number=node.lineno,
+                    cwe="CWE-73",
+                )
+            )
+
+        # Check for importlib.import_module()
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "import_module"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "importlib"
+        ):
+            self.findings.append(
+                SecurityFinding(
+                    rule_id="AST-IMPORTLIB-DYNAMIC-IMPORT",
+                    severity="HIGH",
+                    message="Use of `importlib.import_module()` allows dynamic module loading bypass.",
+                    line_number=node.lineno,
+                    cwe="CWE-73",
+                )
+            )
+
         # Check SQL string formatting in execute calls: cursor.execute(f"...") or cursor.execute(formatted_var)
         if isinstance(node.func, ast.Attribute) and node.func.attr in ("execute", "executemany"):
             if node.args:

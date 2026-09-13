@@ -43,3 +43,40 @@ def test_audit_logger_pii_and_credential_sanitization():
 
     # Verify hash chain integrity
     assert audit_log.verify_chain(case_id) is True
+
+
+def test_sentinel_security_event_audit_logging():
+    """Verify Sentinel and lateral escalation events are recorded in security audit logger with zero secret leakage."""
+    from tribune.security.audit import (
+        SecurityAuditLogger,
+        SecurityEventType,
+        get_security_audit_logger,
+        record_security_event,
+    )
+
+    logger = get_security_audit_logger()
+    initial_count = len(logger.events)
+
+    secret_key = "sk-live-super-secret-vault-key-12345"
+    record_security_event(
+        event_type=SecurityEventType.LATERAL_ESCALATION_ATTEMPT,
+        source="tribune.redteam.adversarial.LateralEscalationProbe",
+        message="Blocked lateral redirection attempt",
+        severity="CRITICAL",
+        details={
+            "attempted_endpoint": "https://attacker.org",
+            "bearer": f"Bearer {secret_key}",
+            "api_key": secret_key,
+        },
+    )
+
+    assert len(logger.events) == initial_count + 1
+    last_event = logger.events[-1]
+    assert last_event.event_type == SecurityEventType.LATERAL_ESCALATION_ATTEMPT
+    assert last_event.severity == "CRITICAL"
+
+    # Verify secret is sanitized in audit output
+    event_dict = last_event.to_dict()
+    assert secret_key not in str(event_dict)
+    assert event_dict["details"]["bearer"] == "Bearer [REDACTED]"
+    assert event_dict["details"]["api_key"] == "[REDACTED]"

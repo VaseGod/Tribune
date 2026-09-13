@@ -283,6 +283,26 @@ class HardenedExecutionSandbox:
                 logger.error(f"[SANDBOX] Execution error in {tool_name}: {exc}")
                 raise
 
+    def execute_synthesized_tool(
+        self,
+        source_code: str,
+        entry_point: str,
+        kwargs: dict[str, Any],
+        sentinel_proxy: Any = None,
+    ) -> Any:
+        """Execute dynamic tool synthesized by agent within restricted namespace and sandbox defenses."""
+        with self._lock:
+            self.watchdog.verify_integrity()
+            self._enforce_decoy_tripwires(entry_point, "", kwargs)
+            from .secure_forge import SecureForgeRuntime
+            runtime = SecureForgeRuntime()
+            return runtime.execute_synthesized_tool(
+                source_code=source_code,
+                entry_point=entry_point,
+                kwargs=kwargs,
+                sentinel_proxy=sentinel_proxy,
+            )
+
     def read_environment_variable(self, var_name: str) -> str:
         """Audit hook on environment variable access: triggers containment breach on decoys."""
         if var_name in DECOY_ENV_VARIABLES:

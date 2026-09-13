@@ -129,3 +129,148 @@ def test_cryptographic_citation_mapper_and_deterministic_verification():
     report_forged = mapper.verify_assertion(forged_assertion, compacted)
     assert report_forged.is_verified is False
     assert len(report_forged.unmatched_hashes) >= 1
+
+
+def test_recursive_trace_consolidator_multi_level_compaction():
+    """Verify RecursiveTraceConsolidator generates multi-level traces with deterministic hashes."""
+    import hashlib
+    from tribune.memory.consolidation import (
+        ConsolidatedMemoryTrace,
+        ProvenanceNode,
+        RecursiveTraceConsolidator,
+    )
+
+    consolidator = RecursiveTraceConsolidator(
+        max_chunk_tokens=100,
+        compaction_threshold_tokens=50,  # low threshold to trigger multi-level compaction
+        branching_factor=2,
+    )
+
+    parent_hash = hashlib.sha256(b"root_case_session_context").hexdigest()
+
+    # Raw traces from subagents
+    raw_subagent_traces = [
+        {
+            "source_id": "subagent_income_doc",
+            "chunk_index": 1,
+            "content": "Gross monthly income is $1,450 from W2 employer paystub.",
+            "confidence": 0.98,
+            "metadata": {"doc_type": "paystub"},
+        },
+        {
+            "source_id": "subagent_deductions",
+            "chunk_index": 2,
+            "content": "Standard deduction of $198 applied for household size 3.",
+            "confidence": 0.95,
+            "metadata": {"statute": "7 CFR 273.9"},
+        },
+        {
+            "source_id": "subagent_assets",
+            "chunk_index": 3,
+            "content": "Liquid assets total $850 in checking account, below $3,000 cap.",
+            "confidence": 0.99,
+            "metadata": {"source": "bank_statement"},
+        },
+        {
+            "source_id": "subagent_residency",
+            "chunk_index": 4,
+            "content": "Applicant is permanent state resident under EX statutory jurisdiction.",
+            "confidence": 0.97,
+            "metadata": {"statute": "7 CFR 273.2"},
+        },
+    ]
+
+    # Compact traces
+    trace: ConsolidatedMemoryTrace = consolidator.compact_subagent_traces(
+        raw_traces=raw_subagent_traces,
+        parent_context_hash=parent_hash,
+    )
+
+    # 1. Verify multi-level compaction occurred (4 traces with branching factor 2 -> Level 1)
+    assert trace.compaction_level >= 1
+    assert len(trace.sub_traces) >= 2
+    assert trace.confidence_score > 0.90
+
+    # 2. Verify deterministic trace ID incorporates parent_context_hash
+    expected_id = hashlib.sha256(f"{parent_hash}:{trace.root_assertion}".encode("utf-8")).hexdigest()
+    assert trace.trace_id == expected_id
+
+    # 3. Verify leaf citations are completely preserved across recursive compaction levels
+    all_leaves = trace.resolve_all_leaf_citations()
+    assert len(all_leaves) == 4
+    leaf_sources = {leaf.source_id for leaf in all_leaves}
+    assert leaf_sources == {
+        "subagent_income_doc",
+        "subagent_deductions",
+        "subagent_assets",
+        "subagent_residency",
+    }
+
+    # 4. Verify verified SHA-256 chunk hashes match content
+    for item in raw_subagent_traces:
+        expected_chunk_hash = hashlib.sha256(item["content"].encode("utf-8")).hexdigest()
+        matching_leaf = next(l for l in all_leaves if l.source_id == item["source_id"])
+        assert matching_leaf.content_hash == expected_chunk_hash
+
+
+def test_hierarchical_trace_retriever_and_citation_locking():
+    """Verify retrieval harness navigates root assertions down to leaf ProvenanceNode citations."""
+    import hashlib
+    from tribune.memory.consolidation import (
+        ConsolidatedMemoryTrace,
+        ProvenanceNode,
+        RecursiveTraceConsolidator,
+    )
+    from tribune.memory.retrieval import CitationLockHarness, HierarchicalTraceRetriever
+
+    consolidator = RecursiveTraceConsolidator(branching_factor=2)
+    parent_hash = hashlib.sha256(b"parent_test_context").hexdigest()
+
+    raw_traces = [
+        {
+            "source_id": "w2_paystub.pdf",
+            "chunk_index": 1,
+            "content": "Monthly gross earnings: $1500.00",
+            "confidence": 0.99,
+        },
+        {
+            "source_id": "7_cfr_273_9.txt",
+            "chunk_index": 10,
+            "content": "Gross income standard <= 130% FPL",
+            "confidence": 1.0,
+        },
+    ]
+
+    trace = consolidator.compact_subagent_traces(raw_traces, parent_context_hash=parent_hash)
+
+    # 1. Test HierarchicalTraceRetriever navigation
+    retriever = HierarchicalTraceRetriever()
+    leaves = retriever.resolve_leaf_sources(trace)
+    assert len(leaves) == 2
+    assert leaves[0].source_id == "w2_paystub.pdf"
+    assert leaves[1].source_id == "7_cfr_273_9.txt"
+
+    hierarchy = retriever.navigate_trace_hierarchy(trace)
+    assert hierarchy["trace_id"] == trace.trace_id
+    assert len(hierarchy["leaf_citations"]) == 2
+
+    # 2. Test CitationLockHarness integration with ConsolidatedMemoryTrace
+    harness = CitationLockHarness()
+    harness.register_evidence(trace)
+
+    # Valid assertion citing leaf source_id
+    valid_output = "Income is verified under w2_paystub.pdf and statutory standard 7_cfr_273_9.txt."
+    is_valid, _ = harness.validate_assertion(valid_output)
+    assert is_valid is True
+
+    # Valid assertion citing leaf chunk hash
+    leaf_hash = leaves[0].content_hash
+    valid_cite_hash = f"Applicant meets wage eligibility [cite: {leaf_hash[:16]}]."
+    is_valid_h, _ = harness.validate_assertion(valid_cite_hash)
+    assert is_valid_h is True
+
+    # Forged citation rejected
+    forged_output = "Applicant is eligible under [cite: ungrounded_forged_document.pdf@deadbeef:1-5]."
+    is_valid_f, signal = harness.validate_assertion(forged_output)
+    assert is_valid_f is False
+    assert signal.is_abstention is True

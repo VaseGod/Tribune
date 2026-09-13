@@ -182,3 +182,78 @@ def test_kv_memory_monitor_and_cache_affinity_routing():
     assert r_dec["kv_compressed_attention"] is True
     assert router.stats["kv_affinity_routed_calls"] >= 1
 
+
+def test_session_sticky_router_prefix_affinity_and_lifecycle():
+    """Verify SessionStickyRouter maximizes warm KV-cache hits and manages concurrency lifecycle."""
+    from tribune.routing.session_sticky_router import (
+        CapacityExceededError,
+        SessionStickyRouter,
+        WorkerNodeState,
+    )
+
+    node1 = WorkerNodeState(node_id="worker_gpu_0", total_vram_gb=24.0)
+    node2 = WorkerNodeState(node_id="worker_gpu_1", total_vram_gb=24.0)
+
+    router = SessionStickyRouter(
+        nodes=[node1, node2],
+        max_concurrency_per_node=2,
+        prefix_window=1024,
+        cold_prefill_ms=100.0,
+        warm_hit_ms=10.0,
+    )
+
+    # 1. First turn: Cold cache dispatch with standardized 1,024-char system prefix
+    system_prompt = ("You are an administrative adjudication assistant for Title 7 CFR SNAP benefits verification and case law analysis. " * 15)[:1024]
+    assert len(system_prompt) == 1024
+
+    turn1_prompt = f"{system_prompt}\nUser: Evaluate income $1200 for family of 3."
+
+    d1 = router.route(turn1_prompt)
+    assert d1.is_cache_hit is False
+    assert d1.estimated_prefill_latency_ms == 100.0
+    first_node_id = d1.node_id
+    assert first_node_id in ("worker_gpu_0", "worker_gpu_1")
+
+    # 2. Multi-turn conversation continuation: Warm KV cache affinity hit (shares exact 1024 prefix)
+    turn2_prompt = f"{turn1_prompt}\nAssistant: Gross income is satisfied.\nUser: Now check assets."
+    d2 = router.route(turn2_prompt)
+    assert d2.is_cache_hit is True
+    assert d2.node_id == first_node_id  # Session affinity maintained
+    assert d2.estimated_prefill_latency_ms == 10.0
+    assert d2.active_concurrency == 2
+
+    # 3. Warm node reaches max concurrency (2): Next request falls back to node2
+    turn3_prompt = f"{turn1_prompt}\nAssistant: Inquire about vehicles.\nUser: 1 car valued at $4000."
+    d3 = router.route(turn3_prompt)
+    assert d3.is_cache_hit is False  # Cold fallback because node1 is saturated
+    other_node_id = "worker_gpu_1" if first_node_id == "worker_gpu_0" else "worker_gpu_0"
+    assert d3.node_id == other_node_id
+    assert d3.active_concurrency == 1
+
+    # 4. Concurrency release: release turn on first_node_id
+    router.release_turn(first_node_id)
+    first_node = router.get_node(first_node_id)
+    assert first_node is not None
+    assert first_node.active_concurrency == 1
+
+    # 5. Subsequent request can hit first_node_id again as a warm hit
+    turn4_prompt = f"{turn1_prompt}\nAssistant: Verified assets.\nUser: Proceed to filing."
+    d4 = router.route(turn4_prompt)
+    assert d4.is_cache_hit is True
+    assert d4.node_id == first_node_id
+    assert d4.active_concurrency == 2
+
+    # Check metrics
+    stats = router.get_stats()
+    assert stats["total_requests"] == 4
+    assert stats["cache_hits"] == 2
+    assert stats["cache_misses"] == 2
+    assert stats["hit_ratio"] == 0.5
+
+    # 6. Saturated cluster raises CapacityExceededError
+    # Fill remaining capacity on other_node
+    router.route("Completely independent prompt #1" * 40)
+    # Both nodes now have concurrency 2 (max_concurrency_per_node=2)
+    with pytest.raises(CapacityExceededError):
+        router.route("Saturated prompt that exceeds cluster capacity" * 40)
+
