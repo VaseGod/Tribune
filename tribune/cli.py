@@ -275,7 +275,73 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--reload", action="store_true", help="auto-reload on code changes (development)")
     p_web.set_defaults(func=cmd_web)
 
+    p_audio = sub.add_parser("intake-audio", help="streaming acoustic ingestion with diarization and eligibility assessment")
+    p_audio.add_argument("--audio", dest="audio", default="", help="path to spoken hearing audio file")
+    p_audio.add_argument("--case-id", dest="case_id", default="hearing-case-001", help="case identifier")
+    p_audio.add_argument("--jurisdiction", dest="jurisdiction", default=None, help="jurisdiction code")
+    p_audio.add_argument("--engine", dest="engine", default="muse-voice-stream", help="transcription engine (muse-voice-stream, mai-transcribe-2)")
+    p_audio.add_argument("--duration", dest="duration", type=float, default=60.0, help="hearing duration in seconds")
+    p_audio.add_argument(
+        "--program",
+        dest="programs",
+        action="append",
+        default=None,
+        help="restrict to a benefit program, e.g. --program snap",
+    )
+    p_audio.set_defaults(func=cmd_intake_audio)
+
     return parser
+
+
+def cmd_intake_audio(args: argparse.Namespace) -> int:
+    from .casegen.synthetic import SyntheticCaseGenerator
+    from .ingestion.acoustic import AcousticIngestionEngine
+    from .orchestration.pipeline import CasePipeline
+    from .types import ProgramId
+
+    settings = get_settings()
+    if args.engine:
+        settings = settings.model_copy(update={"acoustic_transcribe_engine": args.engine})
+
+    print(_BANNER)
+    print(f"\n[Acoustic Ingestion Layer] Engine={args.engine} | Max Cost Budget=${settings.acoustic_hourly_budget:.2f}/hr\n")
+
+    engine = AcousticIngestionEngine(settings)
+    result = engine.process_audio(
+        audio_source=args.audio or "simulated_intake_stream",
+        session_id=f"session-{args.case_id}",
+        duration_s=args.duration,
+    )
+
+    print("#" * 78)
+    print(f"DIARIZED HEARING TRANSCRIPT (Session: {result.session_id}, Duration: {result.duration_s:.1f}s)")
+    print(f"Hourly Cost Rate: ${result.hourly_cost:.2f}/hr | Total Run Expense: ${result.total_cost:.5f}")
+    print("-" * 78)
+    for seg in result.segments:
+        role_tag = f"[{seg.speaker.value.upper()}]".ljust(14)
+        print(f"  {role_tag} ({seg.start_time_s:5.1f}s - {seg.end_time_s:5.1f}s, conf={seg.confidence:.2f}): {seg.text}")
+    print("#" * 78)
+
+    raw_doc = engine.to_raw_document(result, args.case_id)
+    print("\nExtracted Evidentiary Fields from Spoken Dialogue:")
+    for k, v in raw_doc.fields.items():
+        print(f"  - {k}: {v}")
+
+    jurisdiction = args.jurisdiction or settings.default_jurisdiction
+    generator = SyntheticCaseGenerator(seed=settings.seed)
+    target_programs = [ProgramId(p) for p in args.programs] if args.programs else [ProgramId.SNAP, ProgramId.MEDICAID]
+    case = generator.build_case(args.case_id, jurisdiction, {}, target_programs)
+    case = case.model_copy(update={"documents": list(case.documents) + [raw_doc]})
+
+    pipeline = CasePipeline(settings)
+    case_result = pipeline.run_case(case)
+
+    print("\n" + "#" * 78)
+    print("STATUTORY ADJUDICATION OUTCOME (EVIDENCED BY ACOUSTIC INGESTION)")
+    print("#" * 78)
+    print(disclosure.render(case_result))
+    return 0
+
 
 
 def main(argv: list[str] | None = None) -> int:

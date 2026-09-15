@@ -15,7 +15,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -24,10 +24,11 @@ from .casegen.synthetic import SyntheticCaseGenerator
 from .config import TribuneSettings, get_settings
 from .corpus.programs import all_programs, benefit_programs, known_jurisdictions
 from .governance.action_gate import ActionBlocked, ActionGate, HumanSignoff
+from .ingestion.acoustic import AcousticIngestionEngine
 from .ingestion.ocr import parse_text_to_fields
 from .mcp import MCPHandler, get_openai_plugin_manifest, get_openai_tools_schema
 from .orchestration.pipeline import CasePipeline
-from .types import ApplicantSituation, CaseRunResult, ProgramId, RawDocument, SyntheticCase
+from .types import ApplicantSituation, CaseRunResult, IngestMethod, ProgramId, RawDocument, SyntheticCase
 
 PROGRAM_NAMES = {
     "snap": "SNAP (food assistance)",
@@ -83,6 +84,16 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     case_id: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
+
+
+class AcousticIngestRequest(BaseModel):
+    case_id: str | None = None
+    jurisdiction: str | None = None
+    audio_source: str = ""
+    duration_s: float = 60.0
+    assess_immediately: bool = True
+    target_programs: list[str] | None = None
+
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +220,91 @@ async def mcp_endpoint(request: Request) -> dict:
         }
     headers = dict(request.headers)
     handler = MCPHandler(runs_store=_RUNS, settings=get_settings())
-    return handler.handle_request(payload, headers)
+    return await handler.handle_request_async(payload, headers)
+
+
+@app.post("/mcp/stream")
+async def mcp_stream_endpoint(request: Request):
+    """Streaming MCP tool execution endpoint (ndjson chunk stream)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    tool_name = payload.get("tool")
+    arguments = payload.get("arguments") or {}
+    if not tool_name:
+        raise HTTPException(status_code=422, detail="Missing 'tool' in payload")
+
+    handler = MCPHandler(runs_store=_RUNS, settings=get_settings())
+
+    async def event_generator():
+        async for chunk in handler.stream_tool_execution(tool_name, arguments):
+            yield f"{chunk}\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+
+@app.post("/api/ingest/acoustic")
+async def ingest_acoustic(req: AcousticIngestRequest) -> dict:
+    """Ingest spoken hearing/intake audio, transcribe with diarization, and pipe into eligibility."""
+    settings = get_settings()
+    case_id = req.case_id or f"hearing-{uuid4().hex[:8]}"
+    jurisdiction = req.jurisdiction or settings.default_jurisdiction
+
+    engine = AcousticIngestionEngine(settings)
+    ingest_result = engine.process_audio(
+        audio_source=req.audio_source,
+        session_id=f"session-{case_id}",
+        duration_s=req.duration_s,
+    )
+    raw_doc = engine.to_raw_document(ingest_result, case_id)
+
+    res_data = {
+        "case_id": case_id,
+        "jurisdiction": jurisdiction,
+        "session_id": ingest_result.session_id,
+        "duration_s": ingest_result.duration_s,
+        "engine": ingest_result.engine,
+        "hourly_cost_usd": ingest_result.hourly_cost,
+        "total_cost_usd": ingest_result.total_cost,
+        "segments": [s.model_dump(mode="json") for s in ingest_result.segments],
+        "extracted_fields": raw_doc.fields,
+    }
+
+    if req.assess_immediately:
+        generator = SyntheticCaseGenerator(seed=settings.seed)
+        target_programs = [ProgramId(p) for p in (req.target_programs or _DEFAULT_PROGRAMS)]
+        case = generator.build_case(case_id, jurisdiction, {}, target_programs)
+        case = case.model_copy(update={"documents": list(case.documents) + [raw_doc]})
+
+        pipeline = CasePipeline(settings)
+        case_result = pipeline.run_case(case)
+        _RUNS[case.case_id] = {"case": case, "result": case_result}
+        res_data["assessment_run"] = {
+            "case_id": case_result.case_id,
+            "outcomes": [o.model_dump(mode="json") for o in case_result.outcomes],
+        }
+
+    return res_data
+
+
+@app.post("/api/ingest/acoustic/stream")
+async def ingest_acoustic_stream(request: Request):
+    """Real-time streaming soft token acoustic ingestion endpoint."""
+    settings = get_settings()
+    engine = AcousticIngestionEngine(settings)
+
+    async def simulated_audio_stream():
+        for _ in range(10):
+            yield b"\x00" * 320
+
+    async def stream_generator():
+        async for frame in engine.stream_audio_chunks(simulated_audio_stream()):
+            import json as _json
+            yield f"{_json.dumps(frame)}\n"
+
+    return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
 
 @app.get("/mcp")
@@ -220,6 +315,7 @@ def mcp_info() -> dict:
         "protocolVersion": "2024-11-05",
         "endpoint": "/mcp",
     }
+
 
 
 @app.get("/.well-known/ai-plugin.json")

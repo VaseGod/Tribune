@@ -128,6 +128,8 @@ class IngestMethod(str, enum.Enum):
     OCR = "ocr"
     SYNTHETIC = "synthetic"
     MANUAL = "manual"
+    ACOUSTIC = "acoustic"
+
 
 
 # --------------------------------------------------------------------------- #
@@ -865,6 +867,94 @@ class HMACAuthorizationToken(StrictModel):
     issued_at: datetime = Field(default_factory=_utcnow)
     expires_at: datetime
     supervisor_id: str = "gatekeeper_supervisor_v1"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 & 4: Acoustic Ingestion & SelfCompact Scaffold Types
+# --------------------------------------------------------------------------- #
+
+
+class SpeakerRole(str, enum.Enum):
+    """Speaker roles in administrative and statutory eligibility proceedings."""
+
+    CLAIMANT = "claimant"
+    CASEWORKER = "caseworker"
+    ADJUDICATOR = "adjudicator"
+    UNKNOWN = "unknown"
+
+
+class SoftTokenSpan(StrictModel):
+    """Acoustic soft token representing ~80ms audio frames with entropy metrics."""
+
+    token_index: int
+    duration_ms: float = 80.0
+    acoustic_entropy: float = 0.0
+    confidence: float = 1.0
+
+
+class AcousticTranscriptSegment(StrictModel):
+    """Timestamped, speaker-attributed transcript segment from acoustic streaming."""
+
+    segment_id: str
+    speaker: SpeakerRole
+    start_time_s: float
+    end_time_s: float
+    text: str
+    confidence: float
+    soft_tokens: list[SoftTokenSpan] = Field(default_factory=list)
+    is_final: bool = True
+
+
+class AcousticIngestionResult(StrictModel):
+    """Aggregated output of acoustic transcription intake."""
+
+    session_id: str
+    duration_s: float
+    engine: str
+    segments: list[AcousticTranscriptSegment] = Field(default_factory=list)
+    hourly_cost: float = 0.16
+    total_cost: float = 0.0
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ClosedPredicate(StrictModel):
+    """An immutable evaluated statutory predicate preserved across compaction boundaries."""
+
+    predicate_id: str
+    name: str
+    statutory_module: str
+    outcome: str
+    statutory_citations: list[str] = Field(default_factory=list)
+    evidence_hashes: list[str] = Field(default_factory=list)
+    evaluated_value: Any = None
+    threshold_value: Any = None
+    operator: str = "<="
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class StructuredCompactedState(StrictModel):
+    """Immutable condensed state artifact replacing raw multi-turn trace tokens."""
+
+    compaction_id: str
+    case_id: str
+    timestamp: datetime = Field(default_factory=_utcnow)
+    token_count_before: int
+    token_count_after: int
+    compression_ratio: float
+    closed_predicates: list[ClosedPredicate] = Field(default_factory=list)
+    unresolved_discrepancies: list[str] = Field(default_factory=list)
+    compacted_summary: str = ""
+
+
+class CompactionDecision(StrictModel):
+    """Rubric-evaluated compaction authorization decision."""
+
+    authorized: bool
+    reason: str
+    current_token_count: int
+    resolved_modules: list[str] = Field(default_factory=list)
+    active_discrepancies: list[str] = Field(default_factory=list)
+
 
 
 

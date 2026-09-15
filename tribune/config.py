@@ -9,6 +9,7 @@ an OCR endpoint.
 
 from __future__ import annotations
 
+import enum
 import os
 from functools import lru_cache
 from typing import Literal
@@ -17,8 +18,43 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class ReasoningTierLevel(str, enum.Enum):
+    """Dynamic cognitive reasoning tiers."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    MAX = "max"
+
+
 class TribuneSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TRIBUNE_", extra="ignore")
+
+    # Dynamic Cognitive Reasoning Tiers & Prompt Cache Optimization
+    dynamic_reasoning_tiers_enabled: bool = Field(
+        default_factory=lambda: str(
+            os.getenv("TRIBUNE_DYNAMIC_REASONING_TIERS", "true")
+        ).lower()
+        in ("true", "1", "yes")
+    )
+    base_reasoning_tier: Literal["low", "medium", "high", "max"] = "low"
+    escalated_reasoning_tier: Literal["low", "medium", "high", "max"] = "high"
+    conflict_max_reasoning_tier: Literal["low", "medium", "high", "max"] = "max"
+    prompt_cache_discount_per_1m: float = 1.00  # $1.00/M tokens for cached prefixes
+    target_compute_savings_target: float = 0.40  # 40% reduction target
+
+    # SelfCompact Scaffold Settings
+    compaction_token_interval: int = Field(
+        default_factory=lambda: int(
+            os.getenv("TRIBUNE_COMPACTION_TOKEN_INTERVAL", "16000")
+        )
+    )
+
+    # Acoustic Ingestion Settings
+    acoustic_transcribe_engine: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_ACOUSTIC_ENGINE", "muse-voice-stream")
+    )
+    acoustic_hourly_budget: float = 0.20  # Sub-$0.20/hr operational target
 
     # -- Model provider ----------------------------------------------------- #
     # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini", "glm", "zhipu"
