@@ -141,7 +141,7 @@ def recommend_action(status: EligibilityStatus) -> RecommendedAction:
 
 
 def get_provider_for_role(role: str, settings=None, recorder=None):
-    """Factory: ``role`` is 'proposer', 'verifier', or 'router'. Selected by config.
+    """Factory: ``role`` is 'proposer', 'verifier', 'router', 'deepseek', etc. Selected by config.
 
     ``recorder`` is an optional :class:`~tribune.instrumentation.usage.UsageRecorder`;
     providers report per-call token usage to it when present.
@@ -155,10 +155,20 @@ def get_provider_for_role(role: str, settings=None, recorder=None):
 
         return ModelRouter(settings=settings, recorder=recorder)
 
+    if role in ("deepseek", "deepseek_flash", "deepseek-flash", "ingestion", "ast_extraction", "summarization"):
+        from .deepseek import DeepSeekProvider
+
+        return DeepSeekProvider(settings=settings, role=role, recorder=recorder)
+
     if role == "verifier":
         kind, model = settings.verifier_provider, settings.verifier_model
     else:
         kind, model = settings.provider, settings.openai_model
+
+    if kind in ("deepseek", "deepseek_flash", "deepseek-flash"):
+        from .deepseek import DeepSeekProvider
+
+        return DeepSeekProvider(model=model, settings=settings, role=role, recorder=recorder)
 
     if kind == "openai_compat":
         from .openai_compat import OpenAICompatProvider

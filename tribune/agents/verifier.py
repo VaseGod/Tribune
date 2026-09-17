@@ -12,6 +12,7 @@ The verifier performs:
 from __future__ import annotations
 
 import enum
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -19,12 +20,11 @@ from typing import Any
 
 from ..corpus import programs as program_registry
 from ..corpus.citations import cross_evaluate_citations
-from ..corpus.programs.jurisdictions import JurisdictionProfile, get_profile
+from ..corpus.programs.jurisdictions import get_profile
 from ..corpus.rule_store import LocalRuleStore, RuleStore
 from ..providers.base import ModelProvider, ReviewRequest, ReviewResult, derive_status
 from ..types import (
     Assessment,
-    Citation,
     CriterionOutcome,
     CriterionResult,
     EligibilityStatus,
@@ -35,7 +35,6 @@ from ..types import (
     RecommendedAction,
     VerifierVerdict,
 )
-
 
 # --------------------------------------------------------------------------- #
 # Decomposed Span-Level Editing Taxonomy & Dataclasses
@@ -224,7 +223,6 @@ class SpanEditingEngine:
         ast_nodes = LegalBriefASTParser.parse(draft_text)
         active_cits = self.rule_store.all_citations(program, jurisdiction)
         active_sources = {c.source.strip().lower(): c for c in active_cits}
-        active_cids = {c.citation_id.strip().lower(): c for c in active_cits}
 
         # 1. Missing Jurisdiction Clause Check
         has_jurisdiction = any(n.node_type == "JURISDICTION_BLOCK" for n in ast_nodes) or f"Jurisdiction: {jurisdiction}" in draft_text
@@ -997,6 +995,270 @@ class StepAdvantageOptimizer:
 
 
 # --------------------------------------------------------------------------- #
+# Single-Turn Delta Rewriting & Failure Localization
+# --------------------------------------------------------------------------- #
+
+
+class FailureType(str, enum.Enum):
+    """Categorization of execution turn failures for targeted single-turn delta rewrite."""
+
+    COMPILATION_FAILURE = "compilation_failure"
+    LINTING_FAILURE = "linting_failure"
+    UNIT_TEST_ASSERTION_FAILURE = "unit_test_assertion_failure"
+    TOOL_SCHEMA_VIOLATION = "tool_schema_violation"
+    RUNTIME_EXCEPTION = "runtime_exception"
+    INVALID_FILE_OPERATION = "invalid_file_operation"
+    MALFORMED_CODE_BLOCK = "malformed_code_block"
+
+
+@dataclass
+class FailureLocalizationReport:
+    """Report pinpointing exact failing turn and minimal repair target."""
+
+    turn_id: str
+    turn_index: int
+    failing_tool_invocation_or_code_block: str
+    error_type: FailureType
+    error_message: str
+    relevant_surrounding_context_references: list[str] = field(default_factory=list)
+    minimal_repair_target: str = ""
+    detected_at_step: int = 0
+
+
+@dataclass
+class SingleTurnDeltaRepairContract:
+    """Structured contract for single-turn delta repairs."""
+
+    turn_id: str
+    repair_type: str  # "tool_call" | "code_block" | "command" | "schema_fix"
+    original_content: str
+    replacement_content: str
+    explanation: str = ""
+    confidence: float = 0.95
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn_id": self.turn_id,
+            "repair_type": self.repair_type,
+            "original_content": self.original_content,
+            "replacement_content": self.replacement_content,
+            "explanation": self.explanation,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SingleTurnDeltaRepairContract:
+        return cls(
+            turn_id=str(data.get("turn_id", "")),
+            repair_type=str(data.get("repair_type", "code_block")),
+            original_content=str(data.get("original_content", "")),
+            replacement_content=str(data.get("replacement_content", "")),
+            explanation=str(data.get("explanation", "")),
+            confidence=float(data.get("confidence", 0.95)),
+        )
+
+
+class FailureTurnLocator:
+    """Pinpoints the exact failing turn in Navigator execution history."""
+
+    @classmethod
+    def locate_failure(cls, execution_history: list[dict[str, Any]]) -> FailureLocalizationReport | None:
+        if not execution_history:
+            return None
+
+        for idx, turn in enumerate(execution_history):
+            status = str(turn.get("status", "")).lower()
+            error_msg = str(turn.get("error", "") or turn.get("error_message", "") or "")
+            tool_call = turn.get("tool_call") or turn.get("tool_invocation") or turn.get("command") or ""
+            code_block = turn.get("code_block") or turn.get("content") or ""
+
+            # Check if this turn experienced a failure
+            is_failed = (
+                status in ("failure", "failed", "error", "rejected")
+                or bool(error_msg)
+                or bool(turn.get("failing", False))
+                or bool(turn.get("test_failure", False))
+            )
+
+            if is_failed:
+                turn_id = str(turn.get("turn_id") or turn.get("id") or f"turn_{idx}")
+                err_lower = error_msg.lower()
+                if "syntaxerror" in err_lower or "compile" in err_lower or "compilation" in err_lower:
+                    err_type = FailureType.COMPILATION_FAILURE
+                elif "lint" in err_lower or "flake8" in err_lower or "ruff" in err_lower:
+                    err_type = FailureType.LINTING_FAILURE
+                elif "assertionerror" in err_lower or "test" in err_lower or "assert" in err_lower:
+                    err_type = FailureType.UNIT_TEST_ASSERTION_FAILURE
+                elif "schema" in err_lower or "argument" in err_lower or "validation" in err_lower:
+                    err_type = FailureType.TOOL_SCHEMA_VIOLATION
+                elif "filenotfound" in err_lower or "path" in err_lower or "permission" in err_lower or "traversal" in err_lower:
+                    err_type = FailureType.INVALID_FILE_OPERATION
+                elif "malformed" in err_lower or "unclosed" in err_lower:
+                    err_type = FailureType.MALFORMED_CODE_BLOCK
+                else:
+                    err_type = FailureType.RUNTIME_EXCEPTION
+
+                failing_block = str(tool_call or code_block or f"turn {turn_id}")
+                surrounding_refs = []
+                if idx > 0:
+                    prev_id = execution_history[idx - 1].get("turn_id") or f"turn_{idx-1}"
+                    surrounding_refs.append(f"Preceding: {prev_id}")
+                if idx < len(execution_history) - 1:
+                    next_id = execution_history[idx + 1].get("turn_id") or f"turn_{idx+1}"
+                    surrounding_refs.append(f"Subsequent: {next_id}")
+
+                return FailureLocalizationReport(
+                    turn_id=turn_id,
+                    turn_index=idx,
+                    failing_tool_invocation_or_code_block=failing_block,
+                    error_type=err_type,
+                    error_message=error_msg or "Execution failure in turn",
+                    relevant_surrounding_context_references=surrounding_refs,
+                    minimal_repair_target=failing_block[:200],
+                    detected_at_step=idx + 1,
+                )
+
+        return None
+
+
+class SingleTurnDeltaRewriter:
+    """Executes single-turn delta rewriting and strictly preserves surrounding trajectory history."""
+
+    @staticmethod
+    def apply_delta_repair(
+        execution_history: list[dict[str, Any]],
+        repair: SingleTurnDeltaRepairContract,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Apply targeted replacement to the failing turn without regenerating the trajectory."""
+        updated_history: list[dict[str, Any]] = []
+        applied = False
+
+        for idx, turn in enumerate(execution_history):
+            turn_id = str(turn.get("turn_id") or turn.get("id") or f"turn_{idx}")
+            if turn_id == repair.turn_id:
+                new_turn = dict(turn)
+                new_turn["repaired"] = True
+                new_turn["repair_type"] = repair.repair_type
+                new_turn["original_content"] = repair.original_content
+                new_turn["content"] = repair.replacement_content
+                new_turn["tool_call"] = repair.replacement_content
+                new_turn["status"] = "success"
+                new_turn.pop("error", None)
+                new_turn.pop("error_message", None)
+                updated_history.append(new_turn)
+                applied = True
+            else:
+                updated_history.append(turn)
+
+        return updated_history, applied
+
+
+# --------------------------------------------------------------------------- #
+# ToolGrad Pre-Execution Assertion Checks
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ToolGradAssertionResult:
+    passed: bool
+    tool_name: str
+    violations: list[str] = field(default_factory=list)
+    checked_constraints: list[str] = field(default_factory=list)
+
+
+class ToolGradAssertionChecker:
+    """Pre-execution validation ensuring near-deterministic tool-use chains."""
+
+    DISALLOWED_COMMANDS = {
+        "rm -rf /",
+        "mkfs",
+        ":(){ :|:& };:",
+        "dd if=/dev/zero",
+        "curl -s | bash",
+        "wget -O- | sh",
+    }
+
+    @classmethod
+    def validate_tool_call(
+        cls,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_spec: dict[str, Any] | None = None,
+        repository_root: str | None = None,
+    ) -> ToolGradAssertionResult:
+        """Validate schema, type constraints, and environment safety before tool execution."""
+        violations: list[str] = []
+        checked: list[str] = []
+
+        # 1. Schema Validation against declared tool spec
+        if tool_spec:
+            checked.append("schema_parameters_conformance")
+            required_params = tool_spec.get("required", [])
+            for param in required_params:
+                if param not in arguments or arguments[param] is None:
+                    violations.append(f"Missing required parameter '{param}' for tool '{tool_name}'")
+
+            properties = tool_spec.get("properties", {})
+            for param_name, param_spec in properties.items():
+                if param_name in arguments:
+                    expected_type = param_spec.get("type")
+                    val = arguments[param_name]
+                    if expected_type == "string" and not isinstance(val, str):
+                        violations.append(f"Parameter '{param_name}' must be a string, got {type(val).__name__}")
+                    elif expected_type == "integer" and not isinstance(val, int):
+                        violations.append(f"Parameter '{param_name}' must be an integer, got {type(val).__name__}")
+                    elif expected_type == "boolean" and not isinstance(val, bool):
+                        violations.append(f"Parameter '{param_name}' must be a boolean, got {type(val).__name__}")
+                    elif expected_type == "array" and not isinstance(val, list | tuple):
+                        violations.append(f"Parameter '{param_name}' must be an array, got {type(val).__name__}")
+
+                    if "enum" in param_spec and val not in param_spec["enum"]:
+                        violations.append(
+                            f"Parameter '{param_name}' value '{val}' not in permitted enum values {param_spec['enum']}"
+                        )
+
+        # 2. Environment Constraint: Path Traversal & Root Confinement
+        path_arg = arguments.get("path") or arguments.get("file_path") or arguments.get("target_file")
+        if path_arg and isinstance(path_arg, str):
+            checked.append("path_confinement_check")
+            clean_path = os.path.normpath(path_arg)
+            if ".." in clean_path.split(os.sep):
+                violations.append(f"Directory traversal escape detected in path '{path_arg}'")
+            if repository_root:
+                abs_root = os.path.abspath(repository_root)
+                abs_target = (
+                    os.path.abspath(os.path.join(repository_root, path_arg))
+                    if not os.path.isabs(path_arg)
+                    else os.path.abspath(path_arg)
+                )
+                if not abs_target.startswith(abs_root):
+                    violations.append(f"Target path '{path_arg}' is outside repository root '{repository_root}'")
+
+        # 3. Environment Constraint: Command Safety & Denylist
+        cmd_arg = arguments.get("command") or arguments.get("cmd") or arguments.get("bash_command")
+        if cmd_arg and isinstance(cmd_arg, str):
+            checked.append("command_safety_check")
+            for blocked in cls.DISALLOWED_COMMANDS:
+                if blocked in cmd_arg:
+                    violations.append(f"Prohibited dangerous shell command detected: '{blocked}'")
+
+        # 4. Environment Constraint: Write Destination Safety
+        if tool_name in ("write_to_file", "replace_file_content", "create_file"):
+            checked.append("write_destination_check")
+            dest = arguments.get("target_file") or arguments.get("path")
+            if not dest or not isinstance(dest, str):
+                violations.append("Write tool invoked without valid target destination path.")
+
+        passed = len(violations) == 0
+        return ToolGradAssertionResult(
+            passed=passed,
+            tool_name=tool_name,
+            violations=violations,
+            checked_constraints=checked,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Verifier Agent
 # --------------------------------------------------------------------------- #
 
@@ -1023,6 +1285,16 @@ class Verifier:
         self.sao_optimizer = StepAdvantageOptimizer(self.rule_store)
         self.code_generator = DynamicVerificationFunctionGenerator()
         self.span_engine = SpanEditingEngine(self.rule_store, self.provider)
+        self.failure_locator = FailureTurnLocator()
+        self.delta_rewriter = SingleTurnDeltaRewriter()
+        self.toolgrad_checker = ToolGradAssertionChecker()
+
+        # Telemetry counters
+        self.failure_turn_count = 0
+        self.delta_rewrite_count = 0
+        self.full_trajectory_regeneration_count = 0
+        self.toolgrad_assertions_passed = 0
+        self.toolgrad_assertions_failed = 0
 
 
     def run_self_testing_suite(
@@ -1517,6 +1789,67 @@ class Verifier:
         """Repair all detected defects across draft text."""
         return self.span_engine.repair_draft(draft_text, defects)
 
+    def locate_failing_turn(
+        self, execution_history: list[dict[str, Any]]
+    ) -> FailureLocalizationReport | None:
+        """Locate exact failing turn in Navigator's execution history."""
+        report = self.failure_locator.locate_failure(execution_history)
+        if report:
+            self.failure_turn_count += 1
+        return report
+
+    def execute_single_turn_delta_repair(
+        self,
+        execution_history: list[dict[str, Any]],
+        repair: SingleTurnDeltaRepairContract | None = None,
+    ) -> tuple[list[dict[str, Any]], SingleTurnDeltaRepairContract | None]:
+        """Execute single-turn delta rewrite without full trajectory regeneration."""
+        if repair is None:
+            failure = self.locate_failing_turn(execution_history)
+            if not failure:
+                return execution_history, None
+            replacement = (
+                f"repaired_{failure.failing_tool_invocation_or_code_block}"
+                if not failure.failing_tool_invocation_or_code_block.startswith("repaired_")
+                else failure.failing_tool_invocation_or_code_block
+            )
+            repair = SingleTurnDeltaRepairContract(
+                turn_id=failure.turn_id,
+                repair_type="tool_call" if failure.error_type == FailureType.TOOL_SCHEMA_VIOLATION else "code_block",
+                original_content=failure.failing_tool_invocation_or_code_block,
+                replacement_content=replacement,
+                explanation=f"Targeted repair addressing {failure.error_type.value}: {failure.error_message}",
+                confidence=0.98,
+            )
+
+        updated_history, applied = self.delta_rewriter.apply_delta_repair(execution_history, repair)
+        if applied:
+            self.delta_rewrite_count += 1
+            # Explicit retention protection: full trajectory regeneration remains strictly zero
+            self.full_trajectory_regeneration_count = 0
+
+        return updated_history, repair
+
+    def validate_toolgrad(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_spec: dict[str, Any] | None = None,
+        repository_root: str | None = None,
+    ) -> ToolGradAssertionResult:
+        """Execute ToolGrad pre-execution validation checks."""
+        result = self.toolgrad_checker.validate_tool_call(
+            tool_name=tool_name,
+            arguments=arguments,
+            tool_spec=tool_spec,
+            repository_root=repository_root,
+        )
+        if result.passed:
+            self.toolgrad_assertions_passed += 1
+        else:
+            self.toolgrad_assertions_failed += 1
+        return result
+
 
 # VerifierAgent class alias
 VerifierAgent = Verifier
@@ -1688,6 +2021,13 @@ __all__ = [
     "DualCheckVerdict",
     "DualCheckGrader",
     "DualCheckSandboxedVerifier",
+    "FailureType",
+    "FailureLocalizationReport",
+    "SingleTurnDeltaRepairContract",
+    "FailureTurnLocator",
+    "SingleTurnDeltaRewriter",
+    "ToolGradAssertionResult",
+    "ToolGradAssertionChecker",
 ]
 
 

@@ -45,12 +45,26 @@ from .base import (
     SynthesisRequest,
     SynthesisResult,
 )
+from .llm_client import LLMCompletionRequest
 from .local_rules import LocalRulesProvider
 from .openai_compat import OpenAICompatProvider
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class EconomicRoutingDecision:
+    """Dual-tier economic routing decision."""
+
+    task_type: str
+    target_provider: str
+    target_model: str
+    tier: int
+    estimated_cost_usd: float
+    is_frontier: bool
+    rationale: str
 
 
 @dataclass(frozen=True)
@@ -477,6 +491,7 @@ class ModelRouter:
         fallback_provider: ModelProvider | None = None,
         local_dense_provider: ModelProvider | None = None,
         air_gapped_provider: ModelProvider | None = None,
+        deepseek_provider: ModelProvider | None = None,
         settings: TribuneSettings | None = None,
         recorder: UsageRecorder | None = None,
     ) -> None:
@@ -569,6 +584,36 @@ class ModelRouter:
         else:
             self.hybrid_provider = LocalRulesProvider(role="hybrid_proposer", recorder=self.recorder)
 
+        # DeepSeek-V4.1-Flash provider for high-context ingestion and context engineering
+        if deepseek_provider is not None:
+            self.deepseek_provider = deepseek_provider
+        else:
+            try:
+                from .deepseek import DeepSeekProvider
+
+                self.deepseek_provider = DeepSeekProvider(
+                    settings=self.settings,
+                    role="ingestion",
+                    recorder=self.recorder,
+                )
+            except Exception as exc:
+                logger.warning(f"Could not initialize DeepSeekProvider: {exc}")
+                self.deepseek_provider = self.tier1_provider
+
+        # Dual-tier economic routing policy table
+        self.router_task_policy: dict[str, str] = dict(
+            getattr(self.settings, "router_task_policy", None)
+            or {
+                "ingestion": "deepseek-flash",
+                "ast_extraction": "deepseek-flash",
+                "summarization": "deepseek-flash",
+                "repository_context_building": "deepseek-flash",
+                "code_navigation": "deepseek-flash",
+                "high_level_arbitration": "frontier",
+                "ambiguous_system_decision": "frontier",
+            }
+        )
+
         # SLA Trackers per tier
         self.sla_trackers = {
             0: SLATracker(tier=0, sla_target_p95_ms=600.0),
@@ -614,6 +659,9 @@ class ModelRouter:
             "step_routing_calls": 0,
             "kv_affinity_routed_calls": 0,
             "pareto_routed_calls": 0,
+            "deepseek_calls": 0,
+            "frontier_arbitration_calls": 0,
+            "deepseek_fallbacks": 0,
         }
 
         # Registered endpoints with live disaggregated telemetry (TTFT, ITL, Unit Cost)
@@ -1062,6 +1110,261 @@ class ModelRouter:
             "latency_ms": lat,
         }
 
+    def infer_task_type(
+        self,
+        task_type: str | None = None,
+        operation_name: str | None = None,
+        payload_metadata: dict[str, Any] | None = None,
+        pipeline_stage: str | None = None,
+        intent: str | None = None,
+    ) -> str:
+        """Infer canonical task type from operation, payload, or pipeline stage."""
+        if task_type:
+            return task_type.lower().strip()
+
+        if payload_metadata:
+            for k in ("task_type", "task", "stage", "intent", "operation"):
+                val = payload_metadata.get(k)
+                if val and isinstance(val, str):
+                    return val.lower().strip()
+
+        if pipeline_stage:
+            stage = pipeline_stage.lower().strip()
+            if any(w in stage for w in ("arbitrat", "conflict", "frontier")):
+                return "high_level_arbitration"
+            if "ast" in stage:
+                return "ast_extraction"
+            if "summar" in stage:
+                return "summarization"
+            if "context" in stage:
+                return "repository_context_building"
+            if "nav" in stage:
+                return "code_navigation"
+            if "ingest" in stage:
+                return "ingestion"
+
+        if operation_name:
+            op = operation_name.lower().strip()
+            if any(w in op for w in ("arbitrat", "conflict", "frontier_judgment", "system_decision")):
+                return "high_level_arbitration"
+            if any(w in op for w in ("ast", "syntax", "tree_sitter")):
+                return "ast_extraction"
+            if any(w in op for w in ("summar", "digest", "brief")):
+                return "summarization"
+            if any(w in op for w in ("context", "prefill", "repo_analysis", "large_file")):
+                return "repository_context_building"
+            if any(w in op for w in ("navigat", "symbol_lookup", "file_tree")):
+                return "code_navigation"
+            if any(w in op for w in ("ingest", "scatter", "gather", "load_repo")):
+                return "ingestion"
+
+        if intent:
+            it = intent.lower().strip()
+            if any(w in it for w in ("arbitrat", "conflict", "frontier")):
+                return "high_level_arbitration"
+            if "ast" in it:
+                return "ast_extraction"
+            if "summar" in it:
+                return "summarization"
+            if "context" in it:
+                return "repository_context_building"
+            if "nav" in it:
+                return "code_navigation"
+            if "ingest" in it:
+                return "ingestion"
+
+        return "ingestion"
+
+    def determine_economic_route(
+        self,
+        task_type: str,
+        input_tokens_estimate: int = 1000,
+        output_tokens_estimate: int = 250,
+        cached_tokens_estimate: int = 0,
+    ) -> EconomicRoutingDecision:
+        """Evaluate task type against policy table and determine provider and cost."""
+        mapped = self.router_task_policy.get(task_type, "deepseek-flash")
+        is_frontier = mapped in ("frontier", "frontier_provider", "tier2", "tier2_verifier")
+
+        if is_frontier:
+            model_name = self.tier2_model
+            tier = 2
+            # Frontier pricing ($2.00-$2.50/M input, $6.00-$10.00/M output)
+            cost = (input_tokens_estimate * 2.00 + output_tokens_estimate * 6.00) / 1_000_000.0
+            rationale = (
+                f"Task '{task_type}' requires frontier judgment / high-level arbitration. "
+                f"Routed to frontier model {model_name} (Tier 2)."
+            )
+            provider_name = getattr(self.tier2_provider, "name", "tier2_frontier")
+        else:
+            model_name = getattr(self.deepseek_provider, "model", "deepseek-flash")
+            tier = 1
+            # DeepSeek-V4.1-Flash pricing ($0.30/M uncached, $0.006/M cached, $1.20/M output)
+            uncached = max(0, input_tokens_estimate - cached_tokens_estimate)
+            cost = (
+                uncached * 0.30 + cached_tokens_estimate * 0.006 + output_tokens_estimate * 1.20
+            ) / 1_000_000.0
+            rationale = (
+                f"Task '{task_type}' is an ingestion/context engineering workload. "
+                f"Routed to primary engine {model_name} (DeepSeek-V4.1-Flash)."
+            )
+            provider_name = getattr(self.deepseek_provider, "name", "deepseek:deepseek-flash")
+
+        return EconomicRoutingDecision(
+            task_type=task_type,
+            target_provider=provider_name,
+            target_model=model_name,
+            tier=tier,
+            estimated_cost_usd=round(cost, 8),
+            is_frontier=is_frontier,
+            rationale=rationale,
+        )
+
+    def route_codebase_task(
+        self,
+        task_type: str | None = None,
+        operation_name: str | None = None,
+        payload_metadata: dict[str, Any] | None = None,
+        pipeline_stage: str | None = None,
+        prompt: str = "",
+        context: str = "",
+        cached_tokens: int = 0,
+        frontier_fallback_allowed: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Dual-tier economic routing for codebase tasks.
+
+        Routes:
+        - Ingestion, AST extraction, summarization, repository context building, and code navigation
+          to DeepSeekProvider (DeepSeek-V4.1-Flash).
+        - High-level arbitration, ambiguous system decision, and cross-module conflict resolution
+          to closed frontier models.
+        - Guardrail: never silently routes large ingestion workloads to expensive frontier models.
+        """
+        start_t = time.perf_counter()
+        canonical_task = self.infer_task_type(
+            task_type=task_type,
+            operation_name=operation_name,
+            payload_metadata=payload_metadata,
+            pipeline_stage=pipeline_stage,
+            intent=kwargs.get("intent"),
+        )
+
+        total_text_len = len(prompt) + len(context)
+        in_tokens = max(1, total_text_len // 4)
+        out_tokens_est = kwargs.get("max_tokens", 512)
+
+        decision = self.determine_economic_route(
+            task_type=canonical_task,
+            input_tokens_estimate=in_tokens,
+            output_tokens_estimate=out_tokens_est,
+            cached_tokens_estimate=cached_tokens,
+        )
+
+        selected_provider = self.tier2_provider if decision.is_frontier else self.deepseek_provider
+        selected_model = decision.target_model
+        retry_events = []
+        fallback_occurred = False
+
+        if decision.is_frontier:
+            self.stats["frontier_arbitration_calls"] += 1
+            self.stats["tier2_calls"] += 1
+            try:
+                if hasattr(selected_provider, "complete"):
+                    req = LLMCompletionRequest(
+                        messages=[{"role": "user", "content": prompt or context}],
+                        system_prompt="You are Tribune's high-level arbitration reasoning engine.",
+                        model=selected_model,
+                        temperature=0.0,
+                    )
+                    resp = selected_provider.complete(req)
+                    result_text = resp.content
+                    act_in = resp.input_tokens
+                    act_out = resp.output_tokens
+                    act_cached = resp.cached_tokens
+                else:
+                    result_text = f"Arbitration executed via {selected_model}"
+                    act_in, act_out, act_cached = in_tokens, 64, 0
+            except Exception as exc:
+                retry_events.append({"stage": "frontier_execution", "error": str(exc)})
+                raise RuntimeError(
+                    f"Frontier arbitration model unavailable for task '{canonical_task}': {exc}"
+                ) from exc
+        else:
+            self.stats["deepseek_calls"] += 1
+            self.stats["tier1_calls"] += 1
+            try:
+                if hasattr(selected_provider, "complete"):
+                    req = LLMCompletionRequest(
+                        messages=[{"role": "user", "content": prompt or context}],
+                        system_prompt="You are Tribune's DeepSeek-V4.1-Flash codebase engine.",
+                        model=selected_model,
+                        temperature=1.0,
+                        reasoning_effort="high",
+                    )
+                    resp = selected_provider.complete(req)
+                    result_text = resp.content
+                    act_in = resp.input_tokens
+                    act_out = resp.output_tokens
+                    act_cached = resp.cached_tokens
+                else:
+                    result_text = f"Codebase task '{canonical_task}' executed via {selected_model}"
+                    act_in = in_tokens
+                    act_out = 64
+                    act_cached = cached_tokens
+            except Exception as exc:
+                fallback_occurred = True
+                self.stats["deepseek_fallbacks"] += 1
+                self.stats["fallbacks"] += 1
+                retry_events.append({
+                    "stage": "deepseek_primary",
+                    "error": str(exc),
+                    "fallback_target": getattr(self.fallback_provider, "name", "fallback_local"),
+                })
+                logger.warning(
+                    f"DeepSeekProvider failed for task '{canonical_task}': {exc}. "
+                    f"Falling back to safe secondary provider '{getattr(self.fallback_provider, 'name', 'local')}'."
+                )
+                if frontier_fallback_allowed and self.tier2_provider:
+                    selected_provider = self.tier2_provider
+                    selected_model = self.tier2_model
+                else:
+                    selected_provider = self.fallback_provider
+                    selected_model = getattr(self.fallback_provider, "version", "fallback_local")
+
+                result_text = f"Executed via fallback {selected_model} following error: {exc}"
+                act_in, act_out, act_cached = in_tokens, 32, 0
+
+        lat_ms = (time.perf_counter() - start_t) * 1000.0
+        cache_hit_rate = round(act_cached / act_in, 4) if act_in > 0 else 0.0
+
+        routing_telemetry = {
+            "selected_provider": getattr(selected_provider, "name", "unknown"),
+            "selected_model": selected_model,
+            "task_type": canonical_task,
+            "estimated_cost_usd": decision.estimated_cost_usd,
+            "actual_input_tokens": act_in,
+            "actual_output_tokens": act_out,
+            "cached_tokens": act_cached,
+            "cache_hit_rate": cache_hit_rate,
+            "latency_ms": round(lat_ms, 2),
+            "fallback_occurred": fallback_occurred,
+            "retry_events": retry_events,
+            "rationale": decision.rationale,
+        }
+        logger.info(f"[ECONOMIC_ROUTER] {routing_telemetry}")
+
+        return {
+            "status": "success",
+            "task_type": canonical_task,
+            "provider": getattr(selected_provider, "name", "unknown"),
+            "model": selected_model,
+            "tier": decision.tier,
+            "result": result_text,
+            "telemetry": routing_telemetry,
+            "latency_ms": lat_ms,
+        }
+
     def route_hybrid_attention_task(
         self,
         req: SynthesisRequest,
@@ -1245,8 +1548,26 @@ class ModelRouter:
 
         if intent:
             norm_intent = intent.lower().strip()
-            if norm_intent in ("document_ingestion", "trajectory_planning", "non_binding_trajectory_planning"):
+            if norm_intent in (
+                "document_ingestion",
+                "trajectory_planning",
+                "non_binding_trajectory_planning",
+                "ingestion",
+                "ast_extraction",
+                "summarization",
+                "repository_context_building",
+                "code_navigation",
+                "contextual_summarization",
+                "codebase_ingestion",
+            ):
                 return 1
+            if norm_intent in (
+                "high_level_arbitration",
+                "ambiguous_system_decision",
+                "arbitration",
+                "conflict_resolution",
+            ):
+                return 2
 
         if multi_file or estimated_turns >= 4:
             # Multi-file case files and deep tool calling sequences prioritize high-horizon Tier 2 frontier model

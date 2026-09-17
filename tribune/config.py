@@ -78,11 +78,16 @@ class TribuneSettings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-3-5-sonnet-20241022"
 
-    # DeepSeek API parameters (including DeepSeek-V4-Flash & DeepSeek-V4-Pro)
+    # DeepSeek API parameters (including DeepSeek-V4.1-Flash & DeepSeek-V4-Pro)
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-v4-pro"
-    deepseek_reasoning_effort: Literal["low", "medium", "high"] = "medium"
+    deepseek_model_name: str = "deepseek-flash"
+    deepseek_flash_endpoint: str = "https://api.deepseek.com/v1"
+    enable_prompt_caching: bool = True
+    deepseek_cache_headers: dict[str, str] = Field(default_factory=dict)
+    deepseek_temperature_override: float | None = None
+    deepseek_reasoning_effort: Literal["low", "medium", "high"] = "high"
 
     # Grok / xAI API parameters
     grok_base_url: str = "https://api.x.ai/v1"
@@ -156,6 +161,43 @@ class TribuneSettings(BaseSettings):
     mcp_auth_token: str = Field(
         default_factory=lambda: os.getenv("TRIBUNE_MCP_AUTH_TOKEN", "")
     )
+
+    # -- Dual-Tier Economic Routing Policy & Engine Mappings ---------------- #
+    router_task_policy: dict[str, str] = Field(
+        default_factory=lambda: {
+            "ingestion": "deepseek-flash",
+            "ast_extraction": "deepseek-flash",
+            "summarization": "deepseek-flash",
+            "repository_context_building": "deepseek-flash",
+            "code_navigation": "deepseek-flash",
+            "high_level_arbitration": "frontier",
+            "ambiguous_system_decision": "frontier",
+        }
+    )
+    frontier_providers: list[str] = Field(
+        default_factory=lambda: [
+            "openai:gpt-5.6-sol-ultrafast",
+            "xai:grok-4.6",
+        ]
+    )
+
+    # -- Preparer & PARSER Scatter-Gather Settings ------------------------- #
+    preparer_max_prefix_tokens: int = 1_000_000
+    preparer_max_dynamic_tail_tokens: int = 32_000
+    parser_max_workers: int = 4
+    parser_partition_token_budget: int = 8_000
+    parser_intermediate_token_budget: int = 64_000
+
+    # -- Navigator Elastic Horizon & Anti-Verbosity Settings --------------- #
+    navigator_default_horizon: int = 15
+    navigator_rolling_window_size: int = 50
+    navigator_max_intermediate_tool_tokens: int = 512
+    navigator_enable_subagents: bool = False
+    verbosity_loop_detection_enabled: bool = True
+
+    # -- Verifier Single-Turn Delta Repair & ToolGrad Settings ------------- #
+    verifier_delta_rewrite_enabled: bool = True
+    toolgrad_strict_mode_enabled: bool = True
 
     # -- ReasonMaxxer & Local Dense Model Configuration -------------------- #
     enable_reasonmaxxer: bool = Field(
