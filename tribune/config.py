@@ -282,6 +282,59 @@ class TribuneSettings(BaseSettings):
     seed: int = 7
     data_dir: str = Field(default_factory=lambda: os.path.join(os.getcwd(), ".tribune"))
 
+    # -- Architectural Roadmap & Compliance Controls ------------------------ #
+    lead_model_name: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_LEAD_MODEL", "gpt-4o")
+    )
+    worker_model_name: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_WORKER_MODEL", "deepseek-v4.1-flash")
+    )
+    lead_provider: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_LEAD_PROVIDER", "openai_compatible")
+    )
+    worker_provider: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_WORKER_PROVIDER", "openai_compatible")
+    )
+    reasoning_budget_cap_usd: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_REASONING_BUDGET_CAP_USD", "1.00"))
+    )
+    reasoning_budget_cap_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_REASONING_BUDGET_CAP_TOKENS", "200000"))
+    )
+    citation_verifier_strict: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_CITATION_VERIFIER_STRICT", "true")).lower() in ("true", "1", "yes")
+    )
+    sandbox_mode: Literal["container", "local_fallback", "disabled"] = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_SANDBOX_MODE", "container")  # type: ignore[assignment]
+    )
+    sandbox_network_isolated: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_SANDBOX_NETWORK_ISOLATED", "true")).lower() in ("true", "1", "yes")
+    )
+    sandbox_timeout_s: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_SANDBOX_TIMEOUT_S", "60.0"))
+    )
+    trace_ledger_output_path: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_TRACE_LEDGER_OUTPUT_PATH", "artifacts/trace_ledger.json")
+    )
+    trace_hashing_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_TRACE_HASHING_ENABLED", "true")).lower() in ("true", "1", "yes")
+    )
+    redaction_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_REDACTION_ENABLED", "true")).lower() in ("true", "1", "yes")
+    )
+    aef1_report_output_path: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_AEF1_REPORT_OUTPUT_PATH", "artifacts/aef1_compliance")
+    )
+    policy_enforcement_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_POLICY_ENFORCEMENT_ENABLED", "true")).lower() in ("true", "1", "yes")
+    )
+    recursive_retries_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_RECURSIVE_RETRIES_ENABLED", "false")).lower() in ("true", "1", "yes")
+    )
+    legacy_monolithic_execution: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_LEGACY_MONOLITHIC_EXECUTION", "false")).lower() in ("true", "1", "yes")
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> TribuneSettings:

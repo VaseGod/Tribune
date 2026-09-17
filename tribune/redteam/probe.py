@@ -174,8 +174,13 @@ def _check_payload(
 
 
 class InjectionProbe:
-    def __init__(self, settings: TribuneSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: TribuneSettings | None = None,
+        provider: Any | None = None,
+    ) -> None:
         self.settings = _ocr_settings(settings)
+        self.provider = provider
 
     def run(
         self,
@@ -188,6 +193,37 @@ class InjectionProbe:
         for payload in selected:
             findings.extend(_check_payload(base_case, payload, self.settings))
         return ProbeReport(n_payloads=len(selected), findings=findings)
+
+    def generate_aef1_compliance_report(
+        self,
+        probe_report: ProbeReport | None = None,
+        sandbox_mode: str = "container",
+        output_directory: str | None = None,
+    ) -> tuple[Any, str | None, str | None]:
+        """Generate standardized AEF-1 compliance checklist alongside red-teaming report."""
+        from .aef_compliance import AEFComplianceEngine
+
+        engine = AEFComplianceEngine()
+        policy_triggers = []
+        if probe_report and probe_report.findings:
+            for f in probe_report.findings:
+                policy_triggers.append({
+                    "payload_id": f.payload_id,
+                    "check": f.check,
+                    "detail": f.detail,
+                })
+
+        checklist = engine.build_checklist(
+            sandbox_mode=sandbox_mode,
+            network_isolated=True,
+            policy_triggers=policy_triggers,
+        )
+
+        json_path, md_path = None, None
+        if output_directory:
+            json_path, md_path = engine.export_reports(checklist, output_directory)
+
+        return checklist, json_path, md_path
 
     def run_evomal_probes(self) -> dict[str, Any]:
         """Run EvoMal memory tampering, unsigned partition injection, and browser sandbox exfiltration probes."""

@@ -473,10 +473,115 @@ class AsyncStreamInterceptor:
             yield chunk
 
 
+# --------------------------------------------------------------------------- #
+# Explicit Redaction Disclaimers & Failure-Preserving Masking
+# --------------------------------------------------------------------------- #
+
+_SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+_PHONE_PATTERN = re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
+_EIN_PATTERN = re.compile(r"\b\d{2}-\d{7}\b")
+_BUSINESS_REV_PATTERN = re.compile(r"\b(?:gross_revenue|net_profit|corporate_assets|tax_id|ein)\s*[:=]\s*[\$0-9,.]+", re.IGNORECASE)
+
+# Markers indicating substantive evaluation failures that must NEVER be silently removed
+_FAILURE_MARKERS = [
+    re.compile(r"\b(?:AssertionError|FAILED|DefectDetected|VerifierFault|CRC Fault|SecurityViolationError)\b"),
+    re.compile(r"Traceback \(most recent call last\):.*?(?:\n[^\n]+)+", re.DOTALL),
+    re.compile(r"\[VERIFIER_GATE_REJECTION\].*?=================================", re.DOTALL),
+]
+
+
+@dataclass
+class RedactionDisclaimer:
+    """Explicit disclaimer documenting masked sensitive data while certifying failure preservation."""
+
+    has_redactions: bool = False
+    pii_count: int = 0
+    business_records_count: int = 0
+    preserved_failure_signatures: list[str] = field(default_factory=list)
+    disclaimer_text: str = ""
+
+    def summary(self) -> str:
+        if not self.has_redactions:
+            return "No sensitive data was redacted."
+        return (
+            f"[REDACTION DISCLAIMER: {self.pii_count} PII items masked as [REDACTED_PII], "
+            f"{self.business_records_count} business records masked as [REDACTED_BUSINESS_RECORD]. "
+            f"All substantive evaluation failure modes ({len(self.preserved_failure_signatures)}) have been preserved.]"
+        )
+
+
+def redact_sensitive_data(
+    text: str,
+    preserve_failure_evidence: bool = True,
+) -> tuple[str, RedactionDisclaimer]:
+    """Mask proprietary business records and PII with explicit stable markers.
+
+    Guarantees:
+    - Replaces SSN, Email, Phone with [REDACTED_PII: <TYPE>].
+    - Replaces EIN and corporate financials with [REDACTED_BUSINESS_RECORD: <TYPE>].
+    - Never silently removes failure evidence: preserves failure traces, assertions, and verifier errors.
+    - Appends an explicit disclaimer certifying that redaction occurred.
+    """
+    if not text:
+        return "", RedactionDisclaimer()
+
+    disclaimer = RedactionDisclaimer()
+
+    # 1. Identify and record failure evidence to ensure preservation
+    if preserve_failure_evidence:
+        for marker in _FAILURE_MARKERS:
+            for match in marker.finditer(text):
+                disclaimer.preserved_failure_signatures.append(match.group(0)[:80])
+
+    current = text
+
+    # 2. Mask SSN
+    ssn_matches = _SSN_PATTERN.findall(current)
+    if ssn_matches:
+        disclaimer.pii_count += len(ssn_matches)
+        current = _SSN_PATTERN.sub("[REDACTED_PII: SSN]", current)
+
+    # 3. Mask Email
+    email_matches = _EMAIL_PATTERN.findall(current)
+    if email_matches:
+        disclaimer.pii_count += len(email_matches)
+        current = _EMAIL_PATTERN.sub("[REDACTED_PII: EMAIL]", current)
+
+    # 4. Mask Phone
+    phone_matches = _PHONE_PATTERN.findall(current)
+    if phone_matches:
+        disclaimer.pii_count += len(phone_matches)
+        current = _PHONE_PATTERN.sub("[REDACTED_PII: PHONE]", current)
+
+    # 5. Mask EIN
+    ein_matches = _EIN_PATTERN.findall(current)
+    if ein_matches:
+        disclaimer.business_records_count += len(ein_matches)
+        current = _EIN_PATTERN.sub("[REDACTED_BUSINESS_RECORD: EIN]", current)
+
+    # 6. Mask Business Financials
+    biz_matches = _BUSINESS_REV_PATTERN.findall(current)
+    if biz_matches:
+        disclaimer.business_records_count += len(biz_matches)
+        current = _BUSINESS_REV_PATTERN.sub("[REDACTED_BUSINESS_RECORD: FINANCIALS]", current)
+
+    disclaimer.has_redactions = (disclaimer.pii_count + disclaimer.business_records_count) > 0
+    disclaimer.disclaimer_text = disclaimer.summary()
+
+    # If redactions occurred, prepend the formal legal disclaimer
+    if disclaimer.has_redactions:
+        current = f"{disclaimer.disclaimer_text}\n\n{current}"
+
+    return current, disclaimer
+
+
 __all__ = [
     "AntiMetaAwarenessScrubber",
     "ScrubbingTelemetry",
     "SanitizationViolationError",
     "AsyncStreamInterceptor",
     "SuspensionHook",
+    "RedactionDisclaimer",
+    "redact_sensitive_data",
 ]

@@ -576,6 +576,219 @@ class SimulationEngine:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Dual-Tier Orchestration Model (Lead Tier + Worker Tier)
+# --------------------------------------------------------------------------- #
+
+from ..inference.base import InferenceProvider, InferenceRequest, InferenceResponse
+from ..inference.registry import get_inference_registry
+from .reasoning_budget import TaskReasoningBudget
+from .task_classifier import DeterministicTaskClassifier, TaskComplexityClass, TaskRoutingDecision
+
+
+class LeadOrchestrator:
+    """Lead Orchestrator Tier (Frontier / Astra / Claude Opus / GPT-4o).
+
+    Responsible for:
+    - Appeal strategy and appellate argument planning.
+    - Complex statutory and constitutional synthesis.
+    - Review and approval of worker tier outputs.
+    """
+
+    def __init__(
+        self,
+        provider: InferenceProvider | None = None,
+        model: str = "gpt-4o",
+    ) -> None:
+        self.provider = provider or get_inference_registry().get_provider()
+        self.model = model
+
+    def plan_appeal_strategy(self, case_summary: str, denial_grounds: str) -> dict[str, Any]:
+        """Develop a high-level appellate legal strategy."""
+        prompt = (
+            f"Analyze the following benefit denial and synthesize an appellate legal strategy:\n"
+            f"Case: {case_summary}\n"
+            f"Denial grounds: {denial_grounds}\n"
+            f"Provide legal arguments, required statutory citations, and procedural grounds."
+        )
+        req = InferenceRequest(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.model,
+            system_prompt="You are an expert appellate public-benefits attorney synthesizing legal strategy.",
+            metadata={"tier": "lead", "operation": "appeal_strategy"},
+        )
+        resp = self.provider.complete(req)
+        return {
+            "tier": "lead",
+            "model": resp.model,
+            "strategy_text": resp.text,
+            "tokens_used": resp.usage.total_tokens,
+            "cost_usd": resp.cost_usd,
+        }
+
+    def review_worker_output(self, worker_document: str, standard_of_review: str = "statutory_compliance") -> dict[str, Any]:
+        """Review and certify an administrative document produced by the worker tier."""
+        prompt = (
+            f"Review the following draft for legal accuracy and statutory compliance:\n"
+            f"Draft:\n{worker_document}\n"
+            f"Standard: {standard_of_review}\n"
+            f"Flag any defects, missing citations, or factual misalignments."
+        )
+        req = InferenceRequest(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.model,
+            system_prompt="You are a senior supervising attorney certifying draft legal filings.",
+            metadata={"tier": "lead", "operation": "review_worker_output"},
+        )
+        resp = self.provider.complete(req)
+        return {
+            "tier": "lead",
+            "model": resp.model,
+            "review_notes": resp.text,
+            "approved": "REJECT" not in resp.text.upper() and "DEFECT" not in resp.text.upper(),
+            "tokens_used": resp.usage.total_tokens,
+            "cost_usd": resp.cost_usd,
+        }
+
+
+class WorkerOrchestrator:
+    """Worker Tier (DeepSeek-V4.1-Flash / Swift-Qwen3.8-27B).
+
+    Responsible for high-volume, low-cost operations:
+    - Intake form completion
+    - Docket updates and clerk minutes
+    - Administrative document drafting
+    - Notice date and deadline tracking
+    """
+
+    def __init__(
+        self,
+        provider: InferenceProvider | None = None,
+        model: str = "deepseek-v4.1-flash",
+    ) -> None:
+        self.provider = provider or get_inference_registry().get_provider()
+        self.model = model
+
+    def draft_administrative_document(self, template_name: str, applicant_data: dict[str, Any]) -> dict[str, Any]:
+        """Draft a routine administrative document or form."""
+        prompt = (
+            f"Draft the {template_name} form using the following applicant facts:\n"
+            f"Data: {applicant_data}\n"
+            f"Output concise, standardized administrative text."
+        )
+        req = InferenceRequest(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.model,
+            system_prompt="You are an efficient legal assistant drafting standard administrative filings.",
+            metadata={"tier": "worker", "operation": "administrative_drafting"},
+        )
+        resp = self.provider.complete(req)
+        return {
+            "tier": "worker",
+            "model": resp.model,
+            "draft_text": resp.text,
+            "tokens_used": resp.usage.total_tokens,
+            "cost_usd": resp.cost_usd,
+        }
+
+    def draft_docket_update(self, case_id: str, event_description: str) -> dict[str, Any]:
+        """Create a standard docket update entry."""
+        prompt = f"Create a docket entry for Case {case_id}: Event: {event_description}"
+        req = InferenceRequest(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.model,
+            system_prompt="Generate standardized court docket entry lines.",
+            metadata={"tier": "worker", "operation": "docket_update"},
+        )
+        resp = self.provider.complete(req)
+        return {
+            "tier": "worker",
+            "model": resp.model,
+            "docket_text": resp.text,
+            "tokens_used": resp.usage.total_tokens,
+            "cost_usd": resp.cost_usd,
+        }
+
+
+class DualTierSimulationOrchestrator:
+    """Coordinates dual-tier model execution, dynamic routing, and reasoning budgets."""
+
+    def __init__(
+        self,
+        lead_orchestrator: LeadOrchestrator | None = None,
+        worker_orchestrator: WorkerOrchestrator | None = None,
+        classifier: DeterministicTaskClassifier | None = None,
+    ) -> None:
+        self.lead = lead_orchestrator or LeadOrchestrator()
+        self.worker = worker_orchestrator or WorkerOrchestrator()
+        self.classifier = classifier or DeterministicTaskClassifier()
+        self.audit_log: list[dict[str, Any]] = []
+
+    def dispatch_task(
+        self,
+        task_id: str,
+        task_description: str,
+        applicant_data: dict[str, Any] | None = None,
+        citations_count: int = 0,
+        party_count: int = 1,
+        prior_verifier_failures: int = 0,
+        force_tier: str | None = None,
+    ) -> dict[str, Any]:
+        """Classify task complexity, route to worker or lead, and record routing metadata."""
+        # 1. Deterministic task classification
+        decision = self.classifier.classify(
+            task_text=task_description,
+            citations_count=citations_count,
+            party_count=party_count,
+            prior_verifier_failures=prior_verifier_failures,
+        )
+
+        selected_tier = force_tier or decision.selected_tier
+        budget = TaskReasoningBudget.from_decision(task_id, decision)
+
+        # 2. Dispatch to designated tier
+        start_t = time.perf_counter()
+        if selected_tier == "lead":
+            outcome = self.lead.plan_appeal_strategy(task_description, str(applicant_data or {}))
+        else:
+            outcome = self.worker.draft_administrative_document(task_description, applicant_data or {})
+
+        duration_ms = (time.perf_counter() - start_t) * 1000.0
+
+        # 3. Record budget completion
+        tokens_used = outcome.get("tokens_used", 0)
+        cost_usd = outcome.get("cost_usd", 0.0)
+        budget.record_completion(tokens_in=int(tokens_used * 0.7), tokens_out=int(tokens_used * 0.3), cost_usd=cost_usd)
+
+        # 4. Record audit log
+        log_entry = {
+            "task_id": task_id,
+            "timestamp": budget.timestamp,
+            "task_class": decision.task_class.value,
+            "selected_tier": selected_tier,
+            "selected_model": outcome.get("model", ""),
+            "expected_budget": decision.expected_token_budget,
+            "tokens_consumed": tokens_used,
+            "cost_usd": cost_usd,
+            "duration_ms": duration_ms,
+            "routing_reason": decision.routing_reason,
+            "complexity_score": decision.complexity_score,
+            "budget_exceeded": budget.budget_exceeded,
+        }
+        self.audit_log.append(log_entry)
+        logger.info(f"[DualTierOrchestrator] Task '{task_id}' finished under tier '{selected_tier}' ({tokens_used} tokens, ${cost_usd:.4f})")
+
+        return {
+            "task_id": task_id,
+            "tier": selected_tier,
+            "model": outcome.get("model", ""),
+            "result": outcome,
+            "routing_decision": decision,
+            "budget": budget,
+            "audit_entry": log_entry,
+        }
+
+
 __all__ = [
     "FacialExpression",
     "QuestionPressure",
@@ -589,5 +802,8 @@ __all__ = [
     "SimulationState",
     "TrajectoryOutcome",
     "SimulationEngine",
+    "LeadOrchestrator",
+    "WorkerOrchestrator",
+    "DualTierSimulationOrchestrator",
 ]
 

@@ -430,6 +430,30 @@ class CryptographicCitationMapper:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Deterministic Citation Verifier Gate & AST Integration
+# --------------------------------------------------------------------------- #
+
+from .citation_ast import (
+    CitationASTNode,
+    CitationASTParser,
+    CitationType,
+    CitationVerificationGateResult,
+    CitationVerifierGate,
+    ValidationStatus,
+)
+
+
+def verify_citation_gate(
+    citation_text: str,
+    expected_jurisdiction: str | None = None,
+    strict_mode: bool = True,
+) -> CitationVerificationGateResult:
+    """Convenience functional gate to deterministically verify a citation."""
+    gate = CitationVerifierGate(strict_mode=strict_mode)
+    return gate.verify_citation(citation_text, expected_jurisdiction=expected_jurisdiction)
+
+
 __all__ = [
     "tokenize",
     "embed_token",
@@ -445,5 +469,12 @@ __all__ = [
     "CitationVerificationReport",
     "CryptographicCitationMapper",
     "normalize_segment_text",
+    "CitationASTNode",
+    "CitationASTParser",
+    "CitationType",
+    "CitationVerificationGateResult",
+    "CitationVerifierGate",
+    "ValidationStatus",
+    "verify_citation_gate",
 ]
 

@@ -903,6 +903,30 @@ class SyntheticCaseGenerator:
             )
         ]
 
+    def export_case_markdown(self, case: SyntheticCase) -> str:
+        """Export a generated case into standardized compact Markdown schema."""
+        return serialize_case_to_markdown(case)
+
+    def import_case_markdown(self, md_text: str) -> SyntheticCase:
+        """Import a case from compact Markdown schema."""
+        return parse_markdown_to_case(md_text)
+
+
+# --------------------------------------------------------------------------- #
+# Markdown Schema Exports & Adapters
+# --------------------------------------------------------------------------- #
+
+from .markdown_schema import (
+    convert_json_to_markdown,
+    convert_markdown_to_json,
+    parse_markdown_to_case,
+    serialize_case_to_markdown,
+)
+
+# Monkey-patch convenience methods onto SyntheticCase for seamless ergonomics
+SyntheticCase.to_markdown = lambda self: serialize_case_to_markdown(self)  # type: ignore[attr-defined]
+SyntheticCase.from_markdown = staticmethod(lambda text: parse_markdown_to_case(text))  # type: ignore[attr-defined]
+
 
 __all__ = [
     "LatentFact",
@@ -914,4 +938,8 @@ __all__ = [
     "ScenarioAgent",
     "DualAgentScenarioMiner",
     "SyntheticCaseGenerator",
+    "serialize_case_to_markdown",
+    "parse_markdown_to_case",
+    "convert_json_to_markdown",
+    "convert_markdown_to_json",
 ]

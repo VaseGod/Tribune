@@ -78,6 +78,22 @@ class UsageRecorder:
             early_exit_step=task.early_exit_step,
             tokens_saved_estimate=task.tokens_saved_estimate,
         )
+        try:
+            ledger = tracing.get_trace_ledger()
+            ledger.record_step(
+                task_id=f"{task.case_id}:{task.program}",
+                run_id=task.case_id,
+                step_type="TASK_USAGE_COMPLETED",
+                token_usage={
+                    "prompt_tokens": task.tokens_input,
+                    "completion_tokens": task.tokens_output,
+                    "cached_tokens": task.cache_read_tokens,
+                },
+                cost_estimate_usd=task.cost_usd,
+                outcome="SUCCESS",
+            )
+        except Exception:
+            pass
         self.history.append(task)
         return task
 

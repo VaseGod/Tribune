@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import re
 import shlex
-from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import Field
+
 from ..types import StrictModel
+from .audit import SecurityEventType, record_security_event
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +76,6 @@ def detect_reward_hacking_attempt(code_or_diff: str) -> tuple[bool, str]:
 # --------------------------------------------------------------------------- #
 # Dynamic AST Policy Verification
 # --------------------------------------------------------------------------- #
-
-
-from pydantic import Field
 
 
 class PolicyValidationResult(StrictModel):
@@ -290,8 +290,6 @@ class ASTPolicyEngine:
         except Exception:
             tokens = command_str.split()
 
-        cmd_lower = command_str.lower()
-
         # Check dangerous shell commands
         if re.search(r"\brm\s+-(?:r[fF]|rf|fr)\s+(?:/|/\*|\*|\$HOME|~)\b", command_str):
             violations.append("Unauthorized root/recursive filesystem deletion attempt")
@@ -435,6 +433,196 @@ class ASTPolicyEngine:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Runtime Policy Gates & Active Enforcers
+# --------------------------------------------------------------------------- #
+
+
+class PolicyGateViolationError(PermissionError):
+    """Raised when an operation is blocked by a runtime security policy gate."""
+
+    def __init__(
+        self,
+        message: str,
+        violation_type: str = "POLICY_GATE_VIOLATION",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.violation_type = violation_type
+        self.details = details or {}
+
+
+class RuntimePolicyGate:
+    """Active runtime policy enforcer intercepting unsafe tool calls, sandbox escapes,
+
+    budget overages, and unauthorized operations prior to execution.
+    """
+
+    def __init__(
+        self,
+        forbidden_tools: set[str] | None = None,
+        workspace_root: str | None = None,
+        max_cost_cap_usd: float = 1.00,
+        max_token_ceiling: int = 200_000,
+        allow_external_network: bool = False,
+    ) -> None:
+        self.forbidden_tools = forbidden_tools or {
+            "eval_code",
+            "execute_shell",
+            "raw_socket_bind",
+            "format_disk",
+            "modify_security_rules",
+            "wipe_audit_ledger",
+        }
+        self.workspace_root = os.path.abspath(workspace_root or os.getcwd())
+        self.max_cost_cap_usd = max_cost_cap_usd
+        self.max_token_ceiling = max_token_ceiling
+        self.allow_external_network = allow_external_network
+        self._kill_switch_active: bool = False
+        self._kill_reason: str = ""
+
+    def activate_kill_switch(self, reason: str = "Emergency kill switch triggered") -> None:
+        """Activate immediate kill switch halting all operations."""
+        self._kill_switch_active = True
+        self._kill_reason = reason
+        record_security_event(
+            event_type=SecurityEventType.SECURITY_VIOLATION,
+            source="tribune.security.policies.RuntimePolicyGate",
+            message=f"Kill switch activated: {reason}",
+            severity="CRITICAL",
+            details={"kill_switch": True, "reason": reason},
+        )
+        logger.critical(f"[RuntimePolicyGate] Kill switch triggered: {reason}")
+
+    def validate_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        """Enforce strict tool-use boundaries and sandbox path safety."""
+        # 1. Kill switch check
+        if self._kill_switch_active:
+            raise PolicyGateViolationError(
+                f"Operation rejected: Kill switch is active ({self._kill_reason})",
+                violation_type="KILL_SWITCH_ACTIVE",
+                details={"reason": self._kill_reason},
+            )
+
+        # 2. Forbidden tool check
+        if tool_name in self.forbidden_tools:
+            record_security_event(
+                event_type=SecurityEventType.SECURITY_VIOLATION,
+                source="tribune.security.policies.RuntimePolicyGate",
+                message=f"Forbidden tool invocation attempt: '{tool_name}'",
+                severity="HIGH",
+                details={"tool_name": tool_name, "arguments": arguments},
+            )
+            raise PolicyGateViolationError(
+                f"Tool '{tool_name}' is strictly prohibited by security policy gate.",
+                violation_type="FORBIDDEN_TOOL",
+                details={"tool_name": tool_name},
+            )
+
+        # 3. Path traversal & file boundary checks
+        for arg_k, arg_v in arguments.items():
+            if isinstance(arg_v, str) and ("path" in arg_k or "file" in arg_k or "/" in arg_v):
+                # Check traversal
+                if ".." in arg_v:
+                    record_security_event(
+                        event_type=SecurityEventType.ASTRA_CLASS_CONTAINMENT_BREACH,
+                        source="tribune.security.policies.RuntimePolicyGate",
+                        message=f"Path traversal breach detected: '{arg_v}' in tool '{tool_name}'",
+                        severity="CRITICAL",
+                        details={"tool_name": tool_name, "param": arg_k, "path": arg_v},
+                    )
+                    raise PolicyGateViolationError(
+                        f"Path traversal ('..') detected in parameter '{arg_k}': {arg_v}",
+                        violation_type="PATH_TRAVERSAL_BREACH",
+                        details={"path": arg_v},
+                    )
+                # Check sensitive system root directories
+                norm = os.path.normpath(arg_v).lower()
+                for sensitive in ("/etc", "/proc", "/sys", "/dev", "~/.ssh", ".aws", ".env"):
+                    if norm.startswith(sensitive) or f"/{sensitive}/" in norm:
+                        record_security_event(
+                            event_type=SecurityEventType.ASTRA_CLASS_CONTAINMENT_BREACH,
+                            source="tribune.security.policies.RuntimePolicyGate",
+                            message=f"Unauthorized access attempt to sensitive system path '{arg_v}'",
+                            severity="CRITICAL",
+                            details={"path": arg_v, "tool_name": tool_name},
+                        )
+                        raise PolicyGateViolationError(
+                            f"Access to sensitive host path '{arg_v}' is prohibited.",
+                            violation_type="SENSITIVE_PATH_ACCESS",
+                            details={"path": arg_v},
+                        )
+
+        # 4. Command safety checks if shell or command argument present
+        for cmd_key in ("command", "cmd", "script", "bash"):
+            cmd_val = arguments.get(cmd_key)
+            if isinstance(cmd_val, str):
+                for dangerous in ("rm -rf", "mkfs", "dd if=", ":(){ :|:& };:", "curl http", "wget http"):
+                    if dangerous in cmd_val:
+                        record_security_event(
+                            event_type=SecurityEventType.SECURITY_VIOLATION,
+                            source="tribune.security.policies.RuntimePolicyGate",
+                            message=f"Dangerous command pattern '{dangerous}' intercepted in '{cmd_key}'",
+                            severity="CRITICAL",
+                            details={"command": cmd_val},
+                        )
+                        raise PolicyGateViolationError(
+                            f"Dangerous command pattern '{dangerous}' is prohibited.",
+                            violation_type="DANGEROUS_COMMAND",
+                            details={"command": cmd_val},
+                        )
+
+    def validate_budget(self, cost_usd: float, tokens_consumed: int) -> None:
+        """Enforce financial and token budget caps."""
+        if cost_usd >= self.max_cost_cap_usd:
+            record_security_event(
+                event_type=SecurityEventType.SECURITY_VIOLATION,
+                source="tribune.security.policies.RuntimePolicyGate",
+                message=f"Cost budget cap breached: ${cost_usd:.4f} >= ${self.max_cost_cap_usd:.4f}",
+                severity="HIGH",
+                details={"cost_usd": cost_usd, "max_cost": self.max_cost_cap_usd},
+            )
+            raise PolicyGateViolationError(
+                f"Execution stopped: Cost cap breached (${cost_usd:.4f} >= ${self.max_cost_cap_usd:.4f})",
+                violation_type="BUDGET_CAP_EXCEEDED",
+                details={"cost_usd": cost_usd},
+            )
+
+        if tokens_consumed >= self.max_token_ceiling:
+            record_security_event(
+                event_type=SecurityEventType.SECURITY_VIOLATION,
+                source="tribune.security.policies.RuntimePolicyGate",
+                message=f"Token ceiling breached: {tokens_consumed} >= {self.max_token_ceiling}",
+                severity="HIGH",
+                details={"tokens": tokens_consumed, "token_ceiling": self.max_token_ceiling},
+            )
+            raise PolicyGateViolationError(
+                f"Execution stopped: Token ceiling breached ({tokens_consumed} >= {self.max_token_ceiling})",
+                violation_type="TOKEN_CEILING_EXCEEDED",
+                details={"tokens": tokens_consumed},
+            )
+
+    def validate_network(self, url: str) -> None:
+        """Enforce network isolation policies."""
+        if not self.allow_external_network:
+            # Only permit localhost or .gov domains if configured
+            is_gov = ".gov" in url.lower()
+            is_local = "localhost" in url or "127.0.0.1" in url
+            if not (is_gov or is_local):
+                record_security_event(
+                    event_type=SecurityEventType.SECURITY_VIOLATION,
+                    source="tribune.security.policies.RuntimePolicyGate",
+                    message=f"Network egress attempt to non-whitelisted domain '{url}'",
+                    severity="HIGH",
+                    details={"url": url},
+                )
+                raise PolicyGateViolationError(
+                    f"Network access to external endpoint '{url}' is blocked by sandbox policy.",
+                    violation_type="NETWORK_EGRESS_BLOCKED",
+                    details={"url": url},
+                )
+
+
 __all__ = [
     "ANTI_REWARD_HACKING_POLICY_BLOCK",
     "inject_anti_reward_hacking_policy",
@@ -442,4 +630,6 @@ __all__ = [
     "detect_reward_hacking_attempt",
     "PolicyValidationResult",
     "ASTPolicyEngine",
+    "PolicyGateViolationError",
+    "RuntimePolicyGate",
 ]

@@ -71,3 +71,24 @@ correct abstentions; that set is pinned in
   accounting path runs — and is tested — without any paid service.
 - All new eval fields are additive; pre-existing eval outputs and tests are
   unchanged.
+
+---
+
+## Dual-Tier Routing Economics & Token Accounting
+
+Tribune's dual-tier orchestration splits execution between:
+1. **Lead Tier (Frontier / Astra / Claude Opus / GPT-4o)**: Reserved for complex statutory synthesis, appeal strategy, and worker review ($2.50-$3.00/1M input, $10.00-$15.00/1M output).
+2. **Worker Tier (DeepSeek-V4.1-Flash / Swift-Qwen3.8-27B)**: Handles form completion, docketing, and routine administrative operations ($0.30/1M input uncached, $0.006/1M input cached, $1.20/1M output).
+
+### Token Accounting Formula
+
+For each task trajectory $T$:
+$$\text{Cost}(T) = (N_{\text{uncached}} \times R_{\text{uncached}}) + (N_{\text{cached}} \times R_{\text{cached}}) + (N_{\text{output}} \times R_{\text{output}})$$
+
+Prompt caching achieves up to $50\times$ discount on static prefix reads ($0.006/1\text{M}$ vs $\$0.30/1\text{M}$), making invariant statutory prefixes essentially free across multi-turn trajectories.
+
+### Runtime Reasoning Budget Controls
+
+- **Hard Dollar Ceiling**: `TRIBUNE_REASONING_BUDGET_CAP_USD` (Default: `$1.00`). If cumulative trajectory cost breaches this cap, the `HarnessPolicyEnforcer` halts further steps with `MAX_COST_CAP_EXCEEDED` and marks the task failed.
+- **Hard Token Ceiling**: `TRIBUNE_REASONING_BUDGET_CAP_TOKENS` (Default: `200,000` tokens). Prevents infinite generation or unbounded loop drift.
+- **Fail-Closed Guarantee**: Budget breaches emit audit events to the cryptographically hashed trace ledger and never fall back to unbudgeted execution.
