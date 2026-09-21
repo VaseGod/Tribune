@@ -25,6 +25,28 @@ from typing import Any
 
 import numpy as np
 
+from .decision_router import (
+    DEFAULT_EDGE_CONFIDENCE_THRESHOLD,
+    DeterministicHeuristicClassifier,
+    EdgeDecisionClassifier,
+    EdgeDecisionRouter,
+    ModelBackedRLCDClassifier,
+    RouterTelemetry,
+)
+from .entities import (
+    CalibrationMetadata,
+    EdgeCandidate,
+    EdgeClass,
+    EdgeDecision,
+    EdgeFeatures,
+    EntityMention,
+    EntityResolutionResult,
+    EscalationRecord,
+    GraphTransactionResult,
+)
+from .escalation import EscalationQueue
+from .graph import DependencyEdgeType, EntityEventGraph, EntityKind
+
 
 @dataclass
 class ModuleNode:
@@ -778,12 +800,10 @@ def prune_trajectory(
     for frame in frames:
         if isinstance(frame, dict):
             action = frame.get("action", "")
-            state = frame.get("state", "")
             is_aborted = frame.get("aborted", False)
             query_key = frame.get("query_key") or frame.get("tool_name")
         else:
             action = getattr(frame, "action", "")
-            state = getattr(frame, "state", "")
             is_aborted = getattr(frame, "aborted", False)
             query_key = getattr(frame, "tool_name", None) or getattr(frame, "query_key", None)
 
@@ -867,7 +887,7 @@ class SelfGCPlanner:
             if "large_payload" in comp_item or "raw_code" in comp_item or "tool_output" in comp_item:
                 target_key = "large_payload" if "large_payload" in comp_item else ("raw_code" if "raw_code" in comp_item else "tool_output")
                 raw_data = comp_item[target_key]
-                if isinstance(raw_data, (str, dict, list)) and len(str(raw_data)) > 200:
+                if isinstance(raw_data, str | dict | list) and len(str(raw_data)) > 200:
                     comp_item[target_key] = fold_payload(raw_data, kv_store=self.kv_store, key_prefix="gc_fold")
                     folded_count += 1
 
@@ -904,6 +924,158 @@ class SelfGCPlanner:
             "gc_invocation_count": self.gc_invocation_count,
         }
 
+# --------------------------------------------------------------------------- #
+# Modernized Context Graph via Calibrated Decision Routing
+# --------------------------------------------------------------------------- #
+
+
+class CalibratedGraphBuilder:
+    """Modernized context graph builder decoupling ingestion from calibrated relationship resolution.
+
+    Eliminates slow (>1.5s) autoregressive LLM edge extraction by relying on a calibrated
+    non-autoregressive decision model with strict thresholding (>= 0.85 commits, < 0.85 escalates).
+    """
+
+    def __init__(
+        self,
+        graph: EntityEventGraph | None = None,
+        router: EdgeDecisionRouter | None = None,
+        confidence_threshold: float = DEFAULT_EDGE_CONFIDENCE_THRESHOLD,
+        normalize_entity_fn: Callable[[EntityMention], EntityResolutionResult] | None = None,
+    ) -> None:
+        self.graph = graph or EntityEventGraph(graph_id="calibrated_context_graph")
+        self.router = router or EdgeDecisionRouter(confidence_threshold=confidence_threshold)
+        self.normalize_entity_fn = normalize_entity_fn
+        self._entities: dict[str, EntityResolutionResult] = {}
+        self._committed_edges: list[EdgeDecision] = []
+
+    def normalize_entity(self, mention: EntityMention) -> EntityResolutionResult:
+        """Resolve an unstructured mention to a canonical entity.
+
+        Retains an autoregressive normalization path when a callable is provided,
+        otherwise performs deterministic canonicalization.
+        """
+        if self.normalize_entity_fn is not None:
+            res = self.normalize_entity_fn(mention)
+        else:
+            # Deterministic normalization fallback
+            clean_name = mention.text.strip().lower()
+            entity_id = f"ent_{mention.entity_type}_{clean_name.replace(' ', '_')}"
+            res = EntityResolutionResult(
+                mention_id=mention.mention_id,
+                resolved_id=entity_id,
+                canonical_name=mention.text.strip().title(),
+                confidence=mention.confidence,
+                is_new_entity=(entity_id not in self._entities),
+                normalized_attributes=dict(mention.attributes),
+            )
+
+        if res.resolved_id:
+            self._entities[res.resolved_id] = res
+            # Ensure registered in underlying EntityEventGraph
+            if self.graph.get_entity(res.resolved_id) is None:
+                self.graph.add_entity(
+                    entity_id=res.resolved_id,
+                    kind=EntityKind.MODULE,
+                    name=res.canonical_name or res.resolved_id,
+                    source_uri=mention.source_doc_id or "context://mention",
+                    attributes=res.normalized_attributes,
+                )
+
+        return res
+
+    def propose_and_route_edge(self, candidate: EdgeCandidate) -> GraphTransactionResult:
+        """Route an edge candidate through calibrated decision classification.
+
+        If confidence >= threshold (default 0.85) and not Irrelevant, commits edge to graph.
+        If confidence < threshold, routes candidate to escalation queue and DOES NOT commit.
+        """
+        result = self.router.route_candidate(candidate)
+
+        if result.committed and result.edge_decision:
+            decision = result.edge_decision
+            self._committed_edges.append(decision)
+
+            # Map EdgeClass to DependencyEdgeType for associative graph storage
+            edge_type_map = {
+                EdgeClass.Contradicts: DependencyEdgeType.MUTATES,
+                EdgeClass.Extends: DependencyEdgeType.INHERITS,
+                EdgeClass.TemporalFollowup: DependencyEdgeType.CALLS,
+                EdgeClass.Irrelevant: DependencyEdgeType.IMPORTS,
+            }
+            mapped_type = edge_type_map.get(decision.edge_class, DependencyEdgeType.CALLS)
+
+            self.graph.add_dependency(
+                source_id=decision.source_id,
+                target_id=decision.target_id,
+                edge_type=mapped_type,
+                metadata={
+                    "edge_class": decision.edge_class.value,
+                    "confidence": decision.confidence,
+                    "model_version": decision.calibration.model_version,
+                    "decision_trace_id": decision.calibration.decision_trace_id,
+                },
+            )
+
+        return result
+
+    def ingest_mentions_and_resolve(
+        self,
+        mentions: list[EntityMention],
+        pairwise_similarity_fn: Callable[[EntityResolutionResult, EntityResolutionResult], float] | None = None,
+    ) -> list[GraphTransactionResult]:
+        """Normalize mentions, generate candidates, and route transactions through calibrated decisioning."""
+        resolved = [self.normalize_entity(m) for m in mentions]
+        results: list[GraphTransactionResult] = []
+
+        for i in range(len(resolved)):
+            for j in range(i + 1, len(resolved)):
+                ent_a = resolved[i]
+                ent_b = resolved[j]
+                if not ent_a.resolved_id or not ent_b.resolved_id:
+                    continue
+                if ent_a.resolved_id == ent_b.resolved_id:
+                    continue
+
+                sim = 0.5
+                if pairwise_similarity_fn is not None:
+                    sim = pairwise_similarity_fn(ent_a, ent_b)
+                elif ent_a.canonical_name and ent_b.canonical_name:
+                    # Simple heuristic overlap
+                    words_a = set(ent_a.canonical_name.lower().split())
+                    words_b = set(ent_b.canonical_name.lower().split())
+                    intersect = words_a.intersection(words_b)
+                    sim = len(intersect) / max(1, len(words_a.union(words_b)))
+
+                features = EdgeFeatures(
+                    source_entity_id=ent_a.resolved_id,
+                    target_entity_id=ent_b.resolved_id,
+                    source_text=ent_a.canonical_name,
+                    target_text=ent_b.canonical_name,
+                    semantic_similarity=sim,
+                )
+                candidate = EdgeCandidate(
+                    source_id=ent_a.resolved_id,
+                    target_id=ent_b.resolved_id,
+                    features=features,
+                )
+                tx_res = self.propose_and_route_edge(candidate)
+                results.append(tx_res)
+
+        return results
+
+    @property
+    def escalation_queue(self) -> EscalationQueue:
+        return self.router.escalation_queue
+
+    @property
+    def telemetry(self) -> RouterTelemetry:
+        return self.router.telemetry
+
+    @property
+    def committed_edges(self) -> list[EdgeDecision]:
+        return list(self._committed_edges)
+
 
 __all__ = [
     "ModuleNode",
@@ -922,5 +1094,22 @@ __all__ = [
     "mask_stream",
     "prune_trajectory",
     "SelfGCPlanner",
+    "EdgeClass",
+    "EntityMention",
+    "EntityResolutionResult",
+    "EdgeFeatures",
+    "CalibrationMetadata",
+    "EdgeCandidate",
+    "EdgeDecision",
+    "EscalationRecord",
+    "GraphTransactionResult",
+    "EdgeDecisionClassifier",
+    "DeterministicHeuristicClassifier",
+    "ModelBackedRLCDClassifier",
+    "RouterTelemetry",
+    "EdgeDecisionRouter",
+    "EscalationQueue",
+    "CalibratedGraphBuilder",
 ]
+
 

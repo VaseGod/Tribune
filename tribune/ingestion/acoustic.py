@@ -11,14 +11,13 @@ Features:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
 import logging
 import math
 import time
 from collections.abc import AsyncGenerator, Iterable
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import TribuneSettings, get_settings
@@ -33,7 +32,16 @@ from ..types import (
     SoftTokenSpan,
     SpeakerRole,
 )
+from .audio_transport import (
+    AudioPacket,
+    AudioTransport,
+    LiveKitTransportAdapter,
+    LocalLoopbackTransport,
+    WebRTCTransportAdapter,
+)
+from .background_tasks import BackgroundToolExecutor, ToolExecutionResult
 from .base import coerce_value
+from .interrupts import ConversationalState, InterruptionDetector, ParalinguisticMarkers
 from .ocr import parse_text_to_fields
 
 logger = logging.getLogger(__name__)
@@ -357,7 +365,6 @@ class AcousticIngestionEngine:
             if val is None:
                 continue
 
-            content_hash = hashlib.sha256(f"{field_name}:{val}".encode()).hexdigest()
             prov = make_provenance(
                 source_doc_id=raw_doc.doc_id,
                 ingest_method=IngestMethod.ACOUSTIC,
@@ -374,7 +381,6 @@ class AcousticIngestionEngine:
                 )
             )
 
-
         return evidence_list
 
     async def stream_audio_chunks(
@@ -386,7 +392,7 @@ class AcousticIngestionEngine:
         chunk_idx = 0
         total_time_s = 0.0
 
-        async for chunk in audio_chunks:
+        async for _chunk in audio_chunks:
             chunk_idx += 1
             duration_s = 0.08  # 80ms chunk
             total_time_s += duration_s
@@ -409,6 +415,189 @@ class AcousticIngestionEngine:
             }
 
 
+# --------------------------------------------------------------------------- #
+# Full-Duplex Streaming Pipeline & Interruption Orchestration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class AudioPipelineTelemetry:
+    """Consolidated telemetry for full-duplex acoustic operations."""
+
+    turn_taking_latency_ms: float = 0.0
+    interruption_flush_latency_ms: float = 0.0
+    dropped_packet_count: int = 0
+    partial_transcript_count: int = 0
+    final_transcript_count: int = 0
+    background_tool_call_count: int = 0
+    audio_state_transition_count: int = 0
+    active_state: str = "idle"
+
+
+class FullDuplexAcousticPipeline:
+    """Streaming-first full-duplex acoustic pipeline with fast interruption and background tool calls.
+
+    Supports pluggable transports (WebRTC, LiveKit, Local Loopback), <50ms barge-in flush,
+    conversational state retention, and non-blocking spoken tool dispatch.
+    """
+
+    def __init__(
+        self,
+        transport: AudioTransport | None = None,
+        interruption_detector: InterruptionDetector | None = None,
+        tool_executor: BackgroundToolExecutor | None = None,
+        session_id: str = "full-duplex-session",
+    ) -> None:
+        self.transport = transport or LocalLoopbackTransport()
+        self.interruption_detector = interruption_detector or InterruptionDetector(flush_target_ms=50.0)
+        self.tool_executor = tool_executor or BackgroundToolExecutor()
+        self.session_id = session_id
+
+        self.state = ConversationalState(session_id=session_id)
+        self.telemetry = AudioPipelineTelemetry()
+        self.is_system_playing = False
+        self._running = False
+        self._partial_buffer: list[str] = []
+
+    def _transition_state(self, new_state: str) -> None:
+        if self.telemetry.active_state != new_state:
+            self.telemetry.active_state = new_state
+            self.telemetry.audio_state_transition_count += 1
+
+    async def start(self) -> None:
+        await self.transport.connect()
+        self._running = True
+        self._transition_state("connected")
+
+    async def stop(self) -> None:
+        self._running = False
+        await self.transport.close()
+        self._transition_state("disconnected")
+
+    async def process_inbound_packet(
+        self,
+        packet: AudioPacket,
+    ) -> tuple[ParalinguisticMarkers, str | None, bool]:
+        """Process incoming audio packet from transport.
+
+        Returns: (markers, transcript_update, is_final)
+        """
+        self._transition_state("receiving")
+        markers = self.interruption_detector.analyze_packet(
+            packet=packet,
+            is_system_playing=self.is_system_playing,
+        )
+
+        # Handle user barge-in if detected during active playback
+        if markers.barge_in_event and self.is_system_playing:
+            self._transition_state("interrupted")
+            flush_latency = await self.interruption_detector.handle_barge_in(
+                transport=self.transport,
+                state=self.state,
+            )
+            self.telemetry.interruption_flush_latency_ms = flush_latency
+            self.is_system_playing = False
+
+        transcript_update: str | None = None
+        is_final = False
+
+        if packet.is_speech or markers.voice_activity_level >= 0.50:
+            # Produce partial transcript update
+            text_sim = packet.metadata.get("partial_text", f"speech_frame_{packet.seq}")
+            self._partial_buffer.append(text_sim)
+            self.telemetry.partial_transcript_count += 1
+            transcript_update = text_sim
+
+            if packet.metadata.get("is_final", False):
+                is_final = True
+                full_turn = " ".join(self._partial_buffer)
+                self.state.accumulated_transcript.append(full_turn)
+                self._partial_buffer.clear()
+                self.telemetry.final_transcript_count += 1
+                transcript_update = full_turn
+
+        return markers, transcript_update, is_final
+
+    async def play_outbound_audio(
+        self,
+        packets: list[AudioPacket],
+        system_text: str = "",
+    ) -> bool:
+        """Stream outbound playback packets to transport.
+
+        Flushes immediately and returns False if an interruption occurs during playback.
+        """
+        start_t = time.perf_counter()
+        self.is_system_playing = True
+        self.state.last_system_utterance = system_text
+        self.state.system_playback_interrupted = False
+        self._transition_state("playing")
+
+        interrupted = False
+        for pkt in packets:
+            if self.state.system_playback_interrupted:
+                interrupted = True
+                break
+            await self.transport.send_packet(pkt)
+            await asyncio.sleep(0.005)  # brief pacing simulate frame duration
+
+        self.is_system_playing = False
+        duration_ms = (time.perf_counter() - start_t) * 1000.0
+        self.telemetry.turn_taking_latency_ms = duration_ms
+
+        self._transition_state("idle")
+        return not interrupted
+
+    async def dispatch_spoken_tool(
+        self,
+        tool_name: str,
+        tool_fn: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> str:
+        """Dispatch a tool call triggered by spoken dialogue to the background pool."""
+        self.telemetry.background_tool_call_count += 1
+        call_id = await self.tool_executor.dispatch_tool_call(tool_name, tool_fn, *args, **kwargs)
+        self.state.pending_tool_calls.append({"call_id": call_id, "tool_name": tool_name})
+        return call_id
+
+    def process_sequential_chunks(
+        self,
+        chunks: list[bytes],
+    ) -> list[dict[str, Any]]:
+        """Fallback sequential chunk mode for environments that cannot support full-duplex streaming."""
+        results: list[dict[str, Any]] = []
+        scheduler = DynamicDelayScheduler()
+        for idx, chunk in enumerate(chunks):
+            entropy = 0.25 + 0.10 * (idx % 4)
+            delay = scheduler.compute_delay_ms(entropy)
+            results.append({
+                "chunk_index": idx,
+                "size_bytes": len(chunk),
+                "acoustic_entropy": entropy,
+                "delay_ms": delay,
+            })
+        return results
+
+    def get_telemetry(self) -> dict[str, Any]:
+        """Collect current full-duplex acoustic telemetry."""
+        dropped = (
+            self.transport.dropped_packets
+            if hasattr(self.transport, "dropped_packets")
+            else 0
+        )
+        return {
+            "turn_taking_latency_ms": self.telemetry.turn_taking_latency_ms,
+            "interruption_flush_latency_ms": self.telemetry.interruption_flush_latency_ms,
+            "dropped_packet_count": dropped,
+            "partial_transcript_count": self.telemetry.partial_transcript_count,
+            "final_transcript_count": self.telemetry.final_transcript_count,
+            "background_tool_call_count": self.telemetry.background_tool_call_count,
+            "audio_state_transition_count": self.telemetry.audio_state_transition_count,
+            "active_state": self.telemetry.active_state,
+        }
+
+
 __all__ = [
     "FRAME_DURATION_MS",
     "HOURLY_BENCHMARK_RATE_USD",
@@ -419,4 +608,17 @@ __all__ = [
     "MetaMuseVoiceTranscribeAdapter",
     "MAITranscribe2Adapter",
     "AcousticIngestionEngine",
+    "AudioPacket",
+    "AudioTransport",
+    "LocalLoopbackTransport",
+    "WebRTCTransportAdapter",
+    "LiveKitTransportAdapter",
+    "BackgroundToolExecutor",
+    "ToolExecutionResult",
+    "ParalinguisticMarkers",
+    "ConversationalState",
+    "InterruptionDetector",
+    "FullDuplexAcousticPipeline",
+    "AudioPipelineTelemetry",
 ]
+

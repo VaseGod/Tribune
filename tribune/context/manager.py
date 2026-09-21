@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,18 @@ from ..types import (
     CompactionUrgency,
     ContextAnalysis,
     FoldResult,
+)
+from .scoring import (
+    CalibratedKernelScorer,
+    ContextNode,
+    NodeUtilityScorer,
+    ScoringExplanation,
+    ScoringWeights,
+)
+from .windowing import (
+    EvictionRecord,
+    SlidingWindowConfig,
+    SlidingWindowEngine,
 )
 
 
@@ -122,6 +135,10 @@ class ProactiveContextManager:
         hard_token_boundary: int | None = None,
         elevated_threshold: float = 0.65,
         critical_threshold: float = 0.85,
+        eviction_policy: str = "calibrated_kernel",
+        window_size: int = 2048,
+        scorer: NodeUtilityScorer | None = None,
+        summarize_hook: Callable[[list[ContextNode]], dict[str, str]] | None = None,
     ) -> None:
         self.total_budget = total_budget
         self.hard_token_boundary = (
@@ -129,10 +146,25 @@ class ProactiveContextManager:
         )
         self.elevated_threshold = elevated_threshold
         self.critical_threshold = critical_threshold
+        self.eviction_policy = eviction_policy
 
         self._spans: dict[str, WorkingMemorySpan] = {}
         self._step_count: int = 0
         self._tokens_consumed_history: list[int] = []
+
+        # Sliding-window calibrated eviction engine
+        window_cfg = SlidingWindowConfig(
+            window_size=window_size,
+            token_budget=total_budget,
+            summarization_hook_enabled=(summarize_hook is not None),
+        )
+        self.window_engine = SlidingWindowEngine(
+            config=window_cfg,
+            scorer=scorer or CalibratedKernelScorer(),
+            summarize_hook=summarize_hook,
+        )
+        self._eviction_count: int = 0
+
 
     def register_span(
         self,
@@ -152,7 +184,23 @@ class ProactiveContextManager:
         self._spans[span_id] = span
         self._step_count += 1
         self._tokens_consumed_history.append(token_count)
+
+        # Mirror span into sliding window engine for calibrated utility ranking
+        cnode = ContextNode(
+            node_id=span_id,
+            text=text,
+            token_count=token_count,
+            created_step=self._step_count,
+            last_accessed_step=self._step_count,
+            task_relevance=float((metadata or {}).get("task_relevance", 0.5)),
+            semantic_relevance=float((metadata or {}).get("semantic_relevance", 0.5)),
+            graph_centrality=float((metadata or {}).get("graph_centrality", 0.1)),
+            metadata=metadata or {},
+        )
+        self.window_engine.register_node(cnode)
+
         return span
+
 
     def get_span(self, span_id: str) -> WorkingMemorySpan | None:
         return self._spans.get(span_id)
@@ -393,8 +441,68 @@ class ProactiveContextManager:
                     parts.append(span.text)
         return "\n\n".join(parts)
 
+    def register_node(self, node: ContextNode) -> None:
+        """Explicitly register a context node in the calibrated sliding-window engine."""
+        self.window_engine.register_node(node)
+
+    def touch_node(self, node_id: str) -> None:
+        """Mark a node as accessed, resetting recency and incrementing frequency."""
+        self.window_engine.touch_node(node_id)
+
+    def advance_step(self) -> int:
+        """Advance the operational reasoning step count."""
+        self._step_count = self.window_engine.advance_step()
+        return self._step_count
+
+    def evict_to_budget(self, target_budget: int | None = None) -> list[EvictionRecord]:
+        """Evict lowest-utility nodes using the calibrated kernel scoring policy."""
+        records = self.window_engine.evict_to_budget(target_token_budget=target_budget)
+        self._eviction_count += len(records)
+        return records
+
+    def get_memory_telemetry(self) -> dict[str, Any]:
+        """Collect comprehensive memory management and eviction telemetry."""
+        stats = self.window_engine.stats()
+        active_nodes = self.window_engine.active_nodes()
+        total_tokens = sum(n.token_count for n in active_nodes)
+
+        # Estimate memory footprint (approx 4 bytes per token + metadata overhead)
+        memory_footprint = total_tokens * 4 + len(active_nodes) * 256
+
+        # Retrieval precision proxy: fraction of active nodes with utility >= 0.50
+        high_utility_count = sum(
+            1 for n in active_nodes if self.window_engine.scorer.score(n, self.window_engine.current_step) >= 0.50
+        )
+        precision_proxy = (
+            round(high_utility_count / len(active_nodes), 4) if active_nodes else 1.0
+        )
+
+        return {
+            "node_count": len(active_nodes),
+            "token_estimate": total_tokens,
+            "eviction_count": self._eviction_count,
+            "retrieval_precision_proxy": precision_proxy,
+            "average_node_utility_score": stats.get("average_node_utility_score", 0.0),
+            "memory_footprint_estimate": memory_footprint,
+            "eviction_policy": self.eviction_policy,
+        }
+
+    def compress_execution_trace(self, nodes: list[ContextNode], ratio: float = 0.5) -> str:
+        """Compress execution trace text across multiple context nodes preserving critical tokens."""
+        combined_text = "\n\n".join(n.text for n in nodes if not n.is_evicted and n.text)
+        return self.compress_context(combined_text, ratio=ratio)
+
 
 __all__ = [
     "ProactiveContextManager",
     "WorkingMemorySpan",
+    "ContextNode",
+    "ScoringWeights",
+    "ScoringExplanation",
+    "NodeUtilityScorer",
+    "CalibratedKernelScorer",
+    "SlidingWindowConfig",
+    "EvictionRecord",
+    "SlidingWindowEngine",
 ]
+

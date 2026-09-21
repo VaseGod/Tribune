@@ -56,6 +56,34 @@ class TribuneSettings(BaseSettings):
     )
     acoustic_hourly_budget: float = 0.20  # Sub-$0.20/hr operational target
 
+    # -- Tribune Roadmap Implementation Settings --------------------------- #
+    # 1. Context Graph Modernization
+    context_edge_confidence_threshold: float = Field(default=0.85)
+    context_enable_non_autoregressive_router: bool = Field(default=True)
+    context_escalation_queue_name: str = Field(default="context_escalation")
+
+    # 2. Calibrated Memory Management
+    memory_window_size: int = Field(default=2048)
+    memory_eviction_policy: str = Field(default="calibrated_kernel")
+    memory_token_budget: int = Field(default=32000)
+
+    # 3. Full-Duplex Acoustic Pipeline
+    audio_enable_full_duplex: bool = Field(default=True)
+    audio_interruption_flush_target_ms: float = Field(default=50.0)
+    audio_turn_latency_target_ms: float = Field(default=300.0)
+
+    # 4. MoVA Dynamic Adapters
+    adapters_enable_dynamic_mova_router: bool = Field(default=True)
+    adapters_max_active_experts: int = Field(default=2)
+    adapters_cache_budget_mb: float = Field(default=1024.0)
+
+    # 5. Sandboxed Shell Execution
+    sandbox_default_mode: str = Field(default="shell_first")
+    sandbox_allow_shell: bool = Field(default=True)
+    sandbox_allow_network: bool = Field(default=False)
+    sandbox_max_execution_seconds: int = Field(default=120)
+    sandbox_max_memory_mb: int = Field(default=1024)
+
     # -- Model provider ----------------------------------------------------- #
     # "local_rules" is the deterministic, offline default. Supports: "local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini", "glm", "zhipu"
     provider: Literal["local_rules", "openai_compat", "openai", "anthropic", "deepseek", "vllm", "grok", "xai", "gemini", "glm", "zhipu"] = "local_rules"

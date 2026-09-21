@@ -49,6 +49,27 @@ class TribuneRoadmapMetrics:
     full_trajectory_regeneration_count: int = 0
     tool_assertion_pass_count: int = 0
     tool_assertion_fail_count: int = 0
+
+    # Roadmap Modernization Subsystems Telemetry
+    edge_classification_latency_ms: float = 0.0
+    edge_decision_confidence: float = 0.0
+    edge_escalation_count: int = 0
+    edge_malformed_count: int = 0
+    memory_node_count: int = 0
+    memory_token_estimate: int = 0
+    memory_eviction_count: int = 0
+    average_node_utility_score: float = 0.0
+    audio_turn_latency_ms: float = 0.0
+    audio_flush_latency_ms: float = 0.0
+    audio_partial_count: int = 0
+    audio_tool_call_count: int = 0
+    adapter_active_expert_count: int = 0
+    adapter_routing_latency_ms: float = 0.0
+    adapter_estimated_kv_cache_mb: float = 0.0
+    adapter_cross_modal_interference: float = 0.0
+    sandbox_shell_tokens: int = 0
+    sandbox_exploit_traps: int = 0
+
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -190,6 +211,117 @@ class RoadmapMetricsCollector:
             self.metrics.tool_assertion_fail_count += 1
 
         event = {"type": "tool_assertion", "passed": passed}
+        self.events.append(event)
+
+    def record_context_edge_decision(
+        self,
+        latency_ms: float,
+        confidence: float,
+        escalated: bool = False,
+        malformed: bool = False,
+        edge_class: str = "",
+        correlation_id: str = "",
+    ) -> None:
+        self.metrics.edge_classification_latency_ms = round(latency_ms, 3)
+        self.metrics.edge_decision_confidence = round(confidence, 4)
+        if escalated:
+            self.metrics.edge_escalation_count += 1
+        if malformed:
+            self.metrics.edge_malformed_count += 1
+
+        event = {
+            "type": "context_edge_decision",
+            "latency_ms": latency_ms,
+            "confidence": confidence,
+            "escalated": escalated,
+            "edge_class": edge_class,
+            "correlation_id": correlation_id,
+        }
+        self.events.append(event)
+
+    def record_memory_eviction(
+        self,
+        node_count: int,
+        token_estimate: int,
+        eviction_count: int,
+        average_utility: float,
+        correlation_id: str = "",
+    ) -> None:
+        self.metrics.memory_node_count = node_count
+        self.metrics.memory_token_estimate = token_estimate
+        self.metrics.memory_eviction_count = eviction_count
+        self.metrics.average_node_utility_score = round(average_utility, 4)
+
+        event = {
+            "type": "memory_eviction",
+            "node_count": node_count,
+            "token_estimate": token_estimate,
+            "eviction_count": eviction_count,
+            "average_utility": average_utility,
+            "correlation_id": correlation_id,
+        }
+        self.events.append(event)
+
+    def record_acoustic_turn(
+        self,
+        turn_latency_ms: float,
+        flush_latency_ms: float = 0.0,
+        partial_count: int = 0,
+        tool_call_count: int = 0,
+        correlation_id: str = "",
+    ) -> None:
+        self.metrics.audio_turn_latency_ms = round(turn_latency_ms, 2)
+        self.metrics.audio_flush_latency_ms = round(flush_latency_ms, 2)
+        self.metrics.audio_partial_count += partial_count
+        self.metrics.audio_tool_call_count += tool_call_count
+
+        event = {
+            "type": "acoustic_turn",
+            "turn_latency_ms": turn_latency_ms,
+            "flush_latency_ms": flush_latency_ms,
+            "correlation_id": correlation_id,
+        }
+        self.events.append(event)
+
+    def record_adapter_routing(
+        self,
+        active_experts: int,
+        routing_latency_ms: float,
+        estimated_kv_cache_mb: float,
+        cross_modal_interference: float = 0.0,
+        correlation_id: str = "",
+    ) -> None:
+        self.metrics.adapter_active_expert_count = active_experts
+        self.metrics.adapter_routing_latency_ms = round(routing_latency_ms, 3)
+        self.metrics.adapter_estimated_kv_cache_mb = round(estimated_kv_cache_mb, 2)
+        self.metrics.adapter_cross_modal_interference = round(cross_modal_interference, 4)
+
+        event = {
+            "type": "adapter_routing",
+            "active_experts": active_experts,
+            "routing_latency_ms": routing_latency_ms,
+            "kv_cache_mb": estimated_kv_cache_mb,
+            "interference": cross_modal_interference,
+            "correlation_id": correlation_id,
+        }
+        self.events.append(event)
+
+    def record_sandbox_execution(
+        self,
+        tokens_consumed: int,
+        exploit_trapped: bool = False,
+        correlation_id: str = "",
+    ) -> None:
+        self.metrics.sandbox_shell_tokens += tokens_consumed
+        if exploit_trapped:
+            self.metrics.sandbox_exploit_traps += 1
+
+        event = {
+            "type": "sandbox_execution",
+            "tokens_consumed": tokens_consumed,
+            "exploit_trapped": exploit_trapped,
+            "correlation_id": correlation_id,
+        }
         self.events.append(event)
 
     def get_snapshot(self) -> TribuneRoadmapMetrics:

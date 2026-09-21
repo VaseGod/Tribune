@@ -1,0 +1,67 @@
+{
+  "timestamp": 1789953062.5586681,
+  "edge_classification": {
+    "iterations": 1000,
+    "heuristic_mean_latency_ms": 0.0099,
+    "model_backed_mean_latency_ms": 0.0036,
+    "target_ms": 20.0,
+    "target_achieved": true
+  },
+  "memory_management": {
+    "num_nodes_ingested": 100,
+    "active_node_count": 40,
+    "active_tokens": 2000,
+    "eviction_count": 60,
+    "retrieval_precision_proxy": 0.075,
+    "average_utility": 0.3716,
+    "memory_footprint_bytes": 18240,
+    "total_processing_ms": 1.24
+  },
+  "acoustic_pipeline": {
+    "turn_taking_latency_ms": 31.25,
+    "turn_latency_target_ms": 300.0,
+    "interruption_flush_latency_ms": 0.1,
+    "flush_target_ms": 50.0,
+    "interruption_target_met": true,
+    "turn_target_met": true
+  },
+  "mova_adapters": {
+    "pure_text": {
+      "active_experts": 0,
+      "estimated_kv_cache_mb": 0.0,
+      "routing_latency_ms": 0.018,
+      "interference_proxy": 0.0
+    },
+    "dynamic_multimodal": {
+      "active_experts": 2,
+      "expert_names": [
+        "vision_dinov2",
+        "acoustic_stream"
+      ],
+      "estimated_kv_cache_mb": 384.0,
+      "routing_latency_ms": 0.028,
+      "interference_proxy": 0.12
+    },
+    "static_fallback": {
+      "active_experts": 3,
+      "estimated_kv_cache_mb": 576.0,
+      "interference_proxy": 0.65
+    },
+    "kv_cache_savings_mb": 192.0
+  },
+  "sandbox_execution": {
+    "shell_first": {
+      "exit_code": 0,
+      "output": "ELIGIBLE:True",
+      "tokens_consumed": 24,
+      "duration_s": 0.0473
+    },
+    "catalog_typed": {
+      "exit_code": 0,
+      "tokens_consumed": 250,
+      "duration_s": 0.0
+    },
+    "token_reduction_ratio": 0.904,
+    "task_completion_proxy": true
+  }
+}

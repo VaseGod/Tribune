@@ -30,3 +30,28 @@ static_analysis:
 
 pricing:
   path: "tribune/eval/pricing.json"
+
+tribune:
+  context:
+    edge_confidence_threshold: 0.85
+    enable_non_autoregressive_router: true
+    escalation_queue_name: "context_escalation"
+  memory:
+    window_size: 2048
+    eviction_policy: "calibrated_kernel"
+    token_budget: 32000
+  audio:
+    enable_full_duplex: true
+    interruption_flush_target_ms: 50
+    turn_latency_target_ms: 300
+  adapters:
+    enable_dynamic_mova_router: true
+    max_active_experts: 2
+    cache_budget_mb: 1024
+  sandbox:
+    default_mode: "shell_first"
+    allow_shell: true
+    allow_network: false
+    max_execution_seconds: 120
+    max_memory_mb: 1024
+

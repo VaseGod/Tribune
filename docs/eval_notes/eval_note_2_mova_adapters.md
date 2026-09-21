@@ -88,3 +88,30 @@ graph TD
 ### 3.3 Dual-Surface Divergence & Citation Lock (`tribune/corpus/citations.py`)
 - Evaluates verbal surface vs. operational surface independently to detect deceptive compliance.
 - Anchors all statutory claims to immutable SHA-256 segment hashes preserved across context compaction passes.
+
+---
+
+## 4. Coarse-to-Fine Dynamic Adapter Gating Implementation (`tribune/adapters/`)
+
+To resolve high KV-cache overhead, cross-modal interference, and active-parameter sparsity drift, Tribune implements a two-stage coarse-to-fine dynamic adapter routing architecture:
+
+```mermaid
+graph TD
+    In[Input Query / Evidence] --> CGR[Stage 1: CoarseGatingRouter]
+    CGR -->|Unimodal Text| Trunk[LLM Trunk Direct Route: 0 Adapters, 0 MB KV-Cache]
+    CGR -->|Multimodal Context| MoVA[Stage 2: MoVAdapterPipeline]
+    MoVA -->|Layout / OCR Cues| DINO[Vision Expert A: DINOv2]
+    MoVA -->|Visual Semantic Grounding| CLIP[Vision Expert B: CLIP]
+    MoVA -->|Spoken Testimony| ACOU[Acoustic Stream Expert]
+    MoVA -->|Relational Topology| GRAPH[Graph Structural Expert]
+    MoVA -->|Prune Lowest Confidence| BudgetCheck{KV-Cache Budget <= 1024MB?}
+    BudgetCheck -->|Admitted Experts| Fusion[Cross-Attention Dynamic Fusion]
+```
+
+### 4.1 Implemented Behavior & Configuration Knobs
+1. **Stage 1 (Modality Routing):** Pure unimodal text queries bypass MoVA adapters entirely, guaranteeing 0MB adapter KV-cache allocation and 0.0 cross-modal interference.
+2. **Stage 2 (Dynamic Expert Selection):** Multimodal inputs dynamically activate task-relevant experts up to `max_active_experts` (default: 2), subject to `minimum_activation_confidence` (default: 0.70).
+3. **KV-Cache Budgeting:** Constrained by `cache_budget_mb` (default: 1024 MB). If total active cache exceeds budget, lower-affinity experts are pruned.
+4. **Fallback Static Mode:** `force_static=True` or `enable_dynamic_routing=False` activates a baseline static set for debugging and regression testing.
+5. **Telemetry:** Continuously tracks `active_expert_count`, `routing_latency_ms`, `estimated_kv_cache_mb`, and `cross_modal_interference_proxy`.
+
