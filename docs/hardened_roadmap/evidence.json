@@ -1,0 +1,50 @@
+{
+  "retention": {
+    "events": 200,
+    "reduction_ratio": 0.9142,
+    "tokens_before": 281942,
+    "tokens_after": 24192,
+    "tokens_flushed": 258458,
+    "target_ge_0_5": true
+  },
+  "loop_stability_100k": {
+    "simulated_tokens": 100000,
+    "calls": 400,
+    "loops_detected": 477,
+    "blocked": 477,
+    "stable": true,
+    "active_context_tokens": 46655
+  },
+  "injection_resistance": {
+    "attacks": 6,
+    "blocked": 4,
+    "accepted_benign": 2,
+    "injection_block_rate": 0.6667,
+    "quarantined": 4
+  },
+  "intent_graph": {
+    "exploit_chains": 3,
+    "detected": 3,
+    "detection_rate": 1.0,
+    "benign_fp_rate": 0.0,
+    "note": "tau=0.45 default; re-tune with prod fixtures (scripts/tune_intent_threshold.py)"
+  },
+  "mapreduce": {
+    "ms": {
+      "200": 2.42,
+      "800": 6.52,
+      "3200": 24.77
+    },
+    "coverage_1_0": true,
+    "scaling_4x_ratio": 2.69,
+    "approx_linear": true
+  },
+  "latency": {
+    "cold_mean_ms": 0.0365,
+    "cached_mean_ms": 0.0002,
+    "improvement_ratio": 0.994,
+    "cache_hit_rate": 0.9091,
+    "reasoning_pruned": 0,
+    "reasoning_active_tokens": 1500
+  }
+}

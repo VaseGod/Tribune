@@ -35,6 +35,14 @@ class SecurityEventType(str, enum.Enum):
     ASTRA_CLASS_CONTAINMENT_BREACH = "ASTRA_CLASS_CONTAINMENT_BREACH"
     SECURITY_VIOLATION = "SECURITY_VIOLATION"
     LATERAL_ESCALATION_ATTEMPT = "LATERAL_ESCALATION_ATTEMPT"
+    # Hardened-memory provenance events (additive; existing consumers unaffected).
+    CONSOLIDATION_SIGNED = "CONSOLIDATION_SIGNED"
+    CONSOLIDATION_REJECTED = "CONSOLIDATION_REJECTED"
+    HMAC_VERIFICATION_FAILURE = "HMAC_VERIFICATION_FAILURE"
+    UNSIGNED_VECTOR_BLOCKED = "UNSIGNED_VECTOR_BLOCKED"
+    INTENT_GRAPH_ALERT = "INTENT_GRAPH_ALERT"
+    SESSION_SUSPENDED = "SESSION_SUSPENDED"
+    TOOL_LOOP_DETECTED = "TOOL_LOOP_DETECTED"
 
 
 @dataclass
@@ -193,4 +201,80 @@ __all__ = [
     "SecurityAuditLogger",
     "get_security_audit_logger",
     "record_security_event",
+    "sign_consolidated_node",
+    "verify_consolidated_node",
 ]
+
+
+def sign_consolidated_node(
+    source_ids: list[str],
+    schema_payload: dict[str, Any],
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """HMAC-sign a consolidated schema payload and record it in the audit chain.
+
+    Returns dict with signature, key_id, payload_digest, source_ids,
+    timestamp, previous_hash, entry_digest. Secrets come from
+    ``TRIBUNE_HMAC_SECRET`` (never hardcoded).
+    """
+    from .provenance import get_provenance_log, payload_digest_hex
+
+    log = get_provenance_log()
+    entry = log.sign_and_append(source_ids, schema_payload, timestamp=timestamp)
+    record_security_event(
+        event_type=SecurityEventType.CONSOLIDATION_SIGNED,
+        source="tribune.security.audit.sign_consolidated_node",
+        message="Consolidated node signed and chained.",
+        severity="LOW",
+        details={
+            "key_id": entry.key_id,
+            "payload_digest": entry.payload_digest,
+            "source_ids": entry.source_ids,
+            "timestamp": entry.timestamp,
+            "previous_hash": entry.previous_hash[:16] if entry.previous_hash else "",
+            "entry_digest": entry.entry_digest[:16],
+        },
+    )
+    return {
+        "signature": entry.signature,
+        "key_id": entry.key_id,
+        "payload_digest": payload_digest_hex(schema_payload),
+        "source_ids": entry.source_ids,
+        "timestamp": entry.timestamp,
+        "previous_hash": entry.previous_hash,
+        "entry_digest": entry.entry_digest,
+    }
+
+
+def verify_consolidated_node(
+    source_ids: list[str],
+    schema_payload: dict[str, Any],
+    timestamp: str,
+    signature: str,
+    key_id: str,
+) -> bool:
+    """Verify HMAC + audit-log presence. Fails closed (False) on any mismatch."""
+    from .provenance import get_provenance_log, payload_digest_hex
+
+    log = get_provenance_log()
+    ok = log.verify_entry_signature(source_ids, schema_payload, timestamp, signature, key_id)
+    if not ok:
+        record_security_event(
+            event_type=SecurityEventType.HMAC_VERIFICATION_FAILURE,
+            source="tribune.security.audit.verify_consolidated_node",
+            message="HMAC verification failed for consolidated node.",
+            severity="HIGH",
+            details={"key_id": key_id, "source_ids": source_ids},
+        )
+        return False
+    entry = log.lookup(payload_digest_hex(schema_payload))
+    if entry is None:
+        record_security_event(
+            event_type=SecurityEventType.UNSIGNED_VECTOR_BLOCKED,
+            source="tribune.security.audit.verify_consolidated_node",
+            message="No audit-log entry for payload digest; blocking activation.",
+            severity="HIGH",
+            details={"payload_digest": payload_digest_hex(schema_payload)},
+        )
+        return False
+    return True

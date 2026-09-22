@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -720,5 +721,94 @@ class RecursiveTraceConsolidator:
             confidence_score=round(mean_conf, 4),
             compaction_level=compaction_level,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Structured Schema IR consolidation with HMAC provenance (hardened path)
+# --------------------------------------------------------------------------- #
+
+
+class SecureConsolidator:
+    """Schema-enforced consolidation producing only validated, HMAC-signed IR.
+
+    - Free-form NL summaries are never persisted here.
+    - Rejected payloads are quarantined for audit review and never enter HDM.
+    - Every accepted node is HMAC-signed and chained in the tamper-evident log.
+    """
+
+    def __init__(
+        self,
+        sanitizer: Any | None = None,
+        consolidator_id: str = "tribune-consolidator/v1",
+    ) -> None:
+        from .consolidation_schema import ConsolidationSanitizer
+
+        self.sanitizer = sanitizer or ConsolidationSanitizer()
+        self.consolidator_id = consolidator_id
+        self._accepted: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
+
+    def consolidate(
+        self,
+        source_episodic_ids: list[str],
+        entities: list[dict[str, Any]],
+        declarative_summary: str,
+        contradiction: dict[str, Any] | None = None,
+        decay: dict[str, Any] | None = None,
+        generated_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate schema IR, sign it, and return the signed node envelope."""
+        from ..security.audit import (
+            SecurityEventType,
+            record_security_event,
+            sign_consolidated_node,
+        )
+        from .consolidation_schema import CONSOLIDATION_SCHEMA_VERSION
+
+        if generated_at is None:
+            from datetime import datetime, timezone
+
+            generated_at = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "schema_version": CONSOLIDATION_SCHEMA_VERSION,
+            "source_episodic_ids": list(source_episodic_ids),
+            "entities": entities,
+            "declarative_summary": declarative_summary,
+            "generated_at": generated_at,
+            "consolidator_id": self.consolidator_id,
+            "contradiction": contradiction,
+            "decay": decay,
+        }
+        try:
+            ir = self.sanitizer.sanitize_or_reject(payload)
+        except Exception as exc:
+            record_security_event(
+                event_type=SecurityEventType.CONSOLIDATION_REJECTED,
+                source="tribune.memory.consolidation.SecureConsolidator",
+                message=f"Consolidation rejected: {exc}",
+                severity="HIGH",
+                details={"reason": str(exc)[:300]},
+            )
+            raise
+        schema_payload = ir.to_payload()
+        envelope = sign_consolidated_node(
+            source_ids=ir.source_episodic_ids,
+            schema_payload=schema_payload,
+            timestamp=ir.generated_at,
+        )
+        node = {
+            "schema_payload": schema_payload,
+            "provenance": envelope,
+            "node_id": f"cons_{envelope['payload_digest'][:16]}",
+        }
+        with self._lock:
+            self._accepted.append(node)
+        return node
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            base = self.sanitizer.stats() if hasattr(self.sanitizer, "stats") else {}
+            base["accepted_nodes"] = len(self._accepted)
+            return base
 
 

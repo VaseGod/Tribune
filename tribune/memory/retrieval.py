@@ -388,4 +388,139 @@ __all__ = [
     "UngroundedAssertionViolationError",
     "CitationLockHarness",
     "HierarchicalTraceRetriever",
+    "StateDeltaNode",
+    "RetentionAwareRetriever",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Protocol-Aware Retention: associative search restricted to StateDelta nodes
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class StateDeltaNode:
+    """Retrievable unit for default associative search (never raw observations)."""
+
+    node_id: str
+    text: str  # compact StateDelta rendering (dense factual update)
+    timestamp: float = field(default_factory=time.time)
+    causal_refs: list[str] = field(default_factory=list)
+    verified_provenance: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+    is_ephemeral: bool = False  # always False for indexed nodes; True blocks indexing
+
+
+class RetentionAwareRetriever:
+    """Default associative retrieval over StateDelta nodes only.
+
+    - EphemeralObservation content is never indexed here.
+    - Raw observations require explicit provenance lookup (see
+      ``MemoryEventsTimeline.fetch_cold_observation``) or a privileged debug
+      query with ``include_ephemeral=True`` + ``privileged=True``.
+    - Ranking favors StateDelta recency, causal relevance, verified provenance.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: dict[str, StateDeltaNode] = {}
+        self._quarantined_raw_attempts = 0
+        self._lock = threading.RLock()
+
+    def index_state_delta(
+        self,
+        node_id: str,
+        delta_text: str,
+        timestamp: float | None = None,
+        causal_refs: list[str] | None = None,
+        verified_provenance: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> StateDeltaNode:
+        with self._lock:
+            node = StateDeltaNode(
+                node_id=node_id,
+                text=delta_text,
+                timestamp=timestamp if timestamp is not None else time.time(),
+                causal_refs=list(causal_refs or []),
+                verified_provenance=bool(verified_provenance),
+                metadata=dict(metadata or {}),
+                is_ephemeral=False,
+            )
+            self._nodes[node_id] = node
+            return node
+
+    def index_timeline_delta(self, delta: Any) -> StateDeltaNode:
+        """Index a StateDelta dataclass (duck-typed) from timeline retention."""
+        to_dict = delta.to_dict() if hasattr(delta, "to_dict") else dict(delta)
+        return self.index_state_delta(
+            node_id=str(to_dict.get("event_id", f"node_{len(self._nodes)}")),
+            delta_text=json.dumps(to_dict, sort_keys=True, default=str),
+            timestamp=float(to_dict.get("timestamp", time.time())),
+            causal_refs=list(to_dict.get("causal_refs", []) or []),
+            verified_provenance=bool(to_dict.get("observation_digest")),
+            metadata={"kind": "StateDelta", "tool": to_dict.get("tool_name", "")},
+        )
+
+    def try_index_raw_observation(self, node_id: str, raw_text: str) -> bool:
+        """Refused by policy: raw observations are excluded from default search."""
+        with self._lock:
+            self._quarantined_raw_attempts += 1
+        record_security_event(
+            event_type=SecurityEventType.UNGROUNDED_ASSERTION_VIOLATION,
+            source="tribune.memory.retrieval.RetentionAwareRetriever",
+            message=f"Blocked raw EphemeralObservation indexing attempt for '{node_id}'.",
+            severity="MEDIUM",
+            details={"node_id": node_id},
+        )
+        return False
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        include_ephemeral: bool = False,
+        privileged: bool = False,
+        now: float | None = None,
+    ) -> list[tuple[StateDeltaNode, float]]:
+        """Lexical associative search over StateDelta nodes.
+
+        ``include_ephemeral=True`` requires ``privileged=True``; otherwise raw
+        content is never returned (defense: noisy logs must not dilute recall).
+        """
+        with self._lock:
+            if include_ephemeral and not privileged:
+                raise PermissionError(
+                    "Raw observation retrieval requires privileged debug query."
+                )
+            now_ts = now if now is not None else time.time()
+            q_terms = {t.lower() for t in re.findall(r"[a-zA-Z0-9_]+", query)}
+            scored: list[tuple[StateDeltaNode, float]] = []
+            for node in self._nodes.values():
+                n_terms = {t.lower() for t in re.findall(r"[a-zA-Z0-9_]+", node.text)}
+                overlap = len(q_terms & n_terms)
+                base = overlap / max(1, len(q_terms))
+                # recency boost (30-day half-life approx)
+                age_s = max(0.0, now_ts - node.timestamp)
+                recency = 1.0 / (1.0 + age_s / 2_592_000.0)
+                causal = 1.0 + 0.1 * min(5, len(node.causal_refs))
+                provenance = 1.25 if node.verified_provenance else 1.0
+                score = base * (0.5 + 0.5 * recency) * causal * provenance
+                scored.append((node, round(score, 6)))
+            scored.sort(key=lambda kv: (kv[1], kv[0].timestamp), reverse=True)
+            return scored[:top_k]
+
+    def inject_context(self, query: str, top_k: int = 3) -> str:
+        """Dense factual context injection (StateDelta summaries, not raw logs)."""
+        hits = self.search(query, top_k=top_k)
+        if not hits:
+            return "=== RETENTION-AWARE CONTEXT (no StateDelta matches) ==="
+        lines = ["=== RETENTION-AWARE CONTEXT (StateDelta only) ==="]
+        for node, score in hits:
+            lines.append(f"• [{node.node_id}] (score={score:.3f}) {node.text[:400]}")
+        return "\n".join(lines)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "indexed_state_deltas": len(self._nodes),
+                "blocked_raw_attempts": self._quarantined_raw_attempts,
+            }

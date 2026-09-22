@@ -37,6 +37,14 @@ tribune disclose   # plain-language "here's why" explanation of the last demo ru
 tribune web        # serve the web UI at http://127.0.0.1:8000
 ```
 
+Prefer `uv`? This is equivalent (extras are required — a bare `uv sync`
+leaves out the dev/web tooling):
+
+```bash
+uv sync --frozen --extra dev --extra web
+uv run tribune demo
+```
+
 `tribune demo` and `tribune eval` run clean and exit 0 with the default local providers.
 
 ### The web UI
@@ -118,6 +126,16 @@ TRIBUNE is structured around 4 failure-resilient, governance-first architectural
 4. **Quantization Parity & Pareto Frontier Benchmarking (`tribune/eval/`):**
    - Evaluation ladders track statutory citation precision/recall, false positive rate (FPR), false negative rate (FNR), and accuracy delta vs. full-precision reference backends.
    - `CostModel.compute_pareto_frontier` runs multi-objective optimization (minimizing cost vs. maximizing accuracy/parity) across local quant tiers and cloud endpoints.
+
+### Hardened memory & execution (P0/P1/P2 roadmap)
+
+- **Protocol-Aware Retention**: timeline events split into durable `StateDelta` + ephemeral raw observations flushed to cold storage at turn end (~91% context reduction measured).
+- **Cryptographic provenance**: schema-IR consolidation with adversarial sanitizer + HMAC-SHA256 audit chain; unsigned vectors blocked from HDM activation.
+- **Sliding Intent Graph**: multi-turn capability-laundering detection over a decaying intent window (3/3 exploit chains caught, 0.0 FP on benign fixtures locally).
+- **Agentic MapReduce**: deterministic plan/map/majority-reduce sweeps with full-coverage proofs and linear scaling.
+- **Reasoning budgets + speculative embeddings**: bounded trace memory, discardable draft vectors (~99% cache-hit latency cut locally).
+
+See [docs/hardened_roadmap/ARCHITECTURE.md](docs/hardened_roadmap/ARCHITECTURE.md), [CONFIGURATION.md](docs/hardened_roadmap/CONFIGURATION.md), [SECURITY.md](docs/hardened_roadmap/SECURITY.md), and [MIGRATION.md](docs/hardened_roadmap/MIGRATION.md). Measure locally with `scripts/bench_hardened_roadmap.py`; test with `tests/test_hardened_roadmap.py`.
 
 ---
 

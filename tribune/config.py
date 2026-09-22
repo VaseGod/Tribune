@@ -310,6 +310,62 @@ class TribuneSettings(BaseSettings):
     seed: int = 7
     data_dir: str = Field(default_factory=lambda: os.path.join(os.getcwd(), ".tribune"))
 
+    # -- Hardened memory & execution (roadmap) ------------------------------- #
+    retention_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_RETENTION_ENABLED", "true")).lower() in ("true", "1", "yes")
+    )
+    retention_max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_RETENTION_MAX_TOKENS", "32000"))
+    )
+    retention_max_events: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_RETENTION_MAX_EVENTS", "200"))
+    )
+    retention_ephemeral_ttl_s: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_RETENTION_EPHEMERAL_TTL_S", "3600"))
+    )
+    retention_cold_path: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_RETENTION_COLD_PATH", ".tribune/cold_observations.jsonl")
+    )
+    retention_debug_mode: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_RETENTION_DEBUG_MODE", "false")).lower() in ("true", "1", "yes")
+    )
+    token_counter_backend: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_TOKEN_COUNTER", "char")
+    )
+    consolidation_schema_enforced: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_CONSOLIDATION_SCHEMA_ENFORCED", "true")).lower() in ("true", "1", "yes")
+    )
+    hmac_key_id: str = Field(default_factory=lambda: os.getenv("TRIBUNE_HMAC_KEY_ID", "k1"))
+    hmac_secret_env: str = Field(default_factory=lambda: os.getenv("TRIBUNE_HMAC_SECRET_ENV", "TRIBUNE_HMAC_SECRET"))
+    intent_graph_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_INTENT_GRAPH_ENABLED", "true")).lower() in ("true", "1", "yes")
+    )
+    intent_window: int = Field(default_factory=lambda: int(os.getenv("TRIBUNE_INTENT_WINDOW", "8")))
+    intent_decay_lambda: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_INTENT_DECAY_LAMBDA", "0.15"))
+    )
+    intent_tau_threat: float = Field(
+        default_factory=lambda: float(os.getenv("TRIBUNE_INTENT_TAU_THREAT", "0.45"))
+    )
+    intent_threat_library: str = Field(
+        default_factory=lambda: os.getenv("TRIBUNE_INTENT_THREAT_LIBRARY", "")
+    )
+    mapreduce_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_MAPREDUCE_ENABLED", "true")).lower() in ("true", "1", "yes")
+    )
+    mapreduce_workers: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_MAPREDUCE_WORKERS", "4"))
+    )
+    mapreduce_shard_size: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_MAPREDUCE_SHARD_SIZE", "64"))
+    )
+    reasoning_budget_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("TRIBUNE_REASONING_BUDGET_TOKENS", "4000"))
+    )
+    speculative_embedding_enabled: bool = Field(
+        default_factory=lambda: str(os.getenv("TRIBUNE_SPECULATIVE_EMBEDDING", "true")).lower() in ("true", "1", "yes")
+    )
+
     # -- Architectural Roadmap & Compliance Controls ------------------------ #
     lead_model_name: str = Field(
         default_factory=lambda: os.getenv("TRIBUNE_LEAD_MODEL", "gpt-4o")
