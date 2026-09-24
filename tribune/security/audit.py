@@ -43,6 +43,17 @@ class SecurityEventType(str, enum.Enum):
     INTENT_GRAPH_ALERT = "INTENT_GRAPH_ALERT"
     SESSION_SUSPENDED = "SESSION_SUSPENDED"
     TOOL_LOOP_DETECTED = "TOOL_LOOP_DETECTED"
+    # Sentinel security and isolation events
+    COMMAND_REQUESTED = "command_requested"
+    COMMAND_ALLOWED = "command_allowed"
+    COMMAND_DENIED = "command_denied"
+    NETWORK_REQUESTED = "network_requested"
+    NETWORK_ALLOWED = "network_allowed"
+    NETWORK_DENIED = "network_denied"
+    SECRET_REDACTED = "secret_redacted"
+    SURROGATE_TOKEN_ISSUED = "surrogate_token_issued"
+    CONTAINER_SPAWNED = "container_spawned"
+    CONTAINER_EXITED = "container_exited"
 
 
 @dataclass
@@ -78,6 +89,17 @@ class SecurityAuditLogger:
         """Return shallow copy of recorded security events."""
         with self._lock:
             return list(self._events)
+
+    def record(self, event: SecurityAuditEvent) -> SecurityAuditEvent:
+        """Record an already constructed SecurityAuditEvent."""
+        return self.record_event(
+            event_type=event.event_type,
+            source=event.source,
+            message=event.message,
+            severity=event.severity,
+            details=event.details,
+            case_id=event.case_id,
+        )
 
     def record_event(
         self,

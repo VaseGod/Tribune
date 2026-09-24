@@ -406,6 +406,142 @@ class TrajectoryCostModel:
 
         return pareto_points
 
+    def compute_dual_agent_trajectory(
+        self,
+        action_turns_input_tokens: list[int],
+        action_turns_output_tokens: list[int],
+        memory_eval_indicators: list[int],  # I_eval(t) ∈ {0, 1}
+        memory_turns_input_tokens: list[int] | None = None,
+        memory_turns_output_tokens: list[int] | None = None,
+        action_price_per_1k_input: float = 0.0015,
+        action_price_per_1k_output: float = 0.0020,
+        memory_price_per_1k_input: float = 0.0002,
+        memory_price_per_1k_output: float = 0.0004,
+        avoided_loop_count: int = 0,
+        completion_rate: float = 1.0,
+        catastrophic_loop_rate: float = 0.0,
+        baseline_turns: float = 5.0,
+    ) -> DualAgentTrajectoryCost:
+        """Calculate trajectory cost under the dual-agent architecture:
+        
+        Cost_trajectory = sum_{t=1}^T [ C_action(M_quant, ctx_t) + I_eval(t) * C_mem(M_aux, Δctx_t) ]
+        """
+        T = len(action_turns_input_tokens)
+        if T == 0:
+            return DualAgentTrajectoryCost(
+                action_input_tokens=0,
+                action_output_tokens=0,
+                action_estimated_cost=0.0,
+                memory_invocation_count=0,
+                memory_input_tokens=0,
+                memory_output_tokens=0,
+                memory_estimated_cost=0.0,
+                total_trajectory_cost=0.0,
+                auxiliary_overhead_ratio=0.0,
+                avoided_failure_loop_savings_estimate=0.0,
+                net_trajectory_efficiency_score=1.0,
+                total_turns=0,
+            )
+
+        mem_in_tokens = memory_turns_input_tokens or [150] * T
+        mem_out_tokens = memory_turns_output_tokens or [40] * T
+
+        total_action_in = 0
+        total_action_out = 0
+        total_action_cost = 0.0
+
+        total_mem_in = 0
+        total_mem_out = 0
+        total_mem_cost = 0.0
+        mem_invocations = 0
+
+        for t in range(T):
+            act_in = action_turns_input_tokens[t]
+            act_out = action_turns_output_tokens[t] if t < len(action_turns_output_tokens) else 0
+            total_action_in += act_in
+            total_action_out += act_out
+            turn_act_cost = (act_in * action_price_per_1k_input + act_out * action_price_per_1k_output) / 1000.0
+            total_action_cost += turn_act_cost
+
+            # Indicator function I_eval(t)
+            i_eval = memory_eval_indicators[t] if t < len(memory_eval_indicators) else 0
+            if i_eval == 1:
+                mem_invocations += 1
+                m_in = mem_in_tokens[t] if t < len(mem_in_tokens) else 150
+                m_out = mem_out_tokens[t] if t < len(mem_out_tokens) else 40
+                total_mem_in += m_in
+                total_mem_out += m_out
+                turn_mem_cost = (m_in * memory_price_per_1k_input + m_out * memory_price_per_1k_output) / 1000.0
+                total_mem_cost += turn_mem_cost
+
+        total_traj_cost = total_action_cost + total_mem_cost
+        aux_overhead_ratio = total_mem_cost / max(1e-8, total_action_cost)
+
+        # Savings estimate: avoided loops save average action turn cost
+        avg_turn_cost = total_action_cost / max(1, T)
+        avoided_savings = avoided_loop_count * avg_turn_cost * 1.5
+
+        # Net efficiency score:
+        # completion_weight * completion_rate + reliability_weight * (1 - loop_rate)
+        # + turn_efficiency_weight * (baseline / T) - cost_penalty * overhead
+        turn_eff = min(2.0, baseline_turns / max(1, T))
+        net_efficiency = round(
+            0.40 * completion_rate
+            + 0.30 * (1.0 - catastrophic_loop_rate)
+            + 0.20 * turn_eff
+            - 0.10 * min(1.0, aux_overhead_ratio),
+            4,
+        )
+
+        return DualAgentTrajectoryCost(
+            action_input_tokens=total_action_in,
+            action_output_tokens=total_action_out,
+            action_estimated_cost=round(total_action_cost, 6),
+            memory_invocation_count=mem_invocations,
+            memory_input_tokens=total_mem_in,
+            memory_output_tokens=total_mem_out,
+            memory_estimated_cost=round(total_mem_cost, 6),
+            total_trajectory_cost=round(total_traj_cost, 6),
+            auxiliary_overhead_ratio=round(aux_overhead_ratio, 4),
+            avoided_failure_loop_savings_estimate=round(avoided_savings, 6),
+            net_trajectory_efficiency_score=net_efficiency,
+            total_turns=T,
+        )
+
+
+@dataclass(frozen=True)
+class DualAgentTrajectoryCost:
+    """Detailed cost breakdown of a dual-agent trajectory."""
+
+    action_input_tokens: int
+    action_output_tokens: int
+    action_estimated_cost: float
+    memory_invocation_count: int
+    memory_input_tokens: int
+    memory_output_tokens: int
+    memory_estimated_cost: float
+    total_trajectory_cost: float
+    auxiliary_overhead_ratio: float
+    avoided_failure_loop_savings_estimate: float
+    net_trajectory_efficiency_score: float
+    total_turns: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_input_tokens": self.action_input_tokens,
+            "action_output_tokens": self.action_output_tokens,
+            "action_estimated_cost": round(self.action_estimated_cost, 6),
+            "memory_invocation_count": self.memory_invocation_count,
+            "memory_input_tokens": self.memory_input_tokens,
+            "memory_output_tokens": self.memory_output_tokens,
+            "memory_estimated_cost": round(self.memory_estimated_cost, 6),
+            "total_trajectory_cost": round(self.total_trajectory_cost, 6),
+            "auxiliary_overhead_ratio": round(self.auxiliary_overhead_ratio, 4),
+            "avoided_failure_loop_savings_estimate": round(self.avoided_failure_loop_savings_estimate, 6),
+            "net_trajectory_efficiency_score": round(self.net_trajectory_efficiency_score, 4),
+            "total_turns": self.total_turns,
+        }
+
 
 def default_cost_model() -> CostModel:
     """Return the CostModel loaded from the default packaged pricing.json or TRIBUNE_PRICING_PATH."""
@@ -420,7 +556,9 @@ __all__ = [
     "CostModel",
     "TrajectoryParetoPoint",
     "TrajectoryCostModel",
+    "DualAgentTrajectoryCost",
     "default_cost_model",
 ]
+
 
 

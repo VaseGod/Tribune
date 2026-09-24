@@ -1,0 +1,26 @@
+version: 1
+default_policy: deny
+rules:
+  - id: allow_local_mock_api
+    destination_host: mock.internal.tribune
+    port: 443
+    scheme: https
+    methods: [GET, POST]
+    auth_profile: mock_internal_api
+    max_requests_per_task: 50
+
+  - id: allow_static_dataset
+    destination_host: datasets.internal.tribune
+    port: 443
+    scheme: https
+    methods: [GET]
+    auth_profile: none
+    max_requests_per_task: 20
+
+  - id: allow_localhost_eval_proxy
+    destination_host: 127.0.0.1
+    port: 8080
+    scheme: http
+    methods: [GET, POST]
+    auth_profile: none
+    max_requests_per_task: 100

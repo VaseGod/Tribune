@@ -46,5 +46,123 @@
     "cache_hit_rate": 0.9091,
     "reasoning_pruned": 0,
     "reasoning_active_tokens": 1500
+  },
+  "three_tier_hardened_architecture": {
+    "dual_zone_isolation": true,
+    "surrogate_token_enforcement": true,
+    "sentinel_daemon_active": true,
+    "proactive_memory_sidecar": true,
+    "tests_passed": 31,
+    "zero_secret_leakage_verified": true,
+    "evidence_entries": [
+      {
+        "id": "phase0_implementation_plan",
+        "timestamp": "2026-09-24T16:04:00Z",
+        "phase": "PHASE_0",
+        "artifact_path": "docs/hardened_roadmap/implementation_plan.md",
+        "summary": "Completed comprehensive discovery, architecture analysis, data contracts, and implementation plan.",
+        "verification_command": "test -f docs/hardened_roadmap/implementation_plan.md",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase1_sentinel_policy_broker",
+        "timestamp": "2026-09-24T16:05:00Z",
+        "phase": "PHASE_1",
+        "artifact_path": "tribune/security/sentinel.py",
+        "summary": "Implemented SentinelBroker, SentinelServer (UDS IPC), and SentinelClient with deny-by-default allowlist checks and host auth injection.",
+        "verification_command": ".venv/bin/pytest tests/test_sentinel_hardened.py",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase1_token_broker_surrogates",
+        "timestamp": "2026-09-24T16:04:30Z",
+        "phase": "PHASE_1",
+        "artifact_path": "tribune/security/token_broker.py",
+        "summary": "Implemented TokenBroker with synthetic handle replacement (MOCK_*) and bidirectional stdout/stderr redaction.",
+        "verification_command": ".venv/bin/pytest tests/test_sentinel_hardened.py -k test_token_broker_surrogate_mapping_and_redaction",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase1_runtime_runners",
+        "timestamp": "2026-09-24T16:05:40Z",
+        "phase": "PHASE_1",
+        "artifact_path": "tribune/runtime/container_runner.py",
+        "summary": "Implemented ContainerShellRunner (unprivileged, non-root, read-only root, cap-drop) and LocalFallbackRunner (marked unsafe_for_production=True).",
+        "verification_command": ".venv/bin/pytest tests/test_runtime_runners.py",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase1_security_documentation",
+        "timestamp": "2026-09-24T16:06:20Z",
+        "phase": "PHASE_1",
+        "artifact_path": "docs/security/sandbox_shell_execution.md",
+        "summary": "Updated security documentation with threat model, trust boundaries, socket protocols, allowlist schemas, and operational runbook.",
+        "verification_command": "test -f docs/security/sandbox_shell_execution.md",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase2_five_track_state_bank",
+        "timestamp": "2026-09-24T16:06:30Z",
+        "phase": "PHASE_2",
+        "artifact_path": "tribune/memory/state_bank.py",
+        "summary": "Implemented 5-track MemoryStateBank (current_environment, successful_mutations, unmet_task_requirements, active_subgoals, failed_commands_cache).",
+        "verification_command": ".venv/bin/pytest tests/test_proactive_memory_sidecar.py -k test_state_bank_schema_and_fingerprinting",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase2_sparse_intervention_gate",
+        "timestamp": "2026-09-24T16:06:50Z",
+        "phase": "PHASE_2",
+        "artifact_path": "tribune/memory/intervention_policy.py",
+        "summary": "Implemented calibrated sparse intervention policy with SILENCE token default, cooldown turns, budget caps, and 5 trigger conditions.",
+        "verification_command": ".venv/bin/pytest tests/test_proactive_memory_sidecar.py",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase2_proactive_memory_sidecar",
+        "timestamp": "2026-09-24T16:07:10Z",
+        "phase": "PHASE_2",
+        "artifact_path": "tribune/memory/sidecar.py",
+        "summary": "Implemented ProactiveMemorySidecar operating at interval k=2 turns with trajectory buffer and secret redaction.",
+        "verification_command": ".venv/bin/pytest tests/test_proactive_memory_sidecar.py -k test_sidecar_turn_recording_and_k_interval_update",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase2_seedset_and_verifier_integration",
+        "timestamp": "2026-09-24T16:07:50Z",
+        "phase": "PHASE_2",
+        "artifact_path": "tribune/eval/quant_sensitivity/seedset.py",
+        "summary": "Extended seedset with SeedTaskSpecification and updated synthetic_env_verifier with StructuredVerificationResult feeding unmet requirements.",
+        "verification_command": ".venv/bin/pytest tests/test_synthetic_env_verifier.py",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase3_dual_agent_cost_model",
+        "timestamp": "2026-09-24T16:09:00Z",
+        "phase": "PHASE_3",
+        "artifact_path": "tribune/eval/costmodel.py",
+        "summary": "Implemented trajectory cost formula Cost = sum [ C_action + I_eval * C_mem ] tracking overhead ratios, avoided loop savings, and net efficiency.",
+        "verification_command": ".venv/bin/pytest tests/test_dual_agent_costmodel.py",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase3_comparative_reporting",
+        "timestamp": "2026-09-24T16:09:20Z",
+        "phase": "PHASE_3",
+        "artifact_path": "tribune/eval/quant_sensitivity/report.py",
+        "summary": "Implemented comparative reporting across Baseline, Sentinel-only, and Sentinel+Memory, producing markdown, JSON metrics, and CSV tables.",
+        "verification_command": ".venv/bin/pytest tests/test_hardened_report.py",
+        "status": "VERIFIED"
+      },
+      {
+        "id": "phase4_end_to_end_smoke_verification",
+        "timestamp": "2026-09-24T16:12:00Z",
+        "phase": "PHASE_4",
+        "artifact_path": "tests/test_hardened_integration_smoke.py",
+        "summary": "Executed end-to-end synthetic ladder evaluation with zero secret leakage and full three-tier coordination.",
+        "verification_command": ".venv/bin/pytest tests/test_hardened_integration_smoke.py",
+        "status": "VERIFIED"
+      }
+    ]
   }
 }

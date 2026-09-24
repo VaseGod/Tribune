@@ -126,7 +126,96 @@ class BoundedVerifierSelfTesting:
         )
 
 
+@dataclass(frozen=True)
+class StructuredVerificationResult:
+    """Structured verification outcome for a specific task requirement."""
+
+    requirement_id: str
+    satisfied: bool
+    evidence: str = ""
+    missing_artifacts: tuple[str, ...] = field(default_factory=tuple)
+    failed_checks: tuple[str, ...] = field(default_factory=tuple)
+    severity: str = "HIGH"
+    reproducible_command_hint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requirement_id": self.requirement_id,
+            "satisfied": self.satisfied,
+            "evidence": self.evidence,
+            "missing_artifacts": list(self.missing_artifacts),
+            "failed_checks": list(self.failed_checks),
+            "severity": self.severity,
+            "reproducible_command_hint": self.reproducible_command_hint,
+        }
+
+
+def verify_task_requirements(
+    requirements: list[Any],
+    execution_artifacts: list[str],
+    passed_tests: list[str] | None = None,
+) -> list[StructuredVerificationResult]:
+    """Evaluate task requirements against observed artifacts and validation checks."""
+    results: list[StructuredVerificationResult] = []
+    observed_artifacts = set(execution_artifacts)
+    passed_set = set(passed_tests or [])
+
+    for req in requirements:
+        req_id = getattr(req, "requirement_id", str(req))
+        expected_artifacts = getattr(req, "missing_artifacts", []) or getattr(req, "expected_artifacts", [])
+        missing = [art for art in expected_artifacts if art not in observed_artifacts]
+
+        failed_checks = []
+        expected_checks = getattr(req, "failed_checks", []) or getattr(req, "expected_verifier_conditions", [])
+        for chk in expected_checks:
+            if chk not in passed_set:
+                failed_checks.append(chk)
+
+        satisfied = len(missing) == 0 and len(failed_checks) == 0
+        evidence = f"Verified with {len(observed_artifacts)} artifacts present" if satisfied else f"Missing: {missing or failed_checks}"
+        severity = getattr(req, "severity", "HIGH")
+        hint = getattr(req, "reproducible_command_hint", "") or (f"ls {missing[0]}" if missing else "")
+
+        results.append(
+            StructuredVerificationResult(
+                requirement_id=req_id,
+                satisfied=satisfied,
+                evidence=evidence,
+                missing_artifacts=tuple(missing),
+                failed_checks=tuple(failed_checks),
+                severity=severity,
+                reproducible_command_hint=hint,
+            )
+        )
+    return results
+
+
+def feed_unmet_requirements(state_bank: Any, verification_results: list[StructuredVerificationResult]) -> None:
+    """Update MemoryStateBank.unmet_task_requirements from verification results."""
+    from ..memory.state_bank import TaskRequirement
+
+    updated_requirements: list[TaskRequirement] = []
+    for res in verification_results:
+        updated_requirements.append(
+            TaskRequirement(
+                requirement_id=res.requirement_id,
+                description=f"Requirement {res.requirement_id}",
+                satisfied=res.satisfied,
+                evidence=res.evidence,
+                severity=res.severity,
+                missing_artifacts=list(res.missing_artifacts),
+                failed_checks=list(res.failed_checks),
+                reproducible_command_hint=res.reproducible_command_hint,
+            )
+        )
+    state_bank.unmet_task_requirements = updated_requirements
+
+
 __all__ = [
     "AbstainResult",
     "BoundedVerifierSelfTesting",
+    "StructuredVerificationResult",
+    "verify_task_requirements",
+    "feed_unmet_requirements",
 ]
+

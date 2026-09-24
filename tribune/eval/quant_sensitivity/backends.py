@@ -568,3 +568,92 @@ def run_statutory_parity_audit(ladder: list[QuantRung] | None = None) -> list[di
         audit_results.append(rung_eval)
 
     return audit_results
+
+
+# --------------------------------------------------------------------------- #
+# Hardened Execution Tier Integration (Sentinel & Dual-Zone Partitioning)
+# --------------------------------------------------------------------------- #
+
+
+def get_configured_shell_runner(
+    config: Any | None = None,
+) -> Any:
+    """Instantiate and configure the ShellRunner per hardening configuration.
+    
+    Default behavior is safe:
+    - Sentinel enabled
+    - Container execution preferred (with fallback to local if docker unavailable)
+    - Network deny-by-default
+    - Surrogate tokens enabled
+    - Legacy mode only available behind explicit flag
+    """
+    from ...runtime import ContainerRunnerConfig, create_shell_runner
+    from ...security.allowlist import AllowlistPolicy, default_allowlist
+    from ...security.sentinel import SentinelBroker, SentinelClient
+    from ...security.token_broker import TokenBroker, get_token_broker
+    from .hardening_config import HardeningConfig, get_hardening_config
+
+    cfg: HardeningConfig = config or get_hardening_config()
+    token_broker = TokenBroker(surrogate_prefix=cfg.surrogate_token_prefix)
+
+    sentinel_client: SentinelClient | None = None
+    if cfg.sentinel_enabled:
+        allowlist = (
+            AllowlistPolicy.load_from_yaml(cfg.allowlist_path)
+            if os.path.exists(cfg.allowlist_path)
+            else default_allowlist()
+        )
+        broker = SentinelBroker(
+            allowlist=allowlist,
+            token_broker=token_broker,
+        )
+        sentinel_client = SentinelClient(
+            socket_path=cfg.sentinel_socket_path,
+            in_process_broker=broker,
+        )
+
+    container_cfg = ContainerRunnerConfig(
+        image=cfg.container_image,
+        user=cfg.container_user,
+        network_mode=cfg.container_network_mode,
+        memory_limit=cfg.container_memory_limit,
+        cpu_limit=cfg.container_cpu_limit,
+    )
+
+    return create_shell_runner(
+        mode=cfg.execution_mode,
+        sentinel_client=sentinel_client,
+        token_broker=token_broker,
+        container_config=container_cfg,
+    )
+
+
+def execute_sandboxed_command(
+    command: str | list[str],
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    timeout_seconds: float | None = None,
+    session_id: str = "eval_session",
+    task_id: str = "eval_task",
+    model_backend_id: str = "quant_model",
+    config: Any | None = None,
+) -> Any:
+    """Execute a shell command within the hardened sandbox with Sentinel policy enforcement."""
+    from ...runtime import ExecRequest
+    from .hardening_config import get_hardening_config
+
+    cfg = config or get_hardening_config()
+    timeout = timeout_seconds if timeout_seconds is not None else cfg.max_command_timeout_seconds
+
+    runner = get_configured_shell_runner(cfg)
+    request = ExecRequest(
+        command=command,
+        cwd=cwd,
+        env=env or {},
+        timeout_seconds=timeout,
+        session_id=session_id,
+        task_id=task_id,
+        model_backend_id=model_backend_id,
+    )
+    return runner.execute(request)
+

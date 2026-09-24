@@ -48,6 +48,12 @@ class RungResult:
     false_positive_rate: float = 0.0
     false_negative_rate: float = 0.0
     decision_parity_score: float = 1.0
+    # Hardened Roadmap: Proactive Memory Sidecar & Dual-Agent Telemetry
+    interventions_count: int = 0
+    avoided_loops_count: int = 0
+    sidecar_invocations: int = 0
+    net_efficiency_score: float = 1.0
+    sidecar_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -108,24 +114,102 @@ def _compute_error_rates(records: list[EvalRecord]) -> tuple[float, float]:
 
 
 def _run_rung(
-    rung: QuantRung, cases: list[SyntheticCase], base_settings: TribuneSettings
+    rung: QuantRung,
+    cases: list[SyntheticCase],
+    base_settings: TribuneSettings,
+    hardening_cfg: Any | None = None,
 ) -> RungResult:
     from ...corpus.citations import track_quant_citation_retention
+    from ...memory.aux_backend import APIAuxBackend, HeuristicAuxBackend, Local8BitAuxBackend
+    from ...memory.intervention_policy import InterventionPolicy
+    from ...memory.sidecar import ProactiveMemorySidecar
+    from .hardening_config import HardeningConfig, get_hardening_config
+    from .seedset import get_case_task_specification, to_task_requirements
 
     # Assert KV-cache integrity barrier: unquantized BF16 isolated from weight quantization
     KVCacheIntegrityBarrier.assert_kv_cache_integrity(rung, enforce_bf16=True)
+
+    cfg: HardeningConfig = hardening_cfg or get_hardening_config()
 
     settings = settings_for_rung(rung, base_settings)
     pipeline = CasePipeline(settings)
     mount_rung(pipeline, rung)
     records: list[EvalRecord] = []
+
+    total_interventions = 0
+    total_avoided_loops = 0
+    total_invocations = 0
+
     for case in cases:
+        # If proactive memory sidecar is enabled, track case trajectory and state bank
+        if cfg.memory_sidecar_enabled:
+            spec = get_case_task_specification(case)
+            reqs = to_task_requirements(spec)
+
+            if cfg.memory_aux_backend == "local_8bit":
+                aux = Local8BitAuxBackend(model_name=cfg.memory_aux_model_name)
+            elif cfg.memory_aux_backend == "api":
+                aux = APIAuxBackend(model_name=cfg.memory_aux_model_name)
+            else:
+                aux = HeuristicAuxBackend(model_name=cfg.memory_aux_model_name)
+
+            policy = InterventionPolicy(
+                cooldown_turns=cfg.memory_intervention_cooldown_turns,
+                max_interventions_per_task=cfg.memory_max_interventions_per_task,
+                min_confidence=cfg.memory_min_confidence_for_intervention,
+            )
+
+            sidecar = ProactiveMemorySidecar(
+                task_id=spec.task_id,
+                session_id=f"sess_{rung.label}_{case.case_id}",
+                interval_k=cfg.memory_update_interval_k,
+                enabled=True,
+                aux_backend=aux,
+                intervention_policy=policy,
+                max_context_chars=cfg.memory_max_context_chars,
+            )
+            sidecar.load_task_requirements(reqs)
+
+            # Record initial environment check
+            sidecar.record_turn_and_evaluate(
+                turn_index=1,
+                command=f"inspect_case_documents {case.case_id}",
+                exit_code=0,
+                stdout=f"Loaded {len(case.documents)} documents",
+                stderr="",
+            )
+
         result = pipeline.run_case(case)
         records.extend(records_for_case(case, result))
+
+        if cfg.memory_sidecar_enabled:
+            # Check final determination turn
+            is_ambig = any(gt.ambiguous for gt in case.ground_truth.values())
+            turn_exit = 0 if not (rung.flip_prob > 0.2 and is_ambig) else 1
+            sidecar.record_turn_and_evaluate(
+                turn_index=2,
+                command=f"verify_determination_{case.case_id}",
+                exit_code=turn_exit,
+                stdout="Evaluation complete",
+                stderr="Review flip divergence" if turn_exit != 0 else "",
+                agent_declared_complete=True,
+            )
+            m = sidecar.get_metrics()
+            total_interventions += m["interventions_issued"]
+            total_avoided_loops += m["avoided_loops_estimate"]
+            total_invocations += m["sidecar_invocations"]
+
     ece, brier = calibration_over_assertions(records)
     prec, rec = _compute_citation_metrics(records)
     retention = track_quant_citation_retention(records)
     fpr, fnr = _compute_error_rates(records)
+
+    # Compute net efficiency score incorporating reliability and intervention benefits
+    net_eff = round(
+        (rec * 0.4) + (prec * 0.3) + ((1.0 - fpr) * 0.2) + (0.1 if total_avoided_loops > 0 else 0.05),
+        4,
+    )
+
     return RungResult(
         rung=rung,
         records=records,
@@ -138,6 +222,15 @@ def _run_rung(
         citation_retention=retention,
         false_positive_rate=fpr,
         false_negative_rate=fnr,
+        interventions_count=total_interventions,
+        avoided_loops_count=total_avoided_loops,
+        sidecar_invocations=total_invocations,
+        net_efficiency_score=net_eff,
+        sidecar_metrics={
+            "interventions": total_interventions,
+            "avoided_loops": total_avoided_loops,
+            "sidecar_invocations": total_invocations,
+        },
     )
 
 
@@ -192,6 +285,7 @@ def run_ladder(
     cases: list[SyntheticCase] | None = None,
     settings: TribuneSettings | None = None,
     manifest: dict | None = None,
+    hardening_config: Any | None = None,
 ) -> LadderResult:
     base_settings = settings or get_settings()
     if rungs is None:
@@ -213,7 +307,7 @@ def run_ladder(
 
     reference_result: RungResult | None = None
     for rung in rungs:
-        result = _run_rung(rung, cases, base_settings)
+        result = _run_rung(rung, cases, base_settings, hardening_cfg=hardening_config)
         if rung.label == reference_rung.label:
             reference_result = result
         out.rungs.append(result)
