@@ -1,12 +1,10 @@
 """Tests for the harness loop execution engine."""
 
-import pytest
 from tribune.harness.context import ContextCompactor
 from tribune.harness.loop import HarnessLoop
-from tribune.harness.policies import HarnessPolicyEnforcer
 from tribune.harness.state import HarnessState, RunStatus, StepType
 from tribune.harness.tools import ToolDefinition, ToolDispatcher
-from tribune.inference.base import InferenceRequest, InferenceResponse, ProviderUsage
+from tribune.inference.base import InferenceResponse
 from tribune.inference.registry import MockOfflineProvider
 
 
@@ -122,3 +120,166 @@ def test_context_compaction_preserves_verifier_failures():
     assert any(m.get("role") == "system" for m in compacted)
     # Assert verifier rejection preserved
     assert any("[VERIFIER_GATE_REJECTION]" in str(m.get("content", "")) for m in compacted)
+
+
+def test_context_staged_tool_output_elision():
+    """Verify bulky middle tool outputs are deterministically elided to short stubs."""
+    compactor = ContextCompactor(
+        max_context_tokens=16_000,
+        preserve_recent_turns=2,
+        tool_output_ceiling_chars=500,
+    )
+
+    bulky_tool_data = "SECTION 201 STATUTE: " + ("Rule paragraph text. " * 100)  # ~2,200 chars
+    recent_tool_data = "SHORT STATUTE: " + ("Short rule. " * 50)  # ~600 chars
+
+    messages = [
+        {"role": "system", "content": "You are a legal assistant."},
+        # Older turns (idx 0 to 2 in conversation_msgs)
+        {"role": "user", "content": "Search for Section 201."},
+        {"role": "assistant", "content": "Invoking search_statute tool."},
+        {
+            "role": "tool",
+            "name": "search_statute",
+            "tool_call_id": "call_statute_1",
+            "content": bulky_tool_data,
+        },
+        # Recent turns (last 2 conversation_msgs)
+        {"role": "assistant", "content": "I found Section 201. Now checking recent rule."},
+        {
+            "role": "tool",
+            "name": "search_recent",
+            "tool_call_id": "call_statute_2",
+            "content": recent_tool_data,
+        },
+    ]
+
+    compacted = compactor.compact(messages)
+
+    # 1. System prompt preserved
+    assert compacted[0]["role"] == "system"
+
+    # 2. Find the elided middle tool message
+    tool_msgs = [m for m in compacted if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+
+    older_tool = tool_msgs[0]
+    recent_tool = tool_msgs[1]
+
+    # Older bulky tool output MUST be elided into deterministic stub
+    assert "[TOOL OUTPUT ELIDED: name=search_statute, tool_call_id=call_statute_1" in older_tool["content"]
+    assert older_tool["name"] == "search_statute"
+    assert older_tool["tool_call_id"] == "call_statute_1"
+    assert len(older_tool["content"]) < 200
+
+    # Recent tool output MUST be preserved intact
+    assert recent_tool["content"] == recent_tool_data
+    assert recent_tool["name"] == "search_recent"
+
+    # Token/character savings check
+    orig_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    compacted_chars = sum(len(str(m.get("content", ""))) for m in compacted)
+    reduction_pct = (orig_chars - compacted_chars) / orig_chars
+    assert reduction_pct > 0.50  # Over 50% character/token reduction
+
+
+def test_staged_tool_elision_respects_critical_anchors():
+    """Verify tool messages containing critical verifier markers are never elided."""
+    compactor = ContextCompactor(
+        max_context_tokens=16_000,
+        preserve_recent_turns=1,
+        tool_output_ceiling_chars=100,
+    )
+
+    critical_tool_data = (
+        "=== [VERIFIER_GATE_REJECTION] ===\n"
+        "GATE STATUS: FAILED\n"
+        + ("Detailed statutory violation description. " * 30)
+    )
+
+    messages = [
+        {"role": "system", "content": "System prompt."},
+        {"role": "user", "content": "Verify submission."},
+        {
+            "role": "tool",
+            "name": "audit_tool",
+            "tool_call_id": "call_crit_1",
+            "content": critical_tool_data,
+        },
+        {"role": "assistant", "content": "Recent response."},
+    ]
+
+    compacted = compactor.compact(messages)
+
+    tool_msg = next(m for m in compacted if m.get("role") == "tool")
+    # Must preserve the exact verifier rejection content despite being older and bulky
+    assert "[VERIFIER_GATE_REJECTION]" in tool_msg["content"]
+    assert tool_msg["content"] == critical_tool_data
+
+
+def test_harness_loop_with_staged_tool_output_elision_integration():
+    """Integration test: HarnessLoop executes multi-turn trajectory with tool elision."""
+    dispatcher = ToolDispatcher()
+    bulky_result = "STATUTE CORPUS DATA: " + ("Extremely long legal text segment. " * 200)
+
+    def mock_bulk_search(query: str):
+        return bulky_result
+
+    dispatcher.register_tool(
+        ToolDefinition(
+            name="bulk_search",
+            description="Returns bulky statute data",
+            parameters_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+            handler=mock_bulk_search,
+        )
+    )
+
+    call_count = 0
+
+    class MultiTurnProvider(MockOfflineProvider):
+        def complete(self, request):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return InferenceResponse(
+                    text="",
+                    tool_calls=[{
+                        "id": "call_bulk_1",
+                        "function": {"name": "bulk_search", "arguments": {"query": "SNAP eligibility"}},
+                    }],
+                    model="mock",
+                    provider_id="mock",
+                )
+            elif call_count == 2:
+                # Issue second non-tool response, leading to more turns
+                return InferenceResponse(
+                    text="Parsed bulky data. Generating additional questions.",
+                    model="mock",
+                    provider_id="mock",
+                )
+            return InferenceResponse(text="Assessment finalized.", model="mock", provider_id="mock")
+
+    # Compactor with preserve_recent_turns=1 and tool_output_ceiling_chars=500
+    compactor = ContextCompactor(
+        max_context_tokens=16_000,
+        preserve_recent_turns=1,
+        tool_output_ceiling_chars=500,
+    )
+
+    loop = HarnessLoop(
+        provider=MultiTurnProvider(),
+        tool_dispatcher=dispatcher,
+        compactor=compactor,
+        max_steps=6,
+    )
+
+    state = loop.run(
+        task_id="task_staged_elision_integration",
+        initial_messages=[{"role": "user", "content": "Evaluate SNAP"}],
+    )
+
+    assert state.status == RunStatus.COMPLETED
+    assert state.step_count >= 2
+    # Verify execution finished cleanly with zero errors
+    assert state.failure_reason is None
+
